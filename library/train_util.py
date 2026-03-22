@@ -1106,7 +1106,8 @@ class BaseDataset(torch.utils.data.Dataset):
         return all(
             [
                 not (
-                    subset.caption_dropout_rate > 0 and not cache_supports_dropout
+                    subset.caption_dropout_rate > 0
+                    and not cache_supports_dropout
                     or subset.shuffle_caption
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
@@ -4471,7 +4472,10 @@ def verify_training_args(args: argparse.Namespace):
     Verify training arguments. Also reflect highvram option to global variable
     学習用引数を検証する。あわせて highvram オプションの指定をグローバル変数に反映する
     """
+    from library.strategy_base import set_cache_format
+
     enable_high_vram(args)
+    set_cache_format(args.cache_format)
 
     if args.v2 and args.clip_skip is not None:
         logger.warning("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
@@ -4636,6 +4640,14 @@ def add_dataset_arguments(
         action="store_true",
         help="skip the content validation of cache (latent and text encoder output). Cache file existence check is always performed, and cache processing is performed if the file does not exist"
         " / cacheの内容の検証をスキップする（latentとテキストエンコーダの出力）。キャッシュファイルの存在確認は常に行われ、ファイルがなければキャッシュ処理が行われる",
+    )
+    parser.add_argument(
+        "--cache_format",
+        type=str,
+        default="npz",
+        choices=["npz", "safetensors"],
+        help="format for latent and text encoder output caches (default: npz). safetensors saves in native dtype (e.g. bf16) for smaller files and faster I/O"
+        " / latentおよびtext encoder出力キャッシュの保存形式（デフォルト: npz）。safetensorsはネイティブdtype（例: bf16）で保存し、ファイルサイズ削減と高速化が可能",
     )
     parser.add_argument(
         "--enable_bucket",
