@@ -93,6 +93,12 @@ def _expand_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
     return F.max_pool2d(mask, kernel_size=(radius * 2) + 1, stride=1, padding=radius)
 
 
+def _terrain_mask_to_occupancy(mask: torch.Tensor, black_is_terrain: bool) -> torch.Tensor:
+    mask = mask.detach().float() if not mask.is_floating_point() else mask.float()
+    mask = mask.clamp(0.0, 1.0)
+    return (1.0 - mask) if black_is_terrain else mask
+
+
 def _select_eval_alpha_logits(alpha_outputs: Optional[Dict[str, object]], output_source: str) -> torch.Tensor:
     if alpha_outputs is None:
         raise RuntimeError("alpha outputs are missing while selecting eval alpha logits")
@@ -364,6 +370,7 @@ def run_eval_step(
     collapse_images: List[np.ndarray] = []
 
     terrain_mask_index = dataset.channel_names.index("terrain_mask")
+    terrain_black_is_terrain = bool(eval_config.get("terrain_mask_black_is_terrain", True))
     full_scene_for_panel: Optional[Tuple[EvalSample, Dict[str, object], Dict[str, object]]] = None
 
     for sample_info in resolved_samples:
@@ -371,9 +378,10 @@ def run_eval_step(
         sem_hash = hashlib.sha256(sample["conditioning_images"].detach().cpu().numpy().tobytes()).hexdigest()
 
         target_alpha = sample["alpha_target"]
+        terrain_prior_raw = sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
+        terrain_prior = _terrain_mask_to_occupancy(terrain_prior_raw, terrain_black_is_terrain)
         if target_alpha is None:
-            target_alpha = sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
-        terrain_prior = sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
+            target_alpha = terrain_prior.clone()
 
         primary_render = None
         for seed in seeds:
@@ -405,6 +413,7 @@ def run_eval_step(
                 collapse_images.append(np.asarray(render["rgb"].convert("RGB"), dtype=np.uint8))
                 _mask_to_image(target_alpha).save(os.path.join(step_dir, f"{sample_info.eval_id}_target_alpha.png"))
                 _mask_to_image(terrain_prior).save(os.path.join(step_dir, f"{sample_info.eval_id}_terrain_prior.png"))
+                _mask_to_image(terrain_prior_raw).save(os.path.join(step_dir, f"{sample_info.eval_id}_terrain_prior_raw.png"))
                 if "pred_x0_latent" in render:
                     debug_dir = os.path.join(step_dir, "debug")
                     os.makedirs(debug_dir, exist_ok=True)
@@ -415,10 +424,13 @@ def run_eval_step(
         p = primary_render["pred_alpha_prob"].detach().float().cpu()
         p_logits = primary_render["pred_alpha_logits"].detach().float().cpu()
         t = terrain_prior.detach().float().cpu()
+        t_raw = terrain_prior_raw.detach().float().cpu()
         t_alpha = target_alpha.detach().float().cpu()
         threshold = float(eval_config.get("binary_threshold", 0.5))
         b = (p >= threshold).float()
         tbin = (t >= threshold).float()
+        tbin_raw = (t_raw >= threshold).float()
+        tbin_raw_inv = 1.0 - tbin_raw
         t_alpha_bin = (t_alpha >= threshold).float()
         inter = float((b * tbin).sum().item())
         union = float((b + tbin - b * tbin).sum().item())
@@ -426,6 +438,12 @@ def run_eval_step(
         inter_target = float((b * t_alpha_bin).sum().item())
         union_target = float((b + t_alpha_bin - b * t_alpha_bin).sum().item())
         alpha_iou_target = inter_target / max(union_target, 1e-6)
+        inter_raw = float((b * tbin_raw).sum().item())
+        union_raw = float((b + tbin_raw - b * tbin_raw).sum().item())
+        alpha_iou_terrain_rawpol = inter_raw / max(union_raw, 1e-6)
+        inter_raw_inv = float((b * tbin_raw_inv).sum().item())
+        union_raw_inv = float((b + tbin_raw_inv - b * tbin_raw_inv).sum().item())
+        alpha_iou_terrain_inverted_rawpol = inter_raw_inv / max(union_raw_inv, 1e-6)
 
         supervision_mask = sample["trusted_mask"].detach().float().cpu().unsqueeze(0).unsqueeze(0)
         supervision_mask = _expand_mask(supervision_mask, int(eval_config.get("supervision_expand_px", 0))).squeeze(0).squeeze(0)
@@ -451,6 +469,8 @@ def run_eval_step(
                 "category": sample_info.category,
                 "sample_key": sample_info.sample_key,
                 "alpha_iou": alpha_iou_terrain,
+                "alpha_iou_terrain_rawpol": alpha_iou_terrain_rawpol,
+                "alpha_iou_terrain_inverted_rawpol": alpha_iou_terrain_inverted_rawpol,
                 "alpha_iou_target": alpha_iou_target,
                 "alpha_iou_target_masked": alpha_iou_target_masked,
                 "alpha_bce": alpha_bce,
@@ -542,6 +562,8 @@ def run_eval_step(
             "category",
             "sample_key",
             "alpha_iou",
+            "alpha_iou_terrain_rawpol",
+            "alpha_iou_terrain_inverted_rawpol",
             "alpha_iou_target",
             "alpha_iou_target_masked",
             "alpha_bce",
@@ -586,8 +608,9 @@ def run_eval_step(
 
     fs_info, fs_sample, fs_render = full_scene_for_panel
     fs_sem = _float_to_grayscale_image(fs_sample["conditioning_images"][terrain_mask_index]).convert("RGB")
-    fs_target = fs_sample["alpha_target"] if fs_sample["alpha_target"] is not None else fs_sample["conditioning_images"][terrain_mask_index]
-    fs_prior = fs_sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
+    fs_prior_raw = fs_sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
+    fs_prior = _terrain_mask_to_occupancy(fs_prior_raw, terrain_black_is_terrain)
+    fs_target = fs_sample["alpha_target"] if fs_sample["alpha_target"] is not None else fs_prior
     fs_rows = [
         (
             f"full_scene | {fs_info.eval_id}",
@@ -612,6 +635,8 @@ def run_eval_step(
 
     means = {
         "alpha_iou": float(np.mean([row["alpha_iou"] for row in metrics_rows])),
+        "alpha_iou_terrain_rawpol": float(np.mean([row["alpha_iou_terrain_rawpol"] for row in metrics_rows])),
+        "alpha_iou_terrain_inverted_rawpol": float(np.mean([row["alpha_iou_terrain_inverted_rawpol"] for row in metrics_rows])),
         "alpha_iou_target": float(np.mean([row["alpha_iou_target"] for row in metrics_rows])),
         "alpha_iou_target_masked": float(np.mean([row["alpha_iou_target_masked"] for row in metrics_rows])),
         "alpha_bce": float(np.mean([row["alpha_bce"] for row in metrics_rows])),

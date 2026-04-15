@@ -151,11 +151,12 @@ def parse_alpha_config(config: Dict[str, object]) -> Dict[str, object]:
         "terrain_presence_boost": float(alpha.get("terrain_presence_boost", 1.5)),
         "synthesized_alpha_warn_fraction": float(alpha.get("synthesized_alpha_warn_fraction", 0.25)),
         "dominance_warn_ratio": float(alpha.get("dominance_warn_ratio", 0.5)),
-        "head_mode": str(alpha.get("head_mode", "fused")),
+        "head_mode": str(alpha.get("head_mode", "single_high")),
         "single_scale_index": int(alpha.get("single_scale_index", -1)),
         "output_source": str(alpha.get("output_source", "main")),
         "baseline_mode": str(alpha.get("baseline_mode", "none")),
         "pre_gate_target_terrain_iou_min": float(alpha.get("pre_gate_target_terrain_iou_min", 0.60)),
+        "terrain_mask_black_is_terrain": bool(alpha.get("terrain_mask_black_is_terrain", True)),
     }
 
 
@@ -226,6 +227,7 @@ def parse_evaluation_config(
         "binary_threshold": float(alpha_config.get("binary_threshold", 0.5)),
         "supervision_expand_px": int(alpha_config.get("supervision_expand_px", 0)),
         "alpha_output_source": str(alpha_config.get("output_source", "main")),
+        "terrain_mask_black_is_terrain": bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
         "alpha_iou_min": float(evaluation.get("alpha_iou_min", 0.35)),
         "alpha_bce_max": float(evaluation.get("alpha_bce_max", 0.62)),
         "alpha_corr_min": float(evaluation.get("alpha_corr_min", 0.30)),
@@ -445,6 +447,12 @@ def _masked_mean_per_sample(values: torch.Tensor, mask: torch.Tensor) -> torch.T
     return masked_sum / masked_area
 
 
+def _terrain_mask_to_occupancy(mask: torch.Tensor, black_is_terrain: bool) -> torch.Tensor:
+    mask = mask.detach().float() if not mask.is_floating_point() else mask.float()
+    mask = mask.clamp(0.0, 1.0)
+    return (1.0 - mask) if black_is_terrain else mask
+
+
 def _resolve_alpha_head_indices(head_scales: List[int], head_mode: str, single_scale_index: int) -> List[int]:
     unique_scales = sorted(set([int(v) for v in head_scales]))
     if not unique_scales:
@@ -519,20 +527,34 @@ def _run_pre_gate_target_terrain_iou_sanity(
         return
 
     terrain_mask_index = _find_channel_index(dataset.channel_names, "terrain_mask")
-    terrain_mask = sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
+    terrain_mask_raw = sample["conditioning_images"][terrain_mask_index].detach().float().clamp(0.0, 1.0)
+    terrain_mask_occ = _terrain_mask_to_occupancy(
+        terrain_mask_raw,
+        bool(alpha_config["terrain_mask_black_is_terrain"]),
+    )
     threshold = float(alpha_config["binary_threshold"])
     alpha_bin = (alpha_target.detach().float() >= threshold).float()
-    terrain_bin = (terrain_mask >= threshold).float()
+    terrain_bin_raw = (terrain_mask_raw >= threshold).float()
+    terrain_bin_raw_inv = 1.0 - terrain_bin_raw
+    terrain_bin = (terrain_mask_occ >= threshold).float()
 
     inter = float((alpha_bin * terrain_bin).sum().item())
     union = float((alpha_bin + terrain_bin - alpha_bin * terrain_bin).sum().item())
     iou = inter / max(union, 1e-6)
+    inter_raw = float((alpha_bin * terrain_bin_raw).sum().item())
+    union_raw = float((alpha_bin + terrain_bin_raw - alpha_bin * terrain_bin_raw).sum().item())
+    iou_raw = inter_raw / max(union_raw, 1e-6)
+    inter_raw_inv = float((alpha_bin * terrain_bin_raw_inv).sum().item())
+    union_raw_inv = float((alpha_bin + terrain_bin_raw_inv - alpha_bin * terrain_bin_raw_inv).sum().item())
+    iou_raw_inv = inter_raw_inv / max(union_raw_inv, 1e-6)
     alpha_occ = float(alpha_bin.mean().item())
     terrain_occ = float(terrain_bin.mean().item())
     logger.info(
         "[sanity/pre_gate_target] "
         + f"dataset_index={sanity_index} iou_target_vs_terrain={iou:.6f} "
-        + f"target_occ={alpha_occ:.4f} terrain_occ={terrain_occ:.4f} threshold={threshold:.3f}"
+        + f"iou_target_vs_terrain_rawpol={iou_raw:.6f} iou_target_vs_terrain_inverted_rawpol={iou_raw_inv:.6f} "
+        + f"target_occ={alpha_occ:.4f} terrain_occ={terrain_occ:.4f} threshold={threshold:.3f} "
+        + f"terrain_mask_black_is_terrain={bool(alpha_config['terrain_mask_black_is_terrain'])}"
     )
     min_iou = float(alpha_config["pre_gate_target_terrain_iou_min"])
     if iou < min_iou:
@@ -1955,7 +1977,11 @@ def train(args: argparse.Namespace) -> None:
                         )
 
                         binary_alpha_target = (alpha_target >= alpha_config["binary_threshold"]).to(dtype=weight_dtype)
-                        terrain_mask_prior = conditioning_images[:, terrain_mask_index : terrain_mask_index + 1].clamp(0.0, 1.0)
+                        terrain_mask_prior_raw = conditioning_images[:, terrain_mask_index : terrain_mask_index + 1].clamp(0.0, 1.0)
+                        terrain_mask_prior = _terrain_mask_to_occupancy(
+                            terrain_mask_prior_raw,
+                            bool(alpha_config["terrain_mask_black_is_terrain"]),
+                        )
                         blended_alpha_target = (
                             (1.0 - alpha_prior_weight) * binary_alpha_target
                             + alpha_prior_weight * terrain_mask_prior
