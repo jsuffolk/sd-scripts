@@ -421,6 +421,7 @@ class BaseSubset:
         keep_tokens_separator: str,
         secondary_separator: Optional[str],
         enable_wildcard: bool,
+        enable_multiline_captions: bool,
         color_aug: bool,
         flip_aug: bool,
         face_crop_aug_range: Optional[Tuple[float, float]],
@@ -446,6 +447,7 @@ class BaseSubset:
         self.keep_tokens_separator = keep_tokens_separator
         self.secondary_separator = secondary_separator
         self.enable_wildcard = enable_wildcard
+        self.enable_multiline_captions = enable_multiline_captions
         self.color_aug = color_aug
         self.flip_aug = flip_aug
         self.face_crop_aug_range = face_crop_aug_range
@@ -485,6 +487,7 @@ class DreamBoothSubset(BaseSubset):
         keep_tokens_separator,
         secondary_separator,
         enable_wildcard,
+        enable_multiline_captions,
         color_aug,
         flip_aug,
         face_crop_aug_range,
@@ -513,6 +516,7 @@ class DreamBoothSubset(BaseSubset):
             keep_tokens_separator,
             secondary_separator,
             enable_wildcard,
+            enable_multiline_captions,
             color_aug,
             flip_aug,
             face_crop_aug_range,
@@ -556,6 +560,7 @@ class FineTuningSubset(BaseSubset):
         keep_tokens_separator,
         secondary_separator,
         enable_wildcard,
+        enable_multiline_captions,
         color_aug,
         flip_aug,
         face_crop_aug_range,
@@ -584,6 +589,7 @@ class FineTuningSubset(BaseSubset):
             keep_tokens_separator,
             secondary_separator,
             enable_wildcard,
+            enable_multiline_captions,
             color_aug,
             flip_aug,
             face_crop_aug_range,
@@ -623,6 +629,7 @@ class ControlNetSubset(BaseSubset):
         keep_tokens_separator,
         secondary_separator,
         enable_wildcard,
+        enable_multiline_captions,
         color_aug,
         flip_aug,
         face_crop_aug_range,
@@ -651,6 +658,7 @@ class ControlNetSubset(BaseSubset):
             keep_tokens_separator,
             secondary_separator,
             enable_wildcard,
+            enable_multiline_captions,
             color_aug,
             flip_aug,
             face_crop_aug_range,
@@ -863,6 +871,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+            elif subset.enable_multiline_captions:
+                # use multiline captions as they are
+                pass
             else:
                 # if caption is multiline, use the first line
                 caption = caption.split("\n")[0]
@@ -1954,7 +1965,7 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
 
-        def read_caption(img_path, caption_extension, enable_wildcard):
+        def read_caption(img_path, caption_extension, enable_wildcard, enable_multiline_captions):
             # captionの候補ファイル名を作る
             base_name = os.path.splitext(img_path)[0]
             base_name_face_det = base_name
@@ -1975,6 +1986,8 @@ class DreamBoothDataset(BaseDataset):
                         assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
                         if enable_wildcard:
                             caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                        elif enable_multiline_captions:
+                            caption = "".join(lines).strip()  # 改行も含めて連結
                         else:
                             caption = lines[0].strip()
                     break
@@ -2095,7 +2108,9 @@ class DreamBoothDataset(BaseDataset):
                 captions = []
                 missing_captions = []
                 for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
+                    cap_for_img = read_caption(
+                        img_path, subset.caption_extension, subset.enable_wildcard, subset.enable_multiline_captions
+                    )
                     if cap_for_img is None and subset.class_tokens is None:
                         logger.warning(
                             f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
@@ -6260,7 +6275,8 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
             )
             if "effective_lr" in lr_scheduler.optimizers[-1].param_groups[lr_index]:
                 logs["lr/d*eff_lr/" + name] = (
-                    lr_scheduler.optimizers[-1].param_groups[lr_index]["d"] * lr_scheduler.optimizers[-1].param_groups[lr_index]["effective_lr"]
+                    lr_scheduler.optimizers[-1].param_groups[lr_index]["d"]
+                    * lr_scheduler.optimizers[-1].param_groups[lr_index]["effective_lr"]
                 )
 
 

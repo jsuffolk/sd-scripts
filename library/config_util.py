@@ -61,6 +61,7 @@ class BaseSubsetParams:
     keep_tokens_separator: str = (None,)
     secondary_separator: Optional[str] = None
     enable_wildcard: bool = False
+    enable_multiline_captions: bool = False
     color_aug: bool = False
     flip_aug: bool = False
     face_crop_aug_range: Optional[Tuple[float, float]] = None
@@ -110,6 +111,7 @@ class BaseDatasetParams:
     resize_interpolation: Optional[str] = None
     skip_image_resolution: Optional[Tuple[int, int]] = None
 
+
 @dataclass
 class DreamBoothDatasetParams(BaseDatasetParams):
     batch_size: int = 1
@@ -119,6 +121,7 @@ class DreamBoothDatasetParams(BaseDatasetParams):
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
     prior_loss_weight: float = 1.0
+
 
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):
@@ -193,6 +196,7 @@ class ConfigSanitizer:
         "secondary_separator": str,
         "caption_separator": str,
         "enable_wildcard": bool,
+        "enable_multiline_captions": bool,
         "token_warmup_min": int,
         "token_warmup_step": Any(float, int),
         "caption_prefix": str,
@@ -473,7 +477,10 @@ class BlueprintGenerator:
 
         return default_value
 
-def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
+
+def generate_dataset_group_by_blueprint(
+    dataset_group_blueprint: DatasetGroupBlueprint,
+) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
     datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:
@@ -498,7 +505,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
     val_datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
     for dataset_blueprint in dataset_group_blueprint.datasets:
         if dataset_blueprint.params.validation_split < 0.0 or dataset_blueprint.params.validation_split > 1.0:
-            logging.warning(f"Dataset param `validation_split` ({dataset_blueprint.params.validation_split}) is not a valid number between 0.0 and 1.0, skipping validation split...")
+            logging.warning(
+                f"Dataset param `validation_split` ({dataset_blueprint.params.validation_split}) is not a valid number between 0.0 and 1.0, skipping validation split..."
+            )
             continue
 
         # if the dataset isn't setting a validation split, there is no current validation dataset
@@ -527,27 +536,36 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         for i, dataset in enumerate(_datasets):
             is_dreambooth = isinstance(dataset, DreamBoothDataset)
             is_controlnet = isinstance(dataset, ControlNetDataset)
-            info += dedent(f"""\
+            info += dedent(
+                f"""\
                 [{dataset_type} {i}]
                   batch_size: {dataset.batch_size}
                   resolution: {(dataset.width, dataset.height)}
                   skip_image_resolution: {dataset.skip_image_resolution}
                   resize_interpolation: {dataset.resize_interpolation}
                   enable_bucket: {dataset.enable_bucket}
-            """)
+            """
+            )
 
             if dataset.enable_bucket:
-                info += indent(dedent(f"""\
+                info += indent(
+                    dedent(
+                        f"""\
                   min_bucket_reso: {dataset.min_bucket_reso}
                   max_bucket_reso: {dataset.max_bucket_reso}
                   bucket_reso_steps: {dataset.bucket_reso_steps}
                   bucket_no_upscale: {dataset.bucket_no_upscale}
-                \n"""), "  ")
+                \n"""
+                    ),
+                    "  ",
+                )
             else:
                 info += "\n"
 
             for j, subset in enumerate(dataset.subsets):
-                info += indent(dedent(f"""\
+                info += indent(
+                    dedent(
+                        f"""\
                   [Subset {j} of {dataset_type} {i}]
                     image_dir: "{subset.image_dir}"
                     image_count: {subset.img_count}
@@ -559,6 +577,8 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
                     caption_prefix: {subset.caption_prefix}
                     caption_suffix: {subset.caption_suffix}
+                    enable_wildcard: {subset.enable_wildcard}
+                    enable_multiline_captions: {subset.enable_multiline_captions}
                     color_aug: {subset.color_aug}
                     flip_aug: {subset.flip_aug}
                     face_crop_aug_range: {subset.face_crop_aug_range}
@@ -568,18 +588,31 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     alpha_mask: {subset.alpha_mask}
                     resize_interpolation: {subset.resize_interpolation}
                     custom_attributes: {subset.custom_attributes}
-                """), "  ")
+                """
+                    ),
+                    "  ",
+                )
 
                 if is_dreambooth:
-                    info += indent(dedent(f"""\
+                    info += indent(
+                        dedent(
+                            f"""\
                         is_reg: {subset.is_reg}
                         class_tokens: {subset.class_tokens}
                         caption_extension: {subset.caption_extension}
-                    \n"""), "    ")
+                    \n"""
+                        ),
+                        "    ",
+                    )
                 elif not is_controlnet:
-                    info += indent(dedent(f"""\
+                    info += indent(
+                        dedent(
+                            f"""\
                         metadata_file: {subset.metadata_file}
-                    \n"""), "    ")
+                    \n"""
+                        ),
+                        "    ",
+                    )
 
         logger.info(info)
 
@@ -602,10 +635,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         dataset.make_buckets()
         dataset.set_seed(seed)
 
-    return (
-        DatasetGroup(datasets),
-        DatasetGroup(val_datasets) if val_datasets else None
-    )
+    return (DatasetGroup(datasets), DatasetGroup(val_datasets) if val_datasets else None)
 
 
 def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] = None, reg_data_dir: Optional[str] = None):

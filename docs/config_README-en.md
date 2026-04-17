@@ -153,6 +153,7 @@ These options are related to subset configuration.
 | `keep_tokens_separator` | `“|||”` | o | o | o |
 | `secondary_separator` | `“;;;”` | o | o | o |
 | `enable_wildcard` | `true` | o | o | o |
+| `enable_multiline_captions` | `true` | o | o | o |
 | `resize_interpolation` | (not specified) | o | o | o |
 
 * `num_repeats`
@@ -167,6 +168,8 @@ These options are related to subset configuration.
     * Specifies an additional separator. The part separated by this separator is treated as one tag and is shuffled and dropped. It is then replaced by `caption_separator`. For example, if you specify `aaa;;;bbb;;;ccc`, it will be replaced by `aaa,bbb,ccc` or dropped together.
 * `enable_wildcard`
     * Enables wildcard notation. This will be explained later.
+* `enable_multiline_captions`
+    * Enables multi-line captions. This will be explained later.
 * `resize_interpolation`
     * Specifies the interpolation method used when resizing images. Normally, there is no need to specify this. The following options can be specified: `lanczos`, `nearest`, `bilinear`, `linear`, `bicubic`, `cubic`, `area`, `box`. By default (when not specified), `area` is used for downscaling, and `lanczos` is used for upscaling. If this option is specified, the same interpolation method will be used for both upscaling and downscaling. When `lanczos` or `box` is specified, PIL is used; for other options, OpenCV is used.
 
@@ -332,9 +335,22 @@ As a temporary measure, we will list common errors and their solutions. If you e
 
 ## Miscellaneous
 
-### Multi-line captions
+### Use multi-line captions as they are
 
-By setting `enable_wildcard = true`, multiple-line captions are also enabled. If the caption file consists of multiple lines, one line is randomly selected as the caption. 
+By setting `enable_multiline_captions = true`, if the caption file consists of multiple lines, it will be used as is (including line breaks). 
+
+```txt
+1girl, hatsune miku, vocaloid, upper body, looking at viewer, microphone, stage
+detailed digital art of a girl Hatsune Miku with a microphone on a stage
+```
+
+(The default is `false`, and in that case, the first line is used as the caption, and the rest are ignored.)
+
+### Wildcard notation and multi-line captions
+
+By setting `enable_wildcard = true`, if the caption file consists of multiple lines, one line is randomly selected as the caption. 
+
+NOTE: When `enable_wildcard` is enabled, `enable_multiline_captions` is ignored, and the caption file is always treated as a random selection of one line.
 
 ```txt
 1girl, hatsune miku, vocaloid, upper body, looking at viewer, microphone, stage
