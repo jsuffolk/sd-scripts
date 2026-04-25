@@ -1,3 +1,4 @@
+from library.terrain_semantic_seam_geometry import center_crop_chw, center_crop_hw, expanded_hw, pad_chw_spatial
 import csv
 import hashlib
 import json
@@ -9,9 +10,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import DDPMScheduler
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from library import sdxl_model_util, sdxl_train_util
+from library.device_utils import clean_memory_on_device
 
 
 @dataclass
@@ -23,6 +25,22 @@ class EvalSample:
     image_name: str
     crop_box: Tuple[int, int, int, int]
     generation_strategy: str
+
+
+@dataclass
+class SwapPair:
+    pair_id: str
+    base_image: str
+    base_sample_key: str
+    base_dataset_index: int
+    swap_image: str
+    swap_sample_key: str
+    swap_dataset_index: int
+    edit_type: str                   # "global" or "local"
+    primary_expected_effect: str
+    allowed_effects: str
+    disallowed_effects: str
+    edit_mask_path: Optional[str]    # only set for local edits
 
 
 def build_sample_key(image_name: str, crop_box: Sequence[int]) -> str:
@@ -80,6 +98,141 @@ def _speckle_ratio(prob: torch.Tensor) -> float:
         return 0.0
     return lap_energy / total_energy
 
+# ---------------------------------------------------------------------------
+# Semantic binding diagnostic helpers
+# ---------------------------------------------------------------------------
+
+def _compute_rgb_diff(
+    img_a: Image.Image,
+    img_b: Image.Image,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (abs_diff, signed_diff) as float32 numpy arrays in [0,255] and [-255,255]."""
+    a = np.asarray(img_a.convert("RGB"), dtype=np.float32)
+    b = np.asarray(img_b.convert("RGB"), dtype=np.float32)
+    signed = a - b
+    return np.abs(signed), signed
+
+
+def _abs_diff_to_image(abs_diff: np.ndarray) -> Image.Image:
+    """Convert abs diff float array [0,255] to a uint8 PIL RGB image."""
+    return Image.fromarray(abs_diff.clip(0, 255).astype(np.uint8), mode="RGB")
+
+
+def _signed_diff_to_image(signed_diff: np.ndarray) -> Image.Image:
+    """Map signed diff [-255,255] to [0,255] with neutral grey at 128."""
+    mapped = ((signed_diff + 255.0) * 0.5).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(mapped, mode="RGB")
+
+
+def _smooth_edge_map(rgb_img: Image.Image, blur_radius: float = 1.2) -> np.ndarray:
+    """Compute a Sobel edge magnitude map on a pre-blurred grayscale image.
+
+    The Gaussian pre-blur suppresses high-frequency texture so that only
+    structural edges contribute to the variance measurement.  Returns a
+    float32 array in [0, 1] with the same spatial dimensions as rgb_img.
+    """
+    blurred = rgb_img.convert("L").filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    gray = np.asarray(blurred, dtype=np.float32) / 255.0
+    padded = np.pad(gray, 1, mode="reflect")
+    gx = (
+        -padded[:-2, :-2] + padded[:-2, 2:]
+        - 2.0 * padded[1:-1, :-2] + 2.0 * padded[1:-1, 2:]
+        - padded[2:, :-2] + padded[2:, 2:]
+    )
+    gy = (
+        -padded[:-2, :-2] - 2.0 * padded[:-2, 1:-1] - padded[:-2, 2:]
+        + padded[2:, :-2] + 2.0 * padded[2:, 1:-1] + padded[2:, 2:]
+    )
+    mag = np.hypot(gx, gy)
+    peak = mag.max()
+    if peak > 0.0:
+        mag = mag / peak
+    return mag.astype(np.float32)
+
+
+def _edge_map_variance(edge_maps: List[np.ndarray]) -> float:
+    """Mean per-pixel variance of smooth edge maps across a list of renders."""
+    if len(edge_maps) < 2:
+        return 0.0
+    stack = np.stack(edge_maps, axis=0)  # (N, H, W)
+    return float(np.mean(np.var(stack, axis=0)))
+
+
+def _compute_localization_score(
+    abs_diff: np.ndarray,
+    region_mask: np.ndarray,
+) -> Tuple[float, float]:
+    """Return (localization_score, total_mean_diff_per_pixel).
+
+    localization_score = fraction of total diff energy inside region_mask.
+    total_mean_diff_per_pixel = mean(abs_diff) across all pixels/channels.
+    """
+    per_pixel = abs_diff.mean(axis=2)  # (H, W)
+    total_energy = float(per_pixel.sum())
+    inside_energy = float((per_pixel * region_mask).sum())
+    loc_score = inside_energy / max(total_energy, 1e-8)
+    total_mean_diff = float(per_pixel.mean())
+    return loc_score, total_mean_diff
+
+
+def _normalize_diff(abs_diff: np.ndarray, ref_rgb: np.ndarray) -> float:
+    """Normalized mean diff: mean(abs_diff) / mean(|ref_rgb|), both in [0, 255].
+
+    Removes the confound of later checkpoints producing sharper outputs.
+    Returns 0 if reference intensity is near zero.
+    """
+    mean_diff = float(abs_diff.mean())
+    mean_intensity = float(np.abs(ref_rgb).mean())
+    if mean_intensity < 1.0:
+        return 0.0
+    return mean_diff / mean_intensity
+
+
+def _make_cond_override(
+    cond: torch.Tensor,
+    mode: str,
+    terrain_mask_channel_index: int,
+    rng_seed: int = 9999,
+) -> torch.Tensor:
+    """Build a modified conditioning tensor for eval-only ablation.
+
+    mode:
+        "zero"       — all channels zeroed.
+        "mask_only"  — keep terrain_mask channel; zero all others.
+        "shuffled"   — spatially shuffle all channels with a fixed seed.
+        "nullspace"  — keep terrain_mask; spatially shuffle all other channels.
+    """
+    if mode == "zero":
+        return torch.zeros_like(cond)
+
+    if mode == "mask_only":
+        result = torch.zeros_like(cond)
+        idx = terrain_mask_channel_index
+        result[:, idx : idx + 1] = cond[:, idx : idx + 1]
+        return result
+
+    # shuffled / nullspace: build a fixed spatial permutation on CPU then apply
+    B, C, H, W = cond.shape
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(rng_seed)
+    perm = torch.randperm(H * W, generator=gen)  # CPU
+
+    flat = cond.reshape(B, C, -1).cpu()  # (B, C, H*W)
+    shuffled_flat = flat[:, :, perm]
+    shuffled = shuffled_flat.reshape(B, C, H, W).to(device=cond.device, dtype=cond.dtype)
+
+    if mode == "shuffled":
+        return shuffled
+
+    if mode == "nullspace":
+        result = cond.clone()
+        for ch in range(C):
+            if ch != terrain_mask_channel_index:
+                result[:, ch] = shuffled[:, ch]
+        return result
+
+    raise ValueError(f"Unknown cond_override mode: '{mode}'")
+
 
 def _histogram_counts(values: torch.Tensor, bin_edges: List[float]) -> List[int]:
     flat = values.detach().float().flatten().cpu().numpy()
@@ -122,6 +275,188 @@ def _select_eval_alpha_logits(alpha_outputs: Optional[Dict[str, object]], output
     return logits
 
 
+def _compose_model_visible_conditioning(
+    sample: Dict[str, object],
+    base_conditioning: torch.Tensor,
+) -> torch.Tensor:
+    """Build model-visible conditioning for eval, including seam channels when present.
+
+    Input/output tensors are channel-first 3D tensors (C, H, W).
+    """
+    if not isinstance(base_conditioning, torch.Tensor):
+        return base_conditioning
+
+    seam_strip = sample.get("seam_strip_tensor")
+    edge_defined_flags = sample.get("edge_defined_flags")
+    edge_flag_maps = sample.get("edge_flag_maps")
+    if seam_strip is None or edge_defined_flags is None or edge_flag_maps is None:
+        return base_conditioning
+
+    if not isinstance(seam_strip, torch.Tensor) or not isinstance(edge_defined_flags, torch.Tensor) or not isinstance(edge_flag_maps, torch.Tensor):
+        return base_conditioning
+
+    if base_conditioning.shape[-2:] != seam_strip.shape[-2:]:
+        return base_conditioning
+
+    expected_full_channels = base_conditioning.shape[0] + seam_strip.shape[0] + edge_flag_maps.shape[0]
+    if base_conditioning.shape[0] == expected_full_channels:
+        return base_conditioning
+
+    seam_gate = edge_defined_flags.float().view(4, 1, 1).repeat_interleave(4, dim=0)
+    seam_visible = seam_strip.float() * seam_gate
+    return torch.cat([base_conditioning.float(), seam_visible, edge_flag_maps.float()], dim=0)
+
+
+def _spatial_shuffle_channels(cond: torch.Tensor, channels: List[int], seed: int) -> torch.Tensor:
+    """Spatially shuffle selected channels of a (C,H,W) tensor with deterministic seed."""
+    result = cond.clone()
+    if not channels:
+        return result
+    c, h, w = cond.shape
+    flat = cond.reshape(c, -1).cpu()
+    gen = torch.Generator(device="cpu")
+    for i, ch in enumerate(channels):
+        if ch < 0 or ch >= c:
+            continue
+        gen.manual_seed(int(seed) + i)
+        perm = torch.randperm(h * w, generator=gen)
+        result[ch] = flat[ch, perm].view(h, w).to(device=cond.device, dtype=cond.dtype)
+    return result
+
+
+def _masked_mean_abs_diff(img_a: Image.Image, img_b: Image.Image, mask: np.ndarray) -> float:
+    """Mean absolute RGB difference under mask, normalized to [0,1]."""
+    a = np.asarray(img_a.convert("RGB"), dtype=np.float32)
+    b = np.asarray(img_b.convert("RGB"), dtype=np.float32)
+    per_pixel = np.mean(np.abs(a - b), axis=2) / 255.0
+    m = np.asarray(mask, dtype=np.float32)
+    if m.ndim == 3:
+        m = m[..., 0]
+    m = np.clip(m, 0.0, 1.0)
+    denom = float(np.sum(m))
+    if denom <= 1e-8:
+        return float(np.mean(per_pixel))
+    return float(np.sum(per_pixel * m) / denom)
+
+
+def _to_luma(rgb: np.ndarray) -> np.ndarray:
+    return (0.299 * rgb[..., 0]) + (0.587 * rgb[..., 1]) + (0.114 * rgb[..., 2])
+
+
+def _gradients_2d(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    gy, gx = np.gradient(x.astype(np.float32))
+    return gx, gy
+
+
+def _mean_gradient_cosine(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    ax, ay = _gradients_2d(a)
+    bx, by = _gradients_2d(b)
+    dot = (ax * bx) + (ay * by)
+    na = np.sqrt((ax * ax) + (ay * ay) + 1e-8)
+    nb = np.sqrt((bx * bx) + (by * by) + 1e-8)
+    cosine = dot / (na * nb + 1e-8)
+    m = np.asarray(mask, dtype=np.float32)
+    denom = float(np.sum(m))
+    if denom <= 1e-8:
+        return 0.0
+    return float(np.sum(cosine * m) / denom)
+
+
+def _masked_l1(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    m = np.asarray(mask, dtype=np.float32)
+    denom = float(np.sum(m))
+    if denom <= 1e-8:
+        return 0.0
+    diff = np.mean(np.abs(a - b), axis=2)
+    return float(np.sum(diff * m) / denom)
+
+
+def _build_expected_expanded_seam_rgba(
+    sample: Dict[str, object],
+    interior_h: int,
+    interior_w: int,
+    halo_px: int,
+) -> Optional[np.ndarray]:
+    seam_strip = sample.get("seam_strip_tensor")
+    edge_defined = sample.get("edge_defined_flags")
+    if seam_strip is None or edge_defined is None:
+        return None
+    if not isinstance(seam_strip, torch.Tensor) or not isinstance(edge_defined, torch.Tensor):
+        return None
+
+    halo = int(max(1, halo_px))
+    exp_h, exp_w = expanded_hw(interior_h, interior_w, halo)
+    expected = np.zeros((exp_h, exp_w, 4), dtype=np.float32)
+
+    strip = seam_strip.detach().float().cpu().numpy()
+    flags = edge_defined.detach().float().cpu().numpy()
+
+    def to_01(x: np.ndarray) -> np.ndarray:
+        rgb = np.clip((x[:3] + 1.0) * 0.5, 0.0, 1.0)
+        a = np.clip(x[3:4], 0.0, 1.0)
+        return np.concatenate([rgb, a], axis=0)
+
+    band = int(min(halo, strip.shape[1], strip.shape[2]))
+    if band <= 0:
+        return expected
+
+    # north
+    if flags[0] >= 0.5:
+        north = to_01(strip[0:4, :band, :]).transpose(1, 2, 0)
+        expected[halo - band : halo, halo : halo + interior_w, :] = north[:band, :interior_w, :]
+    # south
+    if flags[1] >= 0.5:
+        south = to_01(strip[4:8, interior_h - band : interior_h, :]).transpose(1, 2, 0)
+        expected[halo + interior_h : halo + interior_h + band, halo : halo + interior_w, :] = south[:band, :interior_w, :]
+    # east
+    if flags[2] >= 0.5:
+        east = to_01(strip[8:12, :, interior_w - band : interior_w]).transpose(1, 2, 0)
+        expected[halo : halo + interior_h, halo + interior_w : halo + interior_w + band, :] = east[:interior_h, :band, :]
+    # west
+    if flags[3] >= 0.5:
+        west = to_01(strip[12:16, :, :band]).transpose(1, 2, 0)
+        expected[halo : halo + interior_h, halo - band : halo, :] = west[:interior_h, :band, :]
+
+    return expected
+
+
+def _build_expanded_edge_masks(height: int, width: int, halo_px: int, band_px: int) -> Dict[str, Dict[str, np.ndarray]]:
+    h = int(height)
+    w = int(width)
+    halo = int(max(1, halo_px))
+    band = int(max(1, min(band_px, halo)))
+    masks: Dict[str, Dict[str, np.ndarray]] = {}
+
+    def z() -> np.ndarray:
+        return np.zeros((h, w), dtype=np.float32)
+
+    top_halo = z()
+    top_halo[max(0, halo - band):halo, :] = 1.0
+    top_interior = z()
+    top_interior[halo : min(h, halo + band), :] = 1.0
+
+    bottom_halo = z()
+    bottom_halo[h - halo : min(h, h - halo + band), :] = 1.0
+    bottom_interior = z()
+    bottom_interior[max(0, h - halo - band) : h - halo, :] = 1.0
+
+    right_halo = z()
+    right_halo[:, w - halo : min(w, w - halo + band)] = 1.0
+    right_interior = z()
+    right_interior[:, max(0, w - halo - band) : w - halo] = 1.0
+
+    left_halo = z()
+    left_halo[:, max(0, halo - band):halo] = 1.0
+    left_interior = z()
+    left_interior[:, halo : min(w, halo + band)] = 1.0
+
+    masks["top"] = {"halo_inner": top_halo, "interior_outer": top_interior}
+    masks["bottom"] = {"halo_inner": bottom_halo, "interior_outer": bottom_interior}
+    masks["right"] = {"halo_inner": right_halo, "interior_outer": right_interior}
+    masks["left"] = {"halo_inner": left_halo, "interior_outer": left_interior}
+    return masks
+
+
 def _render_one(
     sample: Dict[str, object],
     unet: torch.nn.Module,
@@ -137,16 +472,34 @@ def _render_one(
     seed: int,
     write_latent_debug: bool,
     alpha_output_source: str,
+    expanded_prediction_enabled: bool = False,
+    expanded_halo_px: int = 0,
+    override_conditioning: Optional[torch.Tensor] = None,
+    override_full_conditioning: Optional[torch.Tensor] = None,
 ) -> Dict[str, object]:
-    cond = sample["conditioning_images"].unsqueeze(0).to(device=device, dtype=control_dtype)
+    if override_full_conditioning is not None:
+        cond = override_full_conditioning.unsqueeze(0).to(device=device, dtype=control_dtype)
+    else:
+        raw_cond = override_conditioning if override_conditioning is not None else sample["conditioning_images"]
+        visible_cond = _compose_model_visible_conditioning(sample, raw_cond)
+        cond = visible_cond.unsqueeze(0).to(device=device, dtype=control_dtype)
+
+    interior_h = int(sample["target_sizes_hw"][0].item())
+    interior_w = int(sample["target_sizes_hw"][1].item())
+    use_expanded = bool(expanded_prediction_enabled and int(expanded_halo_px) > 0)
+    halo_px = int(max(0, expanded_halo_px))
+    target_h, target_w = (interior_h, interior_w)
+    if use_expanded:
+        target_h, target_w = expanded_hw(interior_h, interior_w, halo_px)
+        cond = pad_chw_spatial(cond.squeeze(0), halo_px=halo_px, mode="constant").unsqueeze(0).to(device=device, dtype=control_dtype)
 
     te1, te2, pool2 = cached_text
     text_embedding = torch.cat([te1, te2], dim=2)
 
     size_batch = {
-        "original_sizes_hw": sample["original_sizes_hw"].unsqueeze(0).to(device),
-        "crop_top_lefts": sample["crop_top_lefts"].unsqueeze(0).to(device),
-        "target_sizes_hw": sample["target_sizes_hw"].unsqueeze(0).to(device),
+        "original_sizes_hw": torch.tensor([[target_h, target_w]], device=device, dtype=torch.long),
+        "crop_top_lefts": torch.tensor([[0, 0]], device=device, dtype=torch.long),
+        "target_sizes_hw": torch.tensor([[target_h, target_w]], device=device, dtype=torch.long),
     }
     size_embeddings = sdxl_train_util.get_size_embeddings(
         size_batch["original_sizes_hw"],
@@ -156,8 +509,8 @@ def _render_one(
     ).to(weight_dtype)
     vector_embedding = torch.cat([pool2, size_embeddings], dim=1)
 
-    latent_h = int(sample["target_sizes_hw"][0].item()) // 8
-    latent_w = int(sample["target_sizes_hw"][1].item()) // 8
+    latent_h = int(target_h) // 8
+    latent_w = int(target_w) // 8
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     noisy = torch.randn((1, 4, latent_h, latent_w), generator=gen, device=device, dtype=weight_dtype)
@@ -175,7 +528,7 @@ def _render_one(
                 vector_embedding.to(dtype=control_dtype),
                 cond,
                 return_alpha=True,
-                alpha_target_size=tuple(sample["target_sizes_hw"].tolist()),
+                alpha_target_size=(target_h, target_w),
             )
             eps = unet(
                 noisy.to(dtype=weight_dtype),
@@ -192,10 +545,48 @@ def _render_one(
         decoded = vae.decode((pred_x0 / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample[0]
 
         selected_logits = _select_eval_alpha_logits(alpha_outputs, alpha_output_source)
-        alpha_logits = selected_logits.squeeze(0).squeeze(0).detach().float()
+        alpha_logits = selected_logits.squeeze(0).squeeze(0).detach().float().cpu()
         alpha_probs = torch.sigmoid(alpha_logits)
 
-    rgb = _tensor_to_image(decoded).convert("RGB")
+    debug_latent = pred_x0.detach().cpu() if write_latent_debug else None
+    decoded_cpu = decoded.detach().float().cpu()
+    expanded_decoded_cpu = decoded_cpu.clone() if use_expanded else decoded_cpu
+    expanded_alpha_logits = alpha_logits.clone() if use_expanded else alpha_logits
+    expanded_alpha_probs = alpha_probs.clone() if use_expanded else alpha_probs
+
+    expected_h = interior_h
+    expected_w = interior_w
+    if use_expanded:
+        if decoded_cpu.shape[-2:] != (target_h, target_w):
+            raise RuntimeError(
+                "expanded render decode shape mismatch before crop: "
+                + f"decoded={tuple(decoded_cpu.shape[-2:])} expected={(target_h, target_w)}"
+            )
+        decoded_cpu = center_crop_chw(decoded_cpu, out_h=expected_h, out_w=expected_w, halo_px=halo_px)
+        alpha_logits = center_crop_hw(alpha_logits, out_h=expected_h, out_w=expected_w, halo_px=halo_px)
+        alpha_probs = torch.sigmoid(alpha_logits)
+    if decoded_cpu.shape[-2:] != (expected_h, expected_w):
+        raise RuntimeError(
+            "render decode shape mismatch before export: "
+            + f"decoded={tuple(decoded_cpu.shape[-2:])} expected={(expected_h, expected_w)}"
+        )
+
+    del decoded
+    del pred_x0
+    del noisy
+    del alpha_outputs
+    del selected_logits
+    del input_resi_add
+    del mid_add
+    del eps
+    clean_memory_on_device(device)
+
+    rgb = _tensor_to_image(decoded_cpu).convert("RGB")
+    if rgb.size != (expected_w, expected_h):
+        raise RuntimeError(
+            "export image shape mismatch: "
+            + f"rgb_size={rgb.size} expected={(expected_w, expected_h)}"
+        )
     pred_alpha_img = _mask_to_image(alpha_probs)
     rgba = rgb.copy()
     rgba.putalpha(pred_alpha_img)
@@ -206,13 +597,19 @@ def _render_one(
         "pred_alpha_prob": alpha_probs,
         "pred_alpha_img": pred_alpha_img,
         "rgba": rgba,
+        "expanded_prediction_enabled": float(1.0 if use_expanded else 0.0),
+        "expanded_halo_px": float(halo_px),
+        "expanded_rgb_tensor": expanded_decoded_cpu,
+        "expanded_alpha_prob": expanded_alpha_probs,
     }
-    if write_latent_debug:
-        output["pred_x0_latent"] = pred_x0.detach().cpu()
+    if debug_latent is not None:
+        output["pred_x0_latent"] = debug_latent
     return output
 
 
 def _write_json(path: str, payload: Dict[str, object]) -> None:
+    import os
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -361,6 +758,8 @@ def run_eval_step(
             "alpha_preview_mode": str(eval_config.get("alpha_preview_mode", "mask")),
             "alpha_output_source": str(eval_config.get("alpha_output_source", "main")),
         },
+        "expanded_prediction_enabled": bool(eval_config.get("expanded_prediction_enabled", False)),
+        "expanded_halo_px": int(eval_config.get("expanded_halo_px", 0)),
     }
     _write_json(os.path.join(step_dir, "eval_run_config.json"), run_config)
 
@@ -384,6 +783,7 @@ def run_eval_step(
             target_alpha = terrain_prior.clone()
 
         primary_render = None
+        seed_rgb_list: List[Image.Image] = []
         for seed in seeds:
             render = _render_one(
                 sample=sample,
@@ -400,6 +800,8 @@ def run_eval_step(
                 seed=seed,
                 write_latent_debug=bool(eval_config.get("write_latent_debug", False)) and seed == primary_seed,
                 alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
+                expanded_prediction_enabled=bool(eval_config.get("expanded_prediction_enabled", False)),
+                expanded_halo_px=int(eval_config.get("expanded_halo_px", 0)),
             )
             rgb_path = os.path.join(step_dir, f"{sample_info.eval_id}_seed{seed:06d}_rgb.png")
             pred_alpha_path = os.path.join(step_dir, f"{sample_info.eval_id}_seed{seed:06d}_pred_alpha.png")
@@ -407,6 +809,7 @@ def run_eval_step(
             render["rgb"].save(rgb_path)
             render["pred_alpha_img"].save(pred_alpha_path)
             render["rgba"].save(rgba_path)
+            seed_rgb_list.append(render["rgb"])
 
             if seed == primary_seed:
                 primary_render = render
@@ -420,6 +823,130 @@ def run_eval_step(
                     torch.save(render["pred_x0_latent"], os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_latent.pt"))
 
         assert primary_render is not None
+        edge_map_var = _edge_map_variance([_smooth_edge_map(img) for img in seed_rgb_list])
+
+        halo_inner_recon_l1 = 0.0
+        halo_outer_recon_l1 = 0.0
+        interior_continuation_l1 = 0.0
+        halo_to_interior_alignment = 0.0
+        halo_effect_strength = 0.0
+        expanded_vs_direct_rgb_l1 = 0.0
+        expanded_vs_direct_alpha_l1 = 0.0
+        use_expanded = bool(eval_config.get("expanded_prediction_enabled", False)) and int(eval_config.get("expanded_halo_px", 0)) > 0
+        if use_expanded:
+            halo_px = int(eval_config.get("expanded_halo_px", 0))
+            interior_h = int(sample["target_sizes_hw"][0].item())
+            interior_w = int(sample["target_sizes_hw"][1].item())
+            exp_h, exp_w = expanded_hw(interior_h, interior_w, halo_px)
+
+            expanded_rgb = primary_render["expanded_rgb_tensor"].detach().float().cpu().clamp(-1.0, 1.0)
+            expanded_rgb = ((expanded_rgb + 1.0) * 0.5).permute(1, 2, 0).numpy()
+            expanded_alpha = primary_render["expanded_alpha_prob"].detach().float().cpu().numpy()
+            pred_rgba_exp = np.concatenate([expanded_rgb, expanded_alpha[..., None]], axis=2)
+
+            expected_rgba_exp = _build_expected_expanded_seam_rgba(
+                sample=sample,
+                interior_h=interior_h,
+                interior_w=interior_w,
+                halo_px=halo_px,
+            )
+            if expected_rgba_exp is not None and expected_rgba_exp.shape[0] == exp_h and expected_rgba_exp.shape[1] == exp_w:
+                band = max(1, min(int(sample.get("seam_strip_width_px", torch.tensor(float(halo_px))).item()), halo_px))
+                masks = _build_expanded_edge_masks(exp_h, exp_w, halo_px=halo_px, band_px=band)
+                edge_flags = sample.get("edge_defined_flags")
+                if isinstance(edge_flags, torch.Tensor):
+                    ef = edge_flags.detach().float().cpu().numpy()
+                else:
+                    ef = np.ones((4,), dtype=np.float32)
+                sides = ["top", "bottom", "right", "left"]
+
+                halo_vals: List[float] = []
+                interior_vals: List[float] = []
+                align_vals: List[float] = []
+                for side_idx, side in enumerate(sides):
+                    if side_idx < len(ef) and ef[side_idx] < 0.5:
+                        continue
+                    m_h = masks[side]["halo_inner"]
+                    m_i = masks[side]["interior_outer"]
+                    halo_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_h))
+                    interior_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_i))
+                    align_vals.append(
+                        _mean_gradient_cosine(
+                            _to_luma(pred_rgba_exp[..., :3]),
+                            _to_luma(expected_rgba_exp[..., :3]),
+                            m_i,
+                        )
+                    )
+
+                if halo_vals:
+                    halo_inner_recon_l1 = float(np.mean(halo_vals))
+                    halo_outer_recon_l1 = halo_inner_recon_l1
+                if interior_vals:
+                    interior_continuation_l1 = float(np.mean(interior_vals))
+                if align_vals:
+                    halo_to_interior_alignment = float(np.mean(align_vals))
+
+                try:
+                    full_cond = _compose_model_visible_conditioning(sample, sample["conditioning_images"])
+                    if isinstance(full_cond, torch.Tensor):
+                        cond_zero = full_cond.clone()
+                        base_ch = int(sample["conditioning_images"].shape[0])
+                        seam_ch_start = base_ch
+                        seam_ch_end = min(base_ch + 16, int(cond_zero.shape[0]))
+                        cond_zero[seam_ch_start:seam_ch_end] = 0.0
+                        effect_render = _render_one(
+                            sample=sample,
+                            unet=unet,
+                            control_net=control_net,
+                            vae=vae,
+                            scheduler=scheduler,
+                            cached_text=cached_text,
+                            device=device,
+                            weight_dtype=weight_dtype,
+                            control_dtype=control_dtype,
+                            vae_dtype=vae_dtype,
+                            steps=int(eval_config["inference_steps"]),
+                            seed=primary_seed,
+                            write_latent_debug=False,
+                            alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
+                            expanded_prediction_enabled=use_expanded,
+                            expanded_halo_px=halo_px,
+                            override_full_conditioning=cond_zero,
+                        )
+                        base_rgb = np.asarray(primary_render["rgb"].convert("RGB"), dtype=np.float32)
+                        pert_rgb = np.asarray(effect_render["rgb"].convert("RGB"), dtype=np.float32)
+                        halo_effect_strength = float(np.mean(np.abs(base_rgb - pert_rgb)) / 255.0)
+                except Exception:
+                    halo_effect_strength = 0.0
+
+                try:
+                    direct_render = _render_one(
+                        sample=sample,
+                        unet=unet,
+                        control_net=control_net,
+                        vae=vae,
+                        scheduler=scheduler,
+                        cached_text=cached_text,
+                        device=device,
+                        weight_dtype=weight_dtype,
+                        control_dtype=control_dtype,
+                        vae_dtype=vae_dtype,
+                        steps=int(eval_config["inference_steps"]),
+                        seed=primary_seed,
+                        write_latent_debug=False,
+                        alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
+                        expanded_prediction_enabled=False,
+                        expanded_halo_px=0,
+                    )
+                    base_rgb = np.asarray(primary_render["rgb"].convert("RGB"), dtype=np.float32)
+                    direct_rgb = np.asarray(direct_render["rgb"].convert("RGB"), dtype=np.float32)
+                    expanded_vs_direct_rgb_l1 = float(np.mean(np.abs(base_rgb - direct_rgb)) / 255.0)
+                    direct_alpha = direct_render["pred_alpha_prob"].detach().float().cpu().numpy()
+                    base_alpha = primary_render["pred_alpha_prob"].detach().float().cpu().numpy()
+                    expanded_vs_direct_alpha_l1 = float(np.mean(np.abs(base_alpha - direct_alpha)))
+                except Exception:
+                    expanded_vs_direct_rgb_l1 = 0.0
+                    expanded_vs_direct_alpha_l1 = 0.0
 
         p = primary_render["pred_alpha_prob"].detach().float().cpu()
         p_logits = primary_render["pred_alpha_logits"].detach().float().cpu()
@@ -483,6 +1010,14 @@ def run_eval_step(
                 "alpha_logits_hist_counts": json.dumps(logit_hist_counts),
                 "alpha_sigmoid_hist_bins": json.dumps(prob_hist_bins),
                 "alpha_sigmoid_hist_counts": json.dumps(prob_hist_counts),
+                "seed_edge_map_var": edge_map_var,
+                "halo_inner_recon_l1": halo_inner_recon_l1,
+                "halo_outer_recon_l1": halo_outer_recon_l1,
+                "interior_continuation_l1": interior_continuation_l1,
+                "halo_to_interior_alignment": halo_to_interior_alignment,
+                "halo_effect_strength": halo_effect_strength,
+                "expanded_vs_direct_rgb_l1": expanded_vs_direct_rgb_l1,
+                "expanded_vs_direct_alpha_l1": expanded_vs_direct_alpha_l1,
             }
         )
 
@@ -537,6 +1072,21 @@ def run_eval_step(
         if full_scene_for_panel is None and sample_info.generation_strategy == "full_scene":
             full_scene_for_panel = (sample_info, sample, primary_render)
 
+        del primary_render
+        del seed_rgb_list
+        del p
+        del p_logits
+        del t
+        del t_raw
+        del t_alpha
+        del b
+        del tbin
+        del tbin_raw
+        del tbin_raw_inv
+        del t_alpha_bin
+        del supervision_mask
+        clean_memory_on_device(device)
+
     _write_csv(
         os.path.join(step_dir, "resolved_eval_manifest.csv"),
         resolved_rows,
@@ -576,6 +1126,14 @@ def run_eval_step(
             "alpha_logits_hist_counts",
             "alpha_sigmoid_hist_bins",
             "alpha_sigmoid_hist_counts",
+            "seed_edge_map_var",
+            "halo_inner_recon_l1",
+            "halo_outer_recon_l1",
+            "interior_continuation_l1",
+            "halo_to_interior_alignment",
+            "halo_effect_strength",
+            "expanded_vs_direct_rgb_l1",
+            "expanded_vs_direct_alpha_l1",
         ],
     )
 
@@ -603,6 +1161,8 @@ def run_eval_step(
             seed=primary_seed,
             write_latent_debug=False,
             alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
+            expanded_prediction_enabled=bool(eval_config.get("expanded_prediction_enabled", False)),
+            expanded_halo_px=int(eval_config.get("expanded_halo_px", 0)),
         )
         full_scene_for_panel = (first, sample, render)
 
@@ -646,6 +1206,19 @@ def run_eval_step(
         "pred_near0_01": float(np.mean([row["pred_near0_01"] for row in metrics_rows])),
         "pred_near1_99": float(np.mean([row["pred_near1_99"] for row in metrics_rows])),
         "max_pairwise_mse": max_pairwise_mse,
+        "seed_edge_map_var": float(np.mean([row["seed_edge_map_var"] for row in metrics_rows])),
+        "halo_inner_recon_l1": float(np.mean([row.get("halo_inner_recon_l1", 0.0) for row in metrics_rows])),
+        "halo_outer_recon_l1": float(np.mean([row.get("halo_outer_recon_l1", 0.0) for row in metrics_rows])),
+        "interior_continuation_l1": float(np.mean([row.get("interior_continuation_l1", 0.0) for row in metrics_rows])),
+        "halo_to_interior_alignment": float(np.mean([row.get("halo_to_interior_alignment", 0.0) for row in metrics_rows])),
+        "halo_effect_strength": float(np.mean([row.get("halo_effect_strength", 0.0) for row in metrics_rows])),
+        "expanded_vs_direct_rgb_l1": float(np.mean([row.get("expanded_vs_direct_rgb_l1", 0.0) for row in metrics_rows])),
+        "expanded_vs_direct_alpha_l1": float(np.mean([row.get("expanded_vs_direct_alpha_l1", 0.0) for row in metrics_rows])),
+        "seam_margin_inner_recon_l1": float(np.mean([row.get("halo_inner_recon_l1", 0.0) for row in metrics_rows])),
+        "seam_margin_outer_recon_l1": float(np.mean([row.get("halo_outer_recon_l1", 0.0) for row in metrics_rows])),
+        "seam_interior_continuation_l1": float(np.mean([row.get("interior_continuation_l1", 0.0) for row in metrics_rows])),
+        "expanded_prediction_enabled": float(1.0 if bool(eval_config.get("expanded_prediction_enabled", False)) else 0.0),
+        "expanded_halo_px": float(int(eval_config.get("expanded_halo_px", 0))),
         "step_label": step_label,
     }
     _write_json(os.path.join(step_dir, "step_summary.json"), means)
@@ -710,6 +1283,7 @@ def summarize_attempt(
         }
         _write_json(os.path.join(output_dir, "attempt_summary.json"), summary)
         return summary
+
 
     step0 = eval_step_summaries.get("step_0000_pretrain")
     step200 = eval_step_summaries.get("step_0200") or eval_step_summaries.get("step_0120")
@@ -787,3 +1361,401 @@ def summarize_attempt(
     }
     _write_json(os.path.join(output_dir, "attempt_summary.json"), summary)
     return summary
+
+
+# ── swap pair manifest loading ────────────────────────────────────────────────
+
+def resolve_swap_pairs(
+    dataset,
+    swap_manifest_path: str,
+) -> List[SwapPair]:
+    """Resolve a swap-pair CSV manifest to dataset indices.
+
+    Each row must have ``base_sample_key`` and ``swap_sample_key`` that match
+    exactly one entry in ``dataset.records``.  Mirrors ``resolve_eval_samples``.
+    """
+    key_to_index: Dict[str, List[int]] = {}
+    for idx, record in enumerate(dataset.records):
+        key = build_sample_key(record["image_name"], record["crop_box"])
+        key_to_index.setdefault(key, []).append(idx)
+
+    if not os.path.isfile(swap_manifest_path):
+        raise FileNotFoundError(f"swap manifest not found: {swap_manifest_path}")
+
+    pairs: List[SwapPair] = []
+    with open(swap_manifest_path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for i, row in enumerate(reader):
+            base_key = (row.get("base_sample_key") or "").strip()
+            swap_key = (row.get("swap_sample_key") or "").strip()
+            if not base_key or not swap_key:
+                raise ValueError(f"swap manifest row {i + 2} missing base_sample_key or swap_sample_key")
+            base_matches = key_to_index.get(base_key, [])
+            swap_matches = key_to_index.get(swap_key, [])
+            if len(base_matches) != 1:
+                raise ValueError(
+                    f"swap pair '{row.get('pair_id')}': base_sample_key '{base_key}' "
+                    f"resolved to {len(base_matches)} dataset matches (expected 1)"
+                )
+            if len(swap_matches) != 1:
+                raise ValueError(
+                    f"swap pair '{row.get('pair_id')}': swap_sample_key '{swap_key}' "
+                    f"resolved to {len(swap_matches)} dataset matches (expected 1)"
+                )
+            edit_mask_path = (row.get("edit_mask_path") or "").strip() or None
+            pairs.append(
+                SwapPair(
+                    pair_id=(row.get("pair_id") or f"pair_{i:02d}").strip(),
+                    base_image=(row.get("base_image") or "").strip(),
+                    base_sample_key=base_key,
+                    base_dataset_index=base_matches[0],
+                    swap_image=(row.get("swap_image") or "").strip(),
+                    swap_sample_key=swap_key,
+                    swap_dataset_index=swap_matches[0],
+                    edit_type=(row.get("edit_type") or "global").strip(),
+                    primary_expected_effect=(row.get("primary_expected_effect") or "").strip(),
+                    allowed_effects=(row.get("allowed_effects") or "").strip(),
+                    disallowed_effects=(row.get("disallowed_effects") or "").strip(),
+                    edit_mask_path=edit_mask_path,
+                )
+            )
+    if not pairs:
+        raise ValueError("swap manifest resolved to 0 pairs")
+    return pairs
+
+
+# ── semantic binding eval ─────────────────────────────────────────────────────
+
+def run_semantic_binding_eval(
+    *,
+    step_label: str,
+    output_dir: str,
+    run_name: str,
+    dataset,
+    swap_pairs: Sequence[SwapPair],
+    unet: torch.nn.Module,
+    control_net: torch.nn.Module,
+    vae: torch.nn.Module,
+    cached_text: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    binding_config: Dict[str, object],
+    scheduler_config: Dict[str, object],
+    device: torch.device,
+    weight_dtype: torch.dtype,
+    control_dtype: torch.dtype,
+    vae_dtype: torch.dtype,
+) -> Dict[str, object]:
+    """Run the semantic-binding diagnostic suite for one checkpoint.
+
+    For each swap pair this renders and saves:
+      base_rgb        — base atlas, primary seed (and N-seed panel for consistency)
+      swap_rgb        — swap atlas, primary seed; abs + signed diffs vs base_rgb
+      zero_cond_rgb   — zero conditioning (ControlNet ablation)
+      shuffled_rgb    — spatially shuffled conditioning (ControlNet ablation)
+      maskonly_rgb    — terrain_mask channel only (mask-only comparison)
+      ns_<group>_rgb  — non-mask channels scrambled per group (null-space test)
+
+    Metrics per pair are written to ``binding_metrics.csv`` and a contact-sheet
+    board is saved as ``binding_board_<step_label>.png``.
+    """
+    step_dir = os.path.join(output_dir, step_label + "_binding")
+    os.makedirs(step_dir, exist_ok=True)
+
+    unet.to(device=device, dtype=weight_dtype).eval()
+    control_net.to(device=device, dtype=control_dtype).eval()
+    vae.to(device=device, dtype=vae_dtype).eval()
+
+    scheduler = DDPMScheduler(**scheduler_config)
+
+    seeds_panel: List[int] = [int(s) for s in binding_config.get("seeds_panel", [1234, 5678, 9012])]
+    primary_seed: int = seeds_panel[0]
+    inference_steps: int = int(binding_config.get("inference_steps", 8))
+    blur_radius: float = float(binding_config.get("blur_radius", 1.5))
+    terrain_mask_ch: int = int(binding_config.get("terrain_mask_channel_index", 3))
+    ablation_seed: int = int(binding_config.get("ablation_shuffle_seed", 9999))
+    alpha_output_source: str = str(binding_config.get("alpha_output_source", "main"))
+
+    null_space_groups: List[List[int]] = [
+        [int(ch) for ch in grp]
+        for grp in binding_config.get("null_space_channel_groups", [[4, 5, 6, 7], [8, 9, 10, 11], [0, 1, 2]])
+    ]
+    null_space_group_names: List[str] = list(
+        binding_config.get("null_space_group_names", ["edge_channels", "openness_channels", "base_semantic"])
+    )
+    while len(null_space_group_names) < len(null_space_groups):
+        null_space_group_names.append(f"group_{len(null_space_group_names)}")
+
+    ns_ablation_seed_offset = 100  # distinct seed per group to avoid correlated permutations
+
+    def _render(sample_: Dict, override: Optional[torch.Tensor], seed: int) -> Image.Image:
+        """Render and return only the RGB PIL image."""
+        return _render_one(
+            sample=sample_,
+            unet=unet,
+            control_net=control_net,
+            vae=vae,
+            scheduler=scheduler,
+            cached_text=cached_text,
+            device=device,
+            weight_dtype=weight_dtype,
+            control_dtype=control_dtype,
+            vae_dtype=vae_dtype,
+            steps=inference_steps,
+            seed=seed,
+            write_latent_debug=False,
+            alpha_output_source=alpha_output_source,
+            override_conditioning=override,
+        )["rgb"]
+
+    def _render_full(sample_: Dict, full_override: torch.Tensor, seed: int) -> Image.Image:
+        """Render using a full model-visible conditioning tensor override."""
+        return _render_one(
+            sample=sample_,
+            unet=unet,
+            control_net=control_net,
+            vae=vae,
+            scheduler=scheduler,
+            cached_text=cached_text,
+            device=device,
+            weight_dtype=weight_dtype,
+            control_dtype=control_dtype,
+            vae_dtype=vae_dtype,
+            steps=inference_steps,
+            seed=seed,
+            write_latent_debug=False,
+            alpha_output_source=alpha_output_source,
+            override_full_conditioning=full_override,
+        )["rgb"]
+
+    def _cond_override(base_cond_3d: torch.Tensor, mode: str) -> torch.Tensor:
+        """Apply a conditioning override mode; input/output are (C, H, W)."""
+        return _make_cond_override(
+            base_cond_3d.unsqueeze(0), mode, terrain_mask_ch, ablation_seed
+        ).squeeze(0)
+
+    def _ns_override(base_cond_3d: torch.Tensor, channels: List[int], g_seed_offset: int) -> torch.Tensor:
+        """Scramble selected channels; input/output are (C, H, W)."""
+        C, H, W = base_cond_3d.shape
+        batched = base_cond_3d.unsqueeze(0)  # (1, C, H, W)
+        gen = torch.Generator(device="cpu")
+        result = batched.clone()
+        flat = batched.reshape(1, C, -1).cpu()
+        for i, ch in enumerate(channels):
+            gen.manual_seed(ablation_seed + g_seed_offset + i)
+            perm = torch.randperm(H * W, generator=gen)
+            result[0, ch] = flat[0, ch, perm].view(H, W).to(device=batched.device, dtype=batched.dtype)
+        return result.squeeze(0)
+
+    metrics_rows: List[Dict[str, object]] = []
+    board_rows: List[Tuple[str, List[Image.Image]]] = []
+
+    for pair in swap_pairs:
+        base_sample = dataset[pair.base_dataset_index]
+        swap_sample = dataset[pair.swap_dataset_index]
+        base_cond = base_sample["conditioning_images"].detach()     # (C, H, W)
+        swap_cond = swap_sample["conditioning_images"].detach()     # (C, H, W)
+        pair_dir = os.path.join(step_dir, pair.pair_id)
+        os.makedirs(pair_dir, exist_ok=True)
+
+        # ── seed panel (base atlas, N seeds) ───────────────────────────────
+        seed_rgbs: List[Image.Image] = []
+        for sd in seeds_panel:
+            rgb = _render(base_sample, None, sd)
+            rgb.save(os.path.join(pair_dir, f"seed{sd:06d}_base_rgb.png"))
+            seed_rgbs.append(rgb)
+        base_rgb = seed_rgbs[0]
+        edge_maps = [_smooth_edge_map(img, blur_radius=blur_radius) for img in seed_rgbs]
+        edge_var = _edge_map_variance(edge_maps)
+
+        # ── semantic swap ──────────────────────────────────────────────────
+        swap_rgb = _render(base_sample, swap_cond, primary_seed)
+        swap_rgb.save(os.path.join(pair_dir, "swap_rgb.png"))
+        swap_abs, swap_signed = _compute_rgb_diff(base_rgb, swap_rgb)
+        _abs_diff_to_image(swap_abs).save(os.path.join(pair_dir, "swap_absdiff.png"))
+        _signed_diff_to_image(swap_signed).save(os.path.join(pair_dir, "swap_signeddiff.png"))
+        swap_diff_mag = float(swap_abs.mean()) / 255.0
+        swap_diff_norm = _normalize_diff(swap_abs, np.asarray(base_rgb.convert("RGB"), dtype=np.float32))
+
+        # ── local-edit localization (only if edit_mask_path is set) ────────
+        loc_score: float = float("nan")
+        if pair.edit_type == "local" and pair.edit_mask_path and os.path.isfile(pair.edit_mask_path):
+            edit_mask = np.asarray(Image.open(pair.edit_mask_path).convert("L"), dtype=np.float32) / 255.0
+            loc_score, _ = _compute_localization_score(swap_abs, edit_mask)
+
+        # ── ControlNet ablations ────────────────────────────────────────────
+        zero_rgb = _render(base_sample, _cond_override(base_cond, "zero"), primary_seed)
+        zero_rgb.save(os.path.join(pair_dir, "zero_cond_rgb.png"))
+        zero_abs, _ = _compute_rgb_diff(base_rgb, zero_rgb)
+        _abs_diff_to_image(zero_abs).save(os.path.join(pair_dir, "zero_absdiff.png"))
+        zero_diff_mag = float(zero_abs.mean()) / 255.0
+
+        shuffled_rgb = _render(base_sample, _cond_override(base_cond, "shuffled"), primary_seed)
+        shuffled_rgb.save(os.path.join(pair_dir, "shuffled_cond_rgb.png"))
+        shuffled_abs, _ = _compute_rgb_diff(base_rgb, shuffled_rgb)
+        _abs_diff_to_image(shuffled_abs).save(os.path.join(pair_dir, "shuffled_absdiff.png"))
+        shuffled_diff_mag = float(shuffled_abs.mean()) / 255.0
+
+        maskonly_rgb = _render(base_sample, _cond_override(base_cond, "mask_only"), primary_seed)
+        maskonly_rgb.save(os.path.join(pair_dir, "maskonly_rgb.png"))
+        maskonly_abs, _ = _compute_rgb_diff(base_rgb, maskonly_rgb)
+        _abs_diff_to_image(maskonly_abs).save(os.path.join(pair_dir, "maskonly_absdiff.png"))
+        maskonly_diff_mag = float(maskonly_abs.mean()) / 255.0
+
+        # ── seam strip-only perturbation (when seam conditioning exists) ───
+        strip_only_diff_mag = float("nan")
+        strip_only_edge_localization = float("nan")
+        strip_only_interior_drift = float("nan")
+        strip_rgb: Optional[Image.Image] = None
+        seam_strip = base_sample.get("seam_strip_tensor")
+        edge_band_masks = base_sample.get("edge_band_masks")
+        seam_strip_width_px = int(float(base_sample.get("seam_strip_width_px", 0.0) or 0.0))
+        if isinstance(seam_strip, torch.Tensor):
+            full_base_cond = _compose_model_visible_conditioning(base_sample, base_cond)
+            strip_start = int(base_cond.shape[0])
+            strip_end = strip_start + int(seam_strip.shape[0])
+            perturbed_full = _spatial_shuffle_channels(full_base_cond, list(range(strip_start, strip_end)), ablation_seed + 700)
+            strip_rgb = _render_full(base_sample, perturbed_full, primary_seed)
+            strip_rgb.save(os.path.join(pair_dir, "strip_only_perturb_rgb.png"))
+            strip_abs, _ = _compute_rgb_diff(base_rgb, strip_rgb)
+            _abs_diff_to_image(strip_abs).save(os.path.join(pair_dir, "strip_only_perturb_absdiff.png"))
+            strip_only_diff_mag = float(strip_abs.mean()) / 255.0
+
+            if isinstance(edge_band_masks, torch.Tensor):
+                edge_mask = edge_band_masks.float().sum(dim=0).clamp(0.0, 1.0).cpu().numpy()
+            else:
+                h, w = base_cond.shape[-2:]
+                band = max(1, min(seam_strip_width_px if seam_strip_width_px > 0 else 32, (min(h, w) - 1) // 2))
+                edge_mask = np.zeros((h, w), dtype=np.float32)
+                edge_mask[:band, :] = 1.0
+                edge_mask[h - band :, :] = 1.0
+                edge_mask[:, :band] = 1.0
+                edge_mask[:, w - band :] = 1.0
+
+            interior_mask = 1.0 - np.clip(edge_mask, 0.0, 1.0)
+            strip_only_interior_drift = _masked_mean_abs_diff(base_rgb, strip_rgb, interior_mask)
+            edge_diff = _masked_mean_abs_diff(base_rgb, strip_rgb, edge_mask)
+            total_diff = _masked_mean_abs_diff(base_rgb, strip_rgb, np.ones_like(edge_mask, dtype=np.float32))
+            strip_only_edge_localization = edge_diff / max(total_diff, 1e-8)
+
+        # ── null-space tests ────────────────────────────────────────────────
+        ns_metrics: Dict[str, float] = {}
+        for g_idx, (gname, ch_indices) in enumerate(zip(null_space_group_names, null_space_groups)):
+            ns_cond = _ns_override(base_cond, ch_indices, g_seed_offset=g_idx * ns_ablation_seed_offset)
+            ns_rgb = _render(base_sample, ns_cond, primary_seed)
+            ns_rgb.save(os.path.join(pair_dir, f"ns_{gname}_rgb.png"))
+            ns_abs, _ = _compute_rgb_diff(base_rgb, ns_rgb)
+            _abs_diff_to_image(ns_abs).save(os.path.join(pair_dir, f"ns_{gname}_absdiff.png"))
+            ns_metrics[f"ns_{gname}_diff_mag"] = float(ns_abs.mean()) / 255.0
+
+        # ── save expected-effects annotation ────────────────────────────────
+        _write_json(
+            os.path.join(pair_dir, "expected_effects.json"),
+            {
+                "pair_id": pair.pair_id,
+                "edit_type": pair.edit_type,
+                "base_image": pair.base_image,
+                "swap_image": pair.swap_image,
+                "primary_expected_effect": pair.primary_expected_effect,
+                "allowed_effects": pair.allowed_effects,
+                "disallowed_effects": pair.disallowed_effects,
+            },
+        )
+
+        # ── build contact-sheet row ─────────────────────────────────────────
+        board_images: List[Image.Image] = [
+            base_rgb, swap_rgb,
+            _abs_diff_to_image(swap_abs), _signed_diff_to_image(swap_signed),
+            zero_rgb, shuffled_rgb, maskonly_rgb,
+        ]
+        if strip_rgb is not None:
+            board_images.append(strip_rgb)
+        for gname in null_space_group_names:
+            p = os.path.join(pair_dir, f"ns_{gname}_rgb.png")
+            if os.path.isfile(p):
+                board_images.append(Image.open(p).convert("RGB"))
+        board_rows.append((f"{pair.pair_id}|{pair.base_image}→{pair.swap_image}", board_images))
+
+        # ── assemble metrics row ────────────────────────────────────────────
+        row: Dict[str, object] = {
+            "pair_id": pair.pair_id,
+            "step_label": step_label,
+            "base_image": pair.base_image,
+            "swap_image": pair.swap_image,
+            "edit_type": pair.edit_type,
+            "swap_diff_mag": swap_diff_mag,
+            "swap_diff_norm": swap_diff_norm,
+            "zero_diff_mag": zero_diff_mag,
+            "shuffled_diff_mag": shuffled_diff_mag,
+            "maskonly_diff_mag": maskonly_diff_mag,
+            "full_vs_maskonly_gap": swap_diff_mag - maskonly_diff_mag,
+            # controlnet_sensitivity: how much base vs zero diverges (>0 means ControlNet active)
+            "controlnet_sensitivity": zero_diff_mag,
+            # semantic_richness: how much maskonly differs from full atlas
+            # high value means full atlas ≈ mask_only (richness unused); low means richness matters
+            "maskonly_vs_full_ratio": maskonly_diff_mag / (swap_diff_mag + 1e-8),
+            "strip_only_diff_mag": strip_only_diff_mag,
+            "strip_only_edge_localization": strip_only_edge_localization,
+            "strip_only_interior_drift": strip_only_interior_drift,
+            "seed_edge_variance": edge_var,
+            "localization_score": loc_score,
+        }
+        row.update(ns_metrics)
+        metrics_rows.append(row)
+
+    # ── write aggregate metrics CSV ──────────────────────────────────────────
+    if metrics_rows:
+        base_fields = [
+            "pair_id", "step_label", "base_image", "swap_image", "edit_type",
+            "swap_diff_mag", "swap_diff_norm", "zero_diff_mag", "shuffled_diff_mag",
+            "maskonly_diff_mag", "full_vs_maskonly_gap", "controlnet_sensitivity", "maskonly_vs_full_ratio",
+            "strip_only_diff_mag", "strip_only_edge_localization", "strip_only_interior_drift",
+            "seed_edge_variance", "localization_score",
+        ]
+        ns_fields = sorted(k for k in metrics_rows[0] if k.startswith("ns_"))
+        _write_csv(
+            os.path.join(step_dir, "binding_metrics.csv"),
+            metrics_rows,
+            base_fields + ns_fields,
+        )
+
+    # ── build binding board ──────────────────────────────────────────────────
+    if board_rows:
+        headers = ["base_rgb", "swap_rgb", "abs_diff", "signed_diff",
+                   "zero_cond", "shuffled", "mask_only"]
+        if any(os.path.isfile(os.path.join(step_dir, pair.pair_id, "strip_only_perturb_rgb.png")) for pair in swap_pairs):
+            headers.append("strip_only_perturb")
+        headers += [f"ns_{g}" for g in null_space_group_names]
+        _build_contact_sheet(
+            board_rows,
+            headers,
+            os.path.join(step_dir, f"binding_board_{step_label}.png"),
+            tile_min_size=256,
+        )
+
+    # ── aggregate summary ────────────────────────────────────────────────────
+    def _mean(key: str) -> float:
+        vals = [float(r[key]) for r in metrics_rows
+                if not (isinstance(r[key], float) and r[key] != r[key])]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    summary: Dict[str, object] = {
+        "step_label": step_label,
+        "n_pairs": len(metrics_rows),
+        "mean_swap_diff_mag": _mean("swap_diff_mag"),
+        "mean_swap_diff_norm": _mean("swap_diff_norm"),
+        "mean_zero_diff_mag": _mean("zero_diff_mag"),
+        "mean_shuffled_diff_mag": _mean("shuffled_diff_mag"),
+        "mean_maskonly_diff_mag": _mean("maskonly_diff_mag"),
+        "mean_controlnet_sensitivity": _mean("controlnet_sensitivity"),
+        "mean_strip_only_diff_mag": _mean("strip_only_diff_mag"),
+        "mean_strip_only_edge_localization": _mean("strip_only_edge_localization"),
+        "mean_strip_only_interior_drift": _mean("strip_only_interior_drift"),
+        "mean_seed_edge_variance": _mean("seed_edge_variance"),
+    }
+    for gname in null_space_group_names:
+        k = f"ns_{gname}_diff_mag"
+        summary[f"mean_{k}"] = _mean(k)
+
+    _write_json(os.path.join(step_dir, "binding_step_summary.json"), summary)
+    return summary
+
+

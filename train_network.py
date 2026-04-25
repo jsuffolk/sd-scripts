@@ -1383,6 +1383,12 @@ class NetworkTrainer:
                     torch.cuda.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
+        import torch
+        import psutil
+        import time
+        import os
+        import json
+        bottleneck_stats = []
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
@@ -1397,18 +1403,30 @@ class NetworkTrainer:
                 skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
                 initial_step = 1
 
+            # Instrumentation accumulators
+            t_data_total = 0.0
+            t_fwd_total = 0.0
+            t_bwd_total = 0.0
+            t_opt_total = 0.0
+            t_ckpt_total = 0.0
+            t_misc_total = 0.0
+            n_steps = 0
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                t0 = time.perf_counter()
                 current_step.value = global_step
                 if initial_step > 0:
                     initial_step -= 1
                     continue
 
+                t_data = time.perf_counter() - t0
+                t1 = time.perf_counter()
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
+                    t2 = time.perf_counter()
                     loss = self.process_batch(
                         batch,
                         text_encoders,
@@ -1426,8 +1444,13 @@ class NetworkTrainer:
                         train_text_encoder=train_text_encoder,
                         train_unet=train_unet,
                     )
+                    t_fwd = time.perf_counter() - t2
 
+                    t3 = time.perf_counter()
                     accelerator.backward(loss)
+                    t_bwd = time.perf_counter() - t3
+
+                    t4 = time.perf_counter()
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
@@ -1442,31 +1465,18 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    t_opt = time.perf_counter() - t4
 
-                if args.scale_weight_norms:
-                    keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
-                        args.scale_weight_norms, accelerator.device
-                    )
-                    mean_grad_norm = None
-                    mean_combined_norm = None
-                    max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
-                else:
-                    if hasattr(network, "weight_norms"):
-                        weight_norms = network.weight_norms()
-                        mean_norm = weight_norms.mean().item() if weight_norms is not None else None
-                        grad_norms = network.grad_norms()
-                        mean_grad_norm = grad_norms.mean().item() if grad_norms is not None else None
-                        combined_weight_norms = network.combined_weight_norms()
-                        mean_combined_norm = combined_weight_norms.mean().item() if combined_weight_norms is not None else None
-                        maximum_norm = weight_norms.max().item() if weight_norms is not None else None
-                        keys_scaled = None
-                        max_mean_logs = {}
-                    else:
-                        keys_scaled, mean_norm, maximum_norm = None, None, None
-                        mean_grad_norm = None
-                        mean_combined_norm = None
-                        max_mean_logs = {}
+                t_misc = time.perf_counter() - t1 - t_fwd - t_bwd - t_opt
+                t_step = time.perf_counter() - t0
+                t_data_total += t_data
+                t_fwd_total += t_fwd
+                t_bwd_total += t_bwd
+                t_opt_total += t_opt
+                t_misc_total += t_misc
+                n_steps += 1
 
+                # ...existing code for weight norm logging, progress bar, etc...
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
@@ -1477,6 +1487,47 @@ class NetworkTrainer:
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                     )
                     progress_bar.unpause()
+
+            # End of epoch: Bottleneck report
+            avg_data = t_data_total / n_steps if n_steps else 0
+            avg_fwd = t_fwd_total / n_steps if n_steps else 0
+            avg_bwd = t_bwd_total / n_steps if n_steps else 0
+            avg_opt = t_opt_total / n_steps if n_steps else 0
+            avg_misc = t_misc_total / n_steps if n_steps else 0
+            gpu_util = torch.cuda.utilization() if torch.cuda.is_available() else None
+            gpu_mem = torch.cuda.memory_allocated() if torch.cuda.is_available() else None
+            cpu_mem = psutil.Process(os.getpid()).memory_info().rss
+            bottleneck_report = {
+                "epoch": epoch + 1,
+                "avg_data": avg_data,
+                "avg_fwd": avg_fwd,
+                "avg_bwd": avg_bwd,
+                "avg_opt": avg_opt,
+                "avg_misc": avg_misc,
+                "gpu_util": gpu_util,
+                "gpu_mem": gpu_mem,
+                "cpu_mem": cpu_mem,
+                "n_steps": n_steps,
+            }
+            # Classify bottleneck
+            max_time = max(avg_data, avg_fwd, avg_bwd, avg_opt, avg_misc)
+            if avg_data == max_time:
+                bottleneck_report["bottleneck"] = "input-bound"
+            elif avg_fwd == max_time or avg_bwd == max_time or avg_opt == max_time:
+                bottleneck_report["bottleneck"] = "compute-bound"
+            elif avg_misc == max_time:
+                bottleneck_report["bottleneck"] = "sync-or-io-bound"
+            else:
+                bottleneck_report["bottleneck"] = "unknown"
+            # False bottleneck guard: launch-bound
+            if gpu_util is not None and gpu_util < 30 and avg_fwd < 0.01 and avg_bwd < 0.01:
+                bottleneck_report["bottleneck"] = "launch-bound (microbatch too small)"
+            bottleneck_stats.append(bottleneck_report)
+            accelerator.print(f"\n[Instrumentation] Bottleneck report for epoch {epoch+1}:\n" + json.dumps(bottleneck_report, indent=2))
+            # Optionally, write to file
+            if accelerator.is_main_process:
+                with open(os.path.join(args.output_dir, f"bottleneck_report_epoch{epoch+1}.json"), "w") as f:
+                    json.dump(bottleneck_report, f, indent=2)
 
                     # 指定ステップごとにモデルを保存
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:

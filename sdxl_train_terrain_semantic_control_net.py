@@ -1,8 +1,11 @@
 import argparse
 import csv
+import json
 import os
 import random
+import re
 from collections import Counter
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +22,7 @@ from tqdm import tqdm
 from PIL import Image, ImageDraw
 
 from library import sdxl_model_util, sdxl_train_util, strategy_sdxl
+from library import train_util
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.sdxl_original_control_net import SdxlControlNet, SdxlControlledUNet
 from library.terrain_semantic_eval import (
@@ -26,6 +30,8 @@ from library.terrain_semantic_eval import (
     resolve_eval_samples,
     run_eval_step,
     summarize_attempt,
+    resolve_swap_pairs,
+    run_semantic_binding_eval,
 )
 from library.terrain_semantic_manifest_dataset import SemanticChannelSpec, TerrainSemanticManifestDataset
 from library.utils import setup_logging
@@ -39,6 +45,327 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+STEP_STATE_RE = re.compile(r"step(\d+)-state$")
+
+
+@dataclass(frozen=True)
+class TrainingPromptSpec:
+    name: str
+    prompt: str
+    prompt2: str
+    weight: float
+    mode: str
+
+
+class TrainingPromptSampler:
+    def __init__(self, prompts: List[TrainingPromptSpec], seed: int) -> None:
+        if not prompts:
+            raise ValueError("training prompt sampler requires at least one prompt")
+        self._prompts = prompts
+        self._rng = random.Random(seed)
+        self._total_weight = sum(prompt.weight for prompt in prompts)
+        if self._total_weight <= 0.0:
+            raise ValueError("training prompt weights must sum to > 0")
+
+    def sample(self) -> TrainingPromptSpec:
+        draw = self._rng.uniform(0.0, self._total_weight)
+        cumulative = 0.0
+        for prompt in self._prompts:
+            cumulative += prompt.weight
+            if draw <= cumulative:
+                return prompt
+        return self._prompts[-1]
+
+
+def load_training_prompt_pool(config: Dict[str, object]) -> List[TrainingPromptSpec]:
+    training = config.get("training", {}) or {}
+    prompt_pool_path = training.get("prompt_pool_path")
+    if not prompt_pool_path:
+        return []
+
+    if not os.path.isabs(prompt_pool_path):
+        prompt_pool_path = os.path.normpath(os.path.join(config["__config_dir"], str(prompt_pool_path)))
+
+    with open(prompt_pool_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    raw_prompts = payload.get("prompts", []) if isinstance(payload, dict) else []
+    prompt_specs: List[TrainingPromptSpec] = []
+    for index, row in enumerate(raw_prompts):
+        if not isinstance(row, dict):
+            continue
+        prompt = str(row.get("prompt", "")).strip()
+        if not prompt:
+            continue
+        prompt2 = str(row.get("prompt2", prompt)).strip() or prompt
+        weight = float(row.get("weight", 1.0))
+        if weight <= 0.0:
+            continue
+        name = str(row.get("name", f"prompt_{index:02d}")).strip() or f"prompt_{index:02d}"
+        mode = str(row.get("mode", row.get("prompt_mode", "matching"))).strip().lower() or "matching"
+        prompt_specs.append(TrainingPromptSpec(name=name, prompt=prompt, prompt2=prompt2, weight=weight, mode=mode))
+
+    if not prompt_specs:
+        raise ValueError(f"training.prompt_pool_path did not yield any usable prompts: {prompt_pool_path}")
+
+    return prompt_specs
+
+
+def summarize_training_prompt_pool(prompts: List[TrainingPromptSpec]) -> str:
+    total_weight = sum(prompt.weight for prompt in prompts)
+    parts = []
+    for prompt in prompts:
+        normalized = (prompt.weight / total_weight) if total_weight > 0.0 else 0.0
+        parts.append(f"{prompt.name}:{normalized:.3f}")
+    return ", ".join(parts)
+
+
+def get_or_prepare_text_conditioning(
+    text_cache: Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    prompt: str,
+    prompt2: str,
+    tokenize_strategy: strategy_sdxl.SdxlTokenizeStrategy,
+    text_encoding_strategy: strategy_sdxl.SdxlTextEncodingStrategy,
+    text_encoders: List[torch.nn.Module],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (prompt, prompt2)
+    cached = text_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cached = prepare_text_conditioning(
+        prompt,
+        prompt2,
+        tokenize_strategy,
+        text_encoding_strategy,
+        text_encoders,
+        device,
+        dtype,
+    )
+    text_cache[cache_key] = cached
+    return cached
+
+
+def parse_resume_step(resume_path: Optional[str]) -> int:
+    if not resume_path:
+        return 0
+    match = STEP_STATE_RE.search(os.path.basename(os.path.normpath(resume_path)))
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def ema_state_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "ema_state.safetensors")
+
+
+def metadata_state_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "trainer_state.json")
+
+
+def save_extended_training_state(
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    global_step: int,
+    ema_state: Optional[Dict[str, torch.Tensor]],
+    on_train_end: bool = False,
+) -> None:
+    if on_train_end:
+      state_dir = os.path.join(args.output_dir, f"{args.output_name}-state")
+    else:
+      state_dir = os.path.join(args.output_dir, f"{args.output_name}-step{global_step:08d}-state")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    accelerator.save_state(state_dir)
+
+    if ema_state is not None:
+        save_file(ema_state, ema_state_path(state_dir))
+
+    with open(metadata_state_path(state_dir), "w", encoding="utf-8") as handle:
+        json.dump({"global_step": global_step}, handle, indent=2)
+
+    if not on_train_end and getattr(args, "save_last_n_steps_state", None):
+        last_n_steps = int(args.save_last_n_steps_state)
+        remove_step_no = global_step - last_n_steps - 1
+        remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
+        if remove_step_no > 0:
+            old_state_dir = os.path.join(args.output_dir, f"{args.output_name}-step{remove_step_no:08d}-state")
+            if os.path.exists(old_state_dir):
+                import shutil
+
+                shutil.rmtree(old_state_dir)
+
+
+def load_extended_training_state(
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    ema_decay_enabled: bool,
+    control_net_model: Optional[torch.nn.Module] = None,
+) -> tuple[int, Optional[Dict[str, torch.Tensor]]]:
+    def _load_checkpoint_state_dict(path: str) -> Dict[str, torch.Tensor]:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".safetensors":
+            return load_safetensors(path)
+        payload = torch.load(path, map_location="cpu")
+        if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            return payload["state_dict"]
+        if isinstance(payload, dict):
+            return payload
+        raise ValueError(f"unsupported checkpoint payload type at {path}: {type(payload)}")
+
+    def _resolve_model_state_path(state_dir: str) -> Optional[str]:
+        candidates = [
+            os.path.join(state_dir, "model.safetensors"),
+            os.path.join(state_dir, "pytorch_model.bin"),
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _build_compatible_state(
+        target_state: Dict[str, torch.Tensor],
+        source_state: Dict[str, torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], List[str], List[str]]:
+        merged: Dict[str, torch.Tensor] = {}
+        adapted_keys: List[str] = []
+        skipped_keys: List[str] = []
+
+        for key, value in source_state.items():
+            if key not in target_state:
+                continue
+
+            target_value = target_state[key]
+            if not hasattr(value, "shape") or not hasattr(target_value, "shape"):
+                continue
+
+            if tuple(value.shape) == tuple(target_value.shape):
+                merged[key] = value
+                continue
+
+            # Seam migration: widen input channels while preserving the original learned channels.
+            if (
+                value.ndim == 4
+                and target_value.ndim == 4
+                and value.shape[0] == target_value.shape[0]
+                and value.shape[2] == target_value.shape[2]
+                and value.shape[3] == target_value.shape[3]
+                and value.shape[1] < target_value.shape[1]
+            ):
+                adapted = target_value.detach().to(device="cpu", dtype=value.dtype).clone()
+                adapted[:, : value.shape[1], :, :] = value
+                merged[key] = adapted
+                adapted_keys.append(key)
+                continue
+
+            skipped_keys.append(key)
+
+        return merged, adapted_keys, skipped_keys
+
+    def _fallback_resume_with_model_only() -> tuple[int, Optional[Dict[str, torch.Tensor]]]:
+        if control_net_model is None:
+            raise RuntimeError("resume fallback requires control_net_model")
+
+        model_state_path = _resolve_model_state_path(args.resume)
+        if model_state_path is None:
+            raise FileNotFoundError(
+                f"resume fallback could not find model state in {args.resume}; expected model.safetensors or pytorch_model.bin"
+            )
+
+        logger.warning(
+            "[resume] accelerator state restore failed; falling back to model/EMA compatible restore "
+            f"from {model_state_path}"
+        )
+
+        raw_model = control_net_model
+        target_state = {key: value.detach().to(device="cpu") for key, value in raw_model.state_dict().items()}
+        source_state = _load_checkpoint_state_dict(model_state_path)
+        compatible_state, adapted_keys, skipped_keys = _build_compatible_state(target_state, source_state)
+
+        info = raw_model.load_state_dict(compatible_state, strict=False)
+        if adapted_keys:
+            logger.warning(
+                "[resume] adapted checkpoint tensors for widened channels: "
+                + ", ".join(adapted_keys[:8])
+                + (" ..." if len(adapted_keys) > 8 else "")
+            )
+        if skipped_keys:
+            logger.warning(
+                "[resume] skipped incompatible checkpoint tensors: "
+                + ", ".join(skipped_keys[:8])
+                + (" ..." if len(skipped_keys) > 8 else "")
+            )
+        if info.missing_keys:
+            logger.warning(f"[resume] model fallback missing_keys={len(info.missing_keys)}")
+        if info.unexpected_keys:
+            logger.warning(f"[resume] model fallback unexpected_keys={len(info.unexpected_keys)}")
+
+        resumed_step = parse_resume_step(args.resume)
+        metadata_path = metadata_state_path(args.resume)
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            resumed_step = int(metadata.get("global_step", resumed_step))
+
+        resumed_ema_state: Optional[Dict[str, torch.Tensor]] = None
+        ema_path = ema_state_path(args.resume)
+        if ema_decay_enabled and os.path.exists(ema_path):
+            source_ema = _load_checkpoint_state_dict(ema_path)
+            target_ema = {
+                key: value.detach().to(device="cpu", dtype=torch.float32).clone()
+                for key, value in raw_model.state_dict().items()
+            }
+            compatible_ema, adapted_ema_keys, skipped_ema_keys = _build_compatible_state(target_ema, source_ema)
+            for key, value in compatible_ema.items():
+                target_ema[key] = value.to(device="cpu", dtype=torch.float32)
+            resumed_ema_state = target_ema
+            if adapted_ema_keys:
+                logger.warning(
+                    "[resume] adapted EMA tensors for widened channels: "
+                    + ", ".join(adapted_ema_keys[:8])
+                    + (" ..." if len(adapted_ema_keys) > 8 else "")
+                )
+            if skipped_ema_keys:
+                logger.warning(
+                    "[resume] skipped incompatible EMA tensors: "
+                    + ", ".join(skipped_ema_keys[:8])
+                    + (" ..." if len(skipped_ema_keys) > 8 else "")
+                )
+            logger.info(f"[resume] loaded compatible EMA state from {ema_path}")
+
+        logger.info(f"[resume] restored_global_step={resumed_step} (fallback=model+ema-only)")
+        return resumed_step, resumed_ema_state
+
+    if not getattr(args, "resume", None):
+        return 0, None
+
+    logger.info(f"[resume] loading training state from {args.resume}")
+    try:
+        accelerator.load_state(args.resume)
+    except RuntimeError as resume_error:
+        logger.warning(f"[resume] accelerator.load_state failed: {resume_error}")
+        return _fallback_resume_with_model_only()
+
+    resumed_step = parse_resume_step(args.resume)
+    metadata_path = metadata_state_path(args.resume)
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        resumed_step = int(metadata.get("global_step", resumed_step))
+
+    resumed_ema_state: Optional[Dict[str, torch.Tensor]] = None
+    ema_path = ema_state_path(args.resume)
+    if ema_decay_enabled and os.path.exists(ema_path):
+        resumed_ema_state = load_safetensors(ema_path)
+        resumed_ema_state = {key: value.to(device="cpu", dtype=torch.float32) for key, value in resumed_ema_state.items()}
+        logger.info(f"[resume] loaded EMA state from {ema_path}")
+
+    logger.info(f"[resume] restored_global_step={resumed_step}")
+    return resumed_step, resumed_ema_state
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--semantic_config", type=str, required=True)
@@ -48,13 +375,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--material_lora_weights", type=str, required=True)
     parser.add_argument("--material_lora_multiplier", type=float, default=1.0)
     parser.add_argument("--controlnet_model_name_or_path", type=str, default=None)
+    parser.add_argument("--controlnet_multiplier", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--bind_pair_seed", type=int, default=None,
+                        help="Override bind_pair_seed from config (seeds bind negative mode/ROI/shift/retry RNG). "
+                             "Set per-replicate to vary the bind sampling trajectory independently of --seed.")
     parser.add_argument("--resolution", type=int, nargs=2, default=None)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--max_train_steps", type=int, default=8000)
     parser.add_argument("--save_every_n_steps", type=int, default=500)
+    parser.add_argument("--save_warmup_every_n_steps", type=int, default=0)
+    parser.add_argument("--save_warmup_steps", type=int, default=0)
+    parser.add_argument("--save_every_n_steps_after_warmup", type=int, default=0)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--gradient_checkpointing", action="store_true")
@@ -67,6 +401,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_token_length", type=int, default=None)
     parser.add_argument("--tokenizer_cache_dir", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=4)
+    parser.add_argument("--dataloader_pin_memory", dest="dataloader_pin_memory", action="store_true")
+    parser.add_argument("--no_dataloader_pin_memory", dest="dataloader_pin_memory", action="store_false")
+    parser.add_argument("--dataloader_persistent_workers", dest="dataloader_persistent_workers", action="store_true")
+    parser.add_argument("--no_dataloader_persistent_workers", dest="dataloader_persistent_workers", action="store_false")
+    parser.set_defaults(dataloader_pin_memory=True, dataloader_persistent_workers=True)
+    parser.add_argument("--enable_cudnn_benchmark", dest="enable_cudnn_benchmark", action="store_true")
+    parser.add_argument("--disable_cudnn_benchmark", dest="enable_cudnn_benchmark", action="store_false")
+    parser.add_argument("--enable_tf32", dest="enable_tf32", action="store_true")
+    parser.add_argument("--disable_tf32", dest="enable_tf32", action="store_false")
+    parser.set_defaults(enable_cudnn_benchmark=True, enable_tf32=True)
     parser.add_argument("--vae", type=str, default=None)
     parser.add_argument("--lowram", action="store_true")
     parser.add_argument("--disable_mmap_load_safetensors", action="store_true")
@@ -74,8 +419,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full_bf16", action="store_true")
     parser.add_argument("--no_half_vae", action="store_true")
     parser.add_argument("--save_dtype", type=str, default="fp16", choices=["fp16", "bf16", "float"])
+    parser.add_argument("--save_state", action="store_true")
+    parser.add_argument("--save_state_on_train_end", action="store_true")
+    parser.add_argument("--save_last_n_steps_state", type=int, default=None)
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--sanity_samples", type=int, default=32)
-    parser.add_argument("--debug_dump_samples", type=int, default=3)
+    parser.add_argument("--debug_dump_samples", type=int, default=0)
     parser.add_argument("--skip_lora_sanity_check", action="store_true")
     parser.add_argument("--lora_sanity_steps", type=int, default=6)
     parser.add_argument(
@@ -85,12 +434,73 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lora_sanity_prompt2", type=str, default=None)
     parser.add_argument("--loss_trace_every", type=int, default=5)
+    parser.add_argument("--ema_decay", type=float, default=0.0)
+    parser.add_argument("--ema_eval_at_anchors", action="store_true")
+    parser.add_argument("--eval_steps_csv", type=str, default="")
+    parser.add_argument("--skip_step0_eval", action="store_true", help="Skip step 0 evaluation to reduce memory pressure")
     return parser.parse_args()
+
+
+def _parse_steps_csv(steps_csv: str) -> List[int]:
+    if not steps_csv:
+        return []
+    steps: List[int] = []
+    for raw in str(steps_csv).split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        steps.append(int(token))
+    return sorted(set(steps))
+
+
+def should_save_checkpoint(args: argparse.Namespace, global_step: int, resumed_step: int) -> bool:
+    warmup_every = int(getattr(args, "save_warmup_every_n_steps", 0) or 0)
+    warmup_steps = int(getattr(args, "save_warmup_steps", 0) or 0)
+    after_every = int(getattr(args, "save_every_n_steps_after_warmup", 0) or 0)
+
+    if warmup_every > 0 and warmup_steps > 0 and after_every > 0 and global_step > resumed_step:
+        steps_since_resume = global_step - resumed_step
+        if steps_since_resume <= warmup_steps:
+            return (steps_since_resume % warmup_every) == 0
+        return ((steps_since_resume - warmup_steps) % after_every) == 0
+
+    return (global_step % max(1, int(args.save_every_n_steps))) == 0
 
 
 def unwrap_model(accelerator: Accelerator, model):
     model = accelerator.unwrap_model(model)
     return model._orig_mod if is_compiled_module(model) else model
+
+
+def init_ema_state(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    state: Dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for key, value in model.state_dict().items():
+            state[key] = value.detach().to(device="cpu", dtype=torch.float32, copy=True)
+    return state
+
+
+def update_ema_state(model: torch.nn.Module, ema_state: Dict[str, torch.Tensor], decay: float) -> None:
+    with torch.no_grad():
+        for key, value in model.state_dict().items():
+            ema_state[key].mul_(decay).add_(value.detach().to(device="cpu", dtype=torch.float32), alpha=1.0 - decay)
+
+
+def swap_model_state(model: torch.nn.Module, target_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    backup: Dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        current_state = model.state_dict()
+        for key, value in current_state.items():
+            backup[key] = value.detach().to(device="cpu", copy=True)
+            value.copy_(target_state[key].to(device=value.device, dtype=value.dtype))
+    return backup
+
+
+def restore_model_state(model: torch.nn.Module, backup_state: Dict[str, torch.Tensor]) -> None:
+    with torch.no_grad():
+        current_state = model.state_dict()
+        for key, value in current_state.items():
+            value.copy_(backup_state[key].to(device=value.device, dtype=value.dtype))
 
 
 def resolve_save_dtype(name: str) -> torch.dtype:
@@ -127,6 +537,60 @@ def load_semantic_config(path: str) -> Dict[str, object]:
 def parse_alpha_config(config: Dict[str, object]) -> Dict[str, object]:
     alpha = config.get("alpha", {})
     head_scales = alpha.get("head_scales", [0, 3, 6, 8])
+    bind_ratio = float(alpha.get("bind_paired_batch_ratio", 0.33))
+    bind_ratio = max(0.0, min(1.0, bind_ratio))
+    raw_mode_weights = alpha.get(
+        "bind_negative_mode_weights",
+        {
+            "wall_to_flat_suppression": 0.40,
+            "flat_to_wall_injection": 0.35,
+            "local_spatial_misalignment": 0.25,
+            "channel_consistent_scramble": 0.0,
+            "hybrid_local_warp": 0.0,
+        },
+    )
+    if not isinstance(raw_mode_weights, dict):
+        raw_mode_weights = {}
+    bind_negative_mode_weights = {
+        "wall_to_flat_suppression": float(raw_mode_weights.get("wall_to_flat_suppression", 0.40)),
+        "flat_to_wall_injection": float(raw_mode_weights.get("flat_to_wall_injection", 0.35)),
+        "local_spatial_misalignment": float(raw_mode_weights.get("local_spatial_misalignment", 0.25)),
+        "channel_consistent_scramble": float(raw_mode_weights.get("channel_consistent_scramble", 0.0)),
+        "hybrid_local_warp": float(raw_mode_weights.get("hybrid_local_warp", 0.0)),
+    }
+    
+    # Parse step-gated C activation parameters
+    bind_negative_mode_c_activation_step = int(alpha.get("bind_negative_mode_c_activation_step", -1))
+    raw_mode_weights_until_c = alpha.get("bind_negative_mode_weights_until_c_activation", None)
+    if not isinstance(raw_mode_weights_until_c, dict):
+        raw_mode_weights_until_c = None
+    bind_negative_mode_weights_until_c = None
+    if raw_mode_weights_until_c is not None:
+        bind_negative_mode_weights_until_c = {
+            "wall_to_flat_suppression": float(raw_mode_weights_until_c.get("wall_to_flat_suppression", 0.40)),
+            "flat_to_wall_injection": float(raw_mode_weights_until_c.get("flat_to_wall_injection", 0.35)),
+            "local_spatial_misalignment": float(raw_mode_weights_until_c.get("local_spatial_misalignment", 0.25)),
+            "channel_consistent_scramble": float(raw_mode_weights_until_c.get("channel_consistent_scramble", 0.0)),
+            "hybrid_local_warp": float(raw_mode_weights_until_c.get("hybrid_local_warp", 0.0)),
+        }
+
+    bind_negative_mode_schedule = str(alpha.get("bind_negative_mode_schedule", "none")).strip().lower()
+    bind_negative_mode_c_ramp_start_step = int(alpha.get("bind_negative_mode_c_ramp_start_step", 0))
+    bind_negative_mode_c_ramp_end_step = int(alpha.get("bind_negative_mode_c_ramp_end_step", 50))
+    bind_negative_mode_c_ramp_start_weight = float(alpha.get("bind_negative_mode_c_ramp_start_weight", 0.05))
+    bind_negative_mode_c_ramp_end_weight = float(alpha.get("bind_negative_mode_c_ramp_end_weight", 0.25))
+    raw_probe_steps = alpha.get("bind_negative_mode_schedule_probe_steps", [0, 10, 20, 30, 40, 50, 75, 100])
+    if not isinstance(raw_probe_steps, list):
+        raw_probe_steps = [0, 10, 20, 30, 40, 50, 75, 100]
+    bind_negative_mode_schedule_probe_steps = sorted({max(0, int(step)) for step in raw_probe_steps})
+    raw_c_targeted_classes = alpha.get("bind_c_targeted_classes", "mixed,ceiling")
+    if isinstance(raw_c_targeted_classes, str):
+        bind_c_targeted_classes = [v.strip().lower() for v in raw_c_targeted_classes.split(",") if v.strip()]
+    elif isinstance(raw_c_targeted_classes, list):
+        bind_c_targeted_classes = [str(v).strip().lower() for v in raw_c_targeted_classes if str(v).strip()]
+    else:
+        bind_c_targeted_classes = ["mixed", "ceiling"]
+    
     return {
         "enabled": bool(alpha.get("enabled", False)),
         "strict_alpha": bool(alpha.get("strict_alpha", False)),
@@ -157,11 +621,147 @@ def parse_alpha_config(config: Dict[str, object]) -> Dict[str, object]:
         "baseline_mode": str(alpha.get("baseline_mode", "none")),
         "pre_gate_target_terrain_iou_min": float(alpha.get("pre_gate_target_terrain_iou_min", 0.60)),
         "terrain_mask_black_is_terrain": bool(alpha.get("terrain_mask_black_is_terrain", True)),
+        "bind_preference_weight": float(alpha.get("bind_preference_weight", 0.0)),
+        "bind_preference_margin": float(alpha.get("bind_preference_margin", 0.0)),
+        "bind_paired_batch_ratio": bind_ratio,
+        "bind_pair_seed": int(alpha.get("bind_pair_seed", 1337)),
+        "bind_negative_mode": str(alpha.get("bind_negative_mode", "mixed")),
+        "bind_negative_mode_weights": bind_negative_mode_weights,
+        "bind_negative_roi_min_frac": float(alpha.get("bind_negative_roi_min_frac", 0.08)),
+        "bind_negative_roi_max_frac": float(alpha.get("bind_negative_roi_max_frac", 0.28)),
+        "bind_log_margin_variant": bool(alpha.get("bind_log_margin_variant", True)),
+        "bind_negative_mode_c_activation_step": bind_negative_mode_c_activation_step,
+        "bind_negative_mode_weights_until_c": bind_negative_mode_weights_until_c,
+        "bind_negative_mode_schedule": bind_negative_mode_schedule,
+        "bind_negative_mode_c_ramp_start_step": bind_negative_mode_c_ramp_start_step,
+        "bind_negative_mode_c_ramp_end_step": bind_negative_mode_c_ramp_end_step,
+        "bind_negative_mode_c_ramp_start_weight": bind_negative_mode_c_ramp_start_weight,
+        "bind_negative_mode_c_ramp_end_weight": bind_negative_mode_c_ramp_end_weight,
+        "bind_negative_mode_schedule_probe_steps": bind_negative_mode_schedule_probe_steps,
+        "bind_c_directional_rejection_strength": float(alpha.get("bind_c_directional_rejection_strength", 0.14)),
+        "bind_c_signed_polarity_strength": float(alpha.get("bind_c_signed_polarity_strength", 0.18)),
+        "bind_c_interior_haze_suppression": float(alpha.get("bind_c_interior_haze_suppression", 0.12)),
+        "bind_c_transition_softness": float(alpha.get("bind_c_transition_softness", 0.12)),
+        "bind_c_directional_gate_threshold": float(alpha.get("bind_c_directional_gate_threshold", 0.08)),
+        "bind_c_targeted_classes": bind_c_targeted_classes,
     }
+
+
+def _resolve_effective_mode_weights(alpha_config: Dict[str, object], current_step: int = -1) -> Dict[str, float]:
+    schedule = str(alpha_config.get("bind_negative_mode_schedule", "none")).strip().lower()
+    full_weights = dict(alpha_config.get("bind_negative_mode_weights", {}) or {})
+
+    if schedule == "linear_c_ramp" and current_step >= 0:
+        ramp_start = int(alpha_config.get("bind_negative_mode_c_ramp_start_step", 0))
+        ramp_end = int(alpha_config.get("bind_negative_mode_c_ramp_end_step", 50))
+        c_start = float(alpha_config.get("bind_negative_mode_c_ramp_start_weight", 0.05))
+        c_end = float(alpha_config.get("bind_negative_mode_c_ramp_end_weight", 0.25))
+
+        if ramp_end <= ramp_start:
+            ramp_end = ramp_start + 1
+
+        if current_step <= ramp_start:
+            t = 0.0
+        elif current_step >= ramp_end:
+            t = 1.0
+        else:
+            t = float(current_step - ramp_start) / float(ramp_end - ramp_start)
+
+        c_weight = c_start + (c_end - c_start) * t
+        c_weight = max(0.0, min(1.0, c_weight))
+        remaining = max(0.0, 1.0 - c_weight)
+
+        a_base = max(0.0, float(full_weights.get("wall_to_flat_suppression", 0.40)))
+        b_base = max(0.0, float(full_weights.get("flat_to_wall_injection", 0.35)))
+        ab_total = a_base + b_base
+        if ab_total <= 0.0:
+            a_base, b_base = 0.40, 0.35
+            ab_total = 0.75
+
+        return {
+            "wall_to_flat_suppression": remaining * (a_base / ab_total),
+            "flat_to_wall_injection": remaining * (b_base / ab_total),
+            "local_spatial_misalignment": c_weight,
+        }
+
+    # Fallback to existing hard-delay behavior.
+    c_activation_step = int(alpha_config.get("bind_negative_mode_c_activation_step", -1))
+    weights_until_c = alpha_config.get("bind_negative_mode_weights_until_c", None)
+    if c_activation_step >= 0 and weights_until_c is not None and current_step >= 0 and current_step < c_activation_step:
+        weights = dict(weights_until_c or {})
+    else:
+        weights = full_weights
+
+    return {
+        "wall_to_flat_suppression": max(0.0, float(weights.get("wall_to_flat_suppression", 0.40))),
+        "flat_to_wall_injection": max(0.0, float(weights.get("flat_to_wall_injection", 0.35))),
+        "local_spatial_misalignment": max(0.0, float(weights.get("local_spatial_misalignment", 0.25))),
+    }
+
+
+def _sample_negative_mode(alpha_config: Dict[str, object], rng: random.Random, current_step: int = -1) -> str:
+    configured_mode = str(alpha_config.get("bind_negative_mode", "mixed")).strip().lower()
+    supported = (
+        "wall_to_flat_suppression",
+        "flat_to_wall_injection",
+        "local_spatial_misalignment",
+    )
+
+    if configured_mode != "mixed":
+        if configured_mode in supported:
+            return configured_mode
+        logger.warning(f"unsupported bind_negative_mode='{configured_mode}', falling back to wall_to_flat_suppression")
+        return "wall_to_flat_suppression"
+
+    mode_weights = _resolve_effective_mode_weights(alpha_config, current_step=current_step)
+    total = sum(mode_weights.values())
+    if total <= 0.0:
+        logger.warning("bind_negative_mode_weights sum to <= 0; falling back to wall_to_flat_suppression")
+        return "wall_to_flat_suppression"
+
+    draw = rng.uniform(0.0, total)
+    cumulative = 0.0
+    for mode, weight in mode_weights.items():
+        cumulative += weight
+        if draw <= cumulative:
+            return mode
+    return "wall_to_flat_suppression"
+
+
+def _mode_c_precondition(
+    dataset: TerrainSemanticManifestDataset,
+    conditioning: torch.Tensor,
+    terrain_mask_black_is_terrain: bool = True,
+) -> Tuple[bool, str]:
+    _, _, groups = _build_extreme_contrast_conditioning(dataset, conditioning)
+    terrain_indices = groups.get("terrain_mask", [])
+    edge_indices = groups.get("edge", [])
+    openness_indices = groups.get("openness", [])
+    non_mask_indices = edge_indices + openness_indices
+    if not terrain_indices:
+        return False, "missing_terrain_mask_channel"
+    if not non_mask_indices:
+        return False, "missing_nonmask_geometry_channels"
+
+    terrain_idx = terrain_indices[0]
+    terrain = conditioning[:, terrain_idx : terrain_idx + 1, :, :]
+    if terrain_mask_black_is_terrain:
+        terrain_presence = (terrain < 0.5).float().mean().item()
+    else:
+        terrain_presence = (terrain > 0.5).float().mean().item()
+    if terrain_presence < 0.01:
+        return False, "terrain_presence_too_low"
+    if terrain_presence > 0.99:
+        return False, "terrain_presence_too_high"
+    return True, "none"
 
 
 def parse_verification_config(config: Dict[str, object]) -> Dict[str, object]:
     verification = config.get("verification", {})
+    raw_sweep = verification.get("multiplier_sweep", [2.0, 3.0, 5.0])
+    if not isinstance(raw_sweep, list) or not raw_sweep:
+        raise ValueError("verification.multiplier_sweep must be a non-empty list")
+    multiplier_sweep = [float(value) for value in raw_sweep]
     return {
         "enabled": bool(verification.get("enabled", True)),
         "log_every": int(verification.get("log_every", 25)),
@@ -171,8 +771,18 @@ def parse_verification_config(config: Dict[str, object]) -> Dict[str, object]:
         "controlnet_sanity_steps": int(verification.get("controlnet_sanity_steps", 6)),
         "controlnet_min_mse": float(verification.get("controlnet_min_mse", 1e-6)),
         "save_sanity_previews": bool(verification.get("save_sanity_previews", True)),
+        "run_multiplier_sweep_sanity": bool(verification.get("run_multiplier_sweep_sanity", True)),
+        "run_extreme_contrast_test": bool(verification.get("run_extreme_contrast_test", True)),
+        "multiplier_sweep": multiplier_sweep,
         "always_log_during_tiny_overfit": bool(verification.get("always_log_during_tiny_overfit", True)),
         "tiny_overfit_max_steps": int(verification.get("tiny_overfit_max_steps", 400)),
+        "enable_seam_diagnostic_guards": bool(verification.get("enable_seam_diagnostic_guards", False)),
+        "seam_halo_target_energy_min": float(verification.get("seam_halo_target_energy_min", 1e-3)),
+        "seam_loss_contribution_ratio_min": float(verification.get("seam_loss_contribution_ratio_min", 0.05)),
+        "train_expanded_supervision_enabled": bool(verification.get("train_expanded_supervision_enabled", False)),
+        "train_expanded_halo_px": int(verification.get("train_expanded_halo_px", 0)),
+        "save_seam_visual_debug": bool(verification.get("save_seam_visual_debug", False)),
+        "seam_visual_debug_max_steps": int(verification.get("seam_visual_debug_max_steps", 2)),
     }
 
 
@@ -180,6 +790,41 @@ def parse_conditioning_config(config: Dict[str, object]) -> Dict[str, object]:
     conditioning = config.get("conditioning", {})
     return {
         "cond_embedding_lr_multiplier": float(conditioning.get("cond_embedding_lr_multiplier", 10.0)),
+    }
+
+
+def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
+    seam = config.get("seam", {})
+    return {
+        "enabled": bool(seam.get("enabled", False)),
+        "strip_width_px": int(seam.get("strip_width_px", 64)),
+        "state_all_defined_weight": float(seam.get("state_all_defined_weight", 0.25)),
+        "state_partial_defined_weight": float(seam.get("state_partial_defined_weight", 0.50)),
+        "state_none_defined_weight": float(seam.get("state_none_defined_weight", 0.25)),
+        "partial_one_edge_ratio": float(seam.get("partial_one_edge_ratio", 0.45)),
+        "undefined_zero_prob": float(seam.get("undefined_zero_prob", 0.40)),
+        "undefined_noise_prob": float(seam.get("undefined_noise_prob", 0.40)),
+        "alpha_local_loss_weight": float(seam.get("alpha_local_loss_weight", 0.0)),
+        "loss_narrow_min_decay": float(seam.get("loss_narrow_min_decay", 0.5)),
+        "margin_inner_px": int(seam.get("margin_inner_px", 32)),
+        "margin_inner_weight": float(seam.get("margin_inner_weight", 1.0)),
+        "margin_outer_weight": float(seam.get("margin_outer_weight", 0.7)),
+        "interior_band_inner_px": int(seam.get("interior_band_inner_px", 16)),
+        "interior_band_outer_px": int(seam.get("interior_band_outer_px", 32)),
+        "interior_band_inner_weight": float(seam.get("interior_band_inner_weight", 0.8)),
+        "interior_band_outer_weight": float(seam.get("interior_band_outer_weight", 0.5)),
+        "rgb_recon_loss_weight": float(seam.get("rgb_recon_loss_weight", 0.0)),
+        "normalize_region_losses": bool(seam.get("normalize_region_losses", True)),
+        "require_defined_for_margin_and_band": bool(seam.get("require_defined_for_margin_and_band", True)),
+        "force_defined_strip_supervision": bool(seam.get("force_defined_strip_supervision", True)),
+        "seam_supervision_expand_px": int(seam.get("seam_supervision_expand_px", 0)),
+        "boundary_chunk_stride_px": int(seam.get("boundary_chunk_stride_px", 16)),
+        "boundary_grid_offset_x_px": int(seam.get("boundary_grid_offset_x_px", 0)),
+        "boundary_grid_offset_y_px": int(seam.get("boundary_grid_offset_y_px", 0)),
+        "boundary_alignment_error_max_px": float(seam.get("boundary_alignment_error_max_px", 0.5)),
+        "boundary_consistency_error_max_px": float(seam.get("boundary_consistency_error_max_px", 0.5)),
+        "seed": int(seam.get("seed", 1337)),
+        "fixed_defined_edge": str(seam.get("fixed_defined_edge", "") or "").strip().lower(),
     }
 
 
@@ -228,6 +873,8 @@ def parse_evaluation_config(
         "supervision_expand_px": int(alpha_config.get("supervision_expand_px", 0)),
         "alpha_output_source": str(alpha_config.get("output_source", "main")),
         "terrain_mask_black_is_terrain": bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+        "expanded_prediction_enabled": bool(evaluation.get("expanded_prediction_enabled", False)),
+        "expanded_halo_px": int(evaluation.get("expanded_halo_px", 0)),
         "alpha_iou_min": float(evaluation.get("alpha_iou_min", 0.35)),
         "alpha_bce_max": float(evaluation.get("alpha_bce_max", 0.62)),
         "alpha_corr_min": float(evaluation.get("alpha_corr_min", 0.30)),
@@ -238,6 +885,42 @@ def parse_evaluation_config(
         "alpha_bce_delta_min": float(evaluation.get("alpha_bce_delta_min", 0.05)),
         "diffusion_tail_slope_max": float(evaluation.get("diffusion_tail_slope_max", 0.002)),
         "run_name": output_name,
+    }
+
+
+def parse_binding_eval_config(
+    config: Dict[str, object],
+    alpha_config: Dict[str, object],
+) -> Dict[str, object]:
+    """Parse [binding_eval] section from the semantic config.
+
+    Returns a dict consumed by resolve_swap_pairs() and run_semantic_binding_eval().
+    All fields have safe defaults so the section is optional.
+    """
+    binding = config.get("binding_eval", {})
+    enabled = bool(binding.get("enabled", False))
+    if not enabled:
+        return {"enabled": False}
+
+    swap_manifest_path = binding.get("swap_manifest_path")
+    if not swap_manifest_path:
+        return {"enabled": False}
+    if not os.path.isabs(swap_manifest_path):
+        swap_manifest_path = os.path.normpath(
+            os.path.join(config["__config_dir"], str(swap_manifest_path))
+        )
+
+    return {
+        "enabled": True,
+        "swap_manifest_path": swap_manifest_path,
+        "seeds_panel": [int(s) for s in binding.get("seeds_panel", [1234, 5678, 9012])],
+        "inference_steps": int(binding.get("inference_steps", 8)),
+        "blur_radius": float(binding.get("blur_radius", 1.5)),
+        "ablation_shuffle_seed": int(binding.get("ablation_shuffle_seed", 9999)),
+        "terrain_mask_channel_index": int(binding.get("terrain_mask_channel_index", 3)),
+        "null_space_channel_groups": list(binding.get("null_space_channel_groups", [[4, 5, 6, 7], [8, 9, 10, 11], [0, 1, 2]])),
+        "null_space_group_names": list(binding.get("null_space_group_names", ["edge_channels", "openness_channels", "base_semantic"])),
+        "alpha_output_source": str(alpha_config.get("output_source", "main")),
     }
 
 
@@ -277,8 +960,10 @@ def build_dataset(
     args: argparse.Namespace,
     semantic_config: Dict[str, object],
     alpha_config: Dict[str, object],
+    seam_config: Optional[Dict[str, object]] = None,
 ) -> TerrainSemanticManifestDataset:
     training = semantic_config["training"]
+    verification = semantic_config.get("verification", {})
     resolution = tuple(args.resolution) if args.resolution is not None else tuple(training["resolution"])
     channel_specs = parse_channel_specs(semantic_config)
     vae_cache_key = args.latent_cache_vae_key
@@ -301,6 +986,25 @@ def build_dataset(
         latent_cache_vae_key=vae_cache_key,
         enable_alpha_supervision=alpha_config["enabled"],
         strict_alpha=alpha_config["strict_alpha"],
+        seam_enabled=bool((seam_config or {}).get("enabled", False)),
+        seam_strip_width_px=int((seam_config or {}).get("strip_width_px", 64)),
+        seam_state_all_defined_weight=float((seam_config or {}).get("state_all_defined_weight", 0.25)),
+        seam_state_partial_defined_weight=float((seam_config or {}).get("state_partial_defined_weight", 0.50)),
+        seam_state_none_defined_weight=float((seam_config or {}).get("state_none_defined_weight", 0.25)),
+        seam_partial_one_edge_ratio=float((seam_config or {}).get("partial_one_edge_ratio", 0.45)),
+        seam_undefined_zero_prob=float((seam_config or {}).get("undefined_zero_prob", 0.40)),
+        seam_undefined_noise_prob=float((seam_config or {}).get("undefined_noise_prob", 0.40)),
+        expanded_target_halo_px=(
+            int(verification.get("train_expanded_halo_px", 0))
+            if bool(verification.get("train_expanded_supervision_enabled", False))
+            else 0
+        ),
+        boundary_chunk_stride_px=int((seam_config or {}).get("boundary_chunk_stride_px", 16)),
+        boundary_grid_offset_x_px=int((seam_config or {}).get("boundary_grid_offset_x_px", 0)),
+        boundary_grid_offset_y_px=int((seam_config or {}).get("boundary_grid_offset_y_px", 0)),
+        boundary_alignment_error_max_px=float((seam_config or {}).get("boundary_alignment_error_max_px", 0.5)),
+        boundary_consistency_error_max_px=float((seam_config or {}).get("boundary_consistency_error_max_px", 0.5)),
+        seam_seed=int((seam_config or {}).get("seed", 1337)),
     )
 
 
@@ -318,8 +1022,30 @@ def semantic_collate(samples: List[Dict[str, object]]) -> Dict[str, object]:
         "trusted_box",
         "trusted_ratio",
         "sampling_weight",
+        "seam_enabled",
     }
-    optional_tensor_keys = {"latents", "alpha_target"}
+    optional_tensor_keys = {
+        "latents",
+        "alpha_target",
+        "expanded_images",
+        "expanded_alpha_target",
+        "expanded_trusted_mask",
+        "expanded_target_sizes_hw",
+        "expanded_zero_mask",
+        "expanded_crop_box",
+        "seam_strip_tensor",
+        "edge_defined_flags",
+        "edge_flag_maps",
+        "edge_band_masks",
+        "seam_decay_maps",
+        "expanded_edge_band_masks",
+        "expanded_seam_decay_maps",
+        "seam_state_label",
+        "seam_undefined_mode",
+        "seam_strip_width_px",
+        "boundary_alignment_error",
+        "boundary_consistency_error",
+    }
 
     for key in tensor_keys:
         batch[key] = torch.stack([sample[key] for sample in samples], dim=0)
@@ -333,12 +1059,75 @@ def semantic_collate(samples: List[Dict[str, object]]) -> Dict[str, object]:
 
     batch["image_name"] = [sample["image_name"] for sample in samples]
     batch["special_structure_tags"] = [sample["special_structure_tags"] for sample in samples]
+    batch["assigned_crop_class"] = [sample.get("assigned_crop_class", "") for sample in samples]
     batch["crop_size_class"] = [sample["crop_size_class"] for sample in samples]
     batch["generation_strategy"] = [sample["generation_strategy"] for sample in samples]
     batch["prompt"] = samples[0]["prompt"]
     batch["prompt2"] = samples[0]["prompt2"]
     batch["channel_names"] = samples[0]["channel_names"]
+    if "full_conditioning_channel_names" in samples[0]:
+        batch["full_conditioning_channel_names"] = samples[0]["full_conditioning_channel_names"]
     return batch
+
+
+def build_model_visible_conditioning(
+    batch: Dict[str, object],
+    dataset: TerrainSemanticManifestDataset,
+    seam_config: Dict[str, object],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, List[str], Dict[str, float]]:
+    conditioning = batch["conditioning_images"].to(device, dtype=dtype)
+    seam_enabled = bool(seam_config.get("enabled", False))
+    diagnostics = {
+        "seam_enabled": 1.0 if seam_enabled else 0.0,
+        "seam_defined_ratio": 0.0,
+        "seam_pre_gate_l2": 0.0,
+        "seam_post_gate_l2": 0.0,
+        "seam_visible_conditioning_l2": 0.0,
+        "seam_undefined_edges_count": 0.0,
+        "seam_undefined_pre_gate_l2": 0.0,
+        "seam_undefined_post_gate_l2": 0.0,
+    }
+    edge_names = ("north", "south", "east", "west")
+    for edge_name in edge_names:
+        diagnostics[f"seam_edge_{edge_name}_defined"] = 0.0
+        diagnostics[f"seam_edge_{edge_name}_pre_gate_l2"] = 0.0
+        diagnostics[f"seam_edge_{edge_name}_post_gate_l2"] = 0.0
+        diagnostics[f"seam_edge_{edge_name}_visible_l2"] = 0.0
+    if not seam_enabled or batch.get("seam_strip_tensor") is None or batch.get("edge_defined_flags") is None or batch.get("edge_flag_maps") is None:
+        return conditioning, dataset.channel_names, diagnostics
+
+    seam_strip = batch["seam_strip_tensor"].to(device, dtype=dtype)
+    edge_defined_flags = batch["edge_defined_flags"].to(device, dtype=dtype)
+    edge_flag_maps = batch["edge_flag_maps"].to(device, dtype=dtype)
+
+    # Final post-augmentation gating right before ControlNet input assembly.
+    seam_gate = edge_defined_flags.repeat_interleave(4, dim=1).unsqueeze(-1).unsqueeze(-1)
+    seam_visible = seam_strip * seam_gate
+    full_conditioning = torch.cat([conditioning, seam_visible, edge_flag_maps], dim=1)
+
+    undefined_edge_flags = (1.0 - edge_defined_flags).clamp(0.0, 1.0)
+    undefined_gate = undefined_edge_flags.repeat_interleave(4, dim=1).unsqueeze(-1).unsqueeze(-1)
+    seam_undefined = seam_strip * undefined_gate
+    seam_undefined_visible = seam_visible * undefined_gate
+
+    diagnostics["seam_defined_ratio"] = float(edge_defined_flags.mean().detach().item())
+    diagnostics["seam_pre_gate_l2"] = float(seam_strip.detach().float().pow(2.0).mean().sqrt().item())
+    diagnostics["seam_post_gate_l2"] = float(seam_visible.detach().float().pow(2.0).mean().sqrt().item())
+    diagnostics["seam_visible_conditioning_l2"] = float(full_conditioning.detach().float().pow(2.0).mean().sqrt().item())
+    diagnostics["seam_undefined_edges_count"] = float(undefined_edge_flags.sum().detach().item())
+    diagnostics["seam_undefined_pre_gate_l2"] = float(seam_undefined.detach().float().pow(2.0).mean().sqrt().item())
+    diagnostics["seam_undefined_post_gate_l2"] = float(seam_undefined_visible.detach().float().pow(2.0).mean().sqrt().item())
+    for edge_idx, edge_name in enumerate(edge_names):
+        edge_slice = slice(edge_idx * 4, edge_idx * 4 + 4)
+        edge_pre = seam_strip[:, edge_slice]
+        edge_post = seam_visible[:, edge_slice]
+        diagnostics[f"seam_edge_{edge_name}_defined"] = float(edge_defined_flags[:, edge_idx].mean().detach().item())
+        diagnostics[f"seam_edge_{edge_name}_pre_gate_l2"] = float(edge_pre.detach().float().pow(2.0).mean().sqrt().item())
+        diagnostics[f"seam_edge_{edge_name}_post_gate_l2"] = float(edge_post.detach().float().pow(2.0).mean().sqrt().item())
+        diagnostics[f"seam_edge_{edge_name}_visible_l2"] = float(edge_post.detach().float().pow(2.0).mean().sqrt().item())
+    return full_conditioning, dataset.full_conditioning_channel_names, diagnostics
 
 
 def apply_runtime_material_lora(
@@ -389,7 +1178,8 @@ def prepare_text_conditioning(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    input_ids1, input_ids2 = tokenize_strategy.tokenize([prompt])
+    prompt_batch = [prompt] if isinstance(prompt, str) else list(prompt)
+    input_ids1, input_ids2 = tokenize_strategy.tokenize(prompt_batch)
     encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
         tokenize_strategy,
         [text_encoders[0], text_encoders[1], text_encoders[1]],
@@ -412,6 +1202,40 @@ def build_size_embeddings(batch: Dict[str, object], device: torch.device, dtype:
     ).to(dtype)
 
 
+def _pad_spatial_tensor(tensor: torch.Tensor, pad_px: int, mode: str = "constant", value: float = 0.0) -> torch.Tensor:
+    pad = int(max(0, pad_px))
+    if pad <= 0:
+        return tensor
+    if mode == "constant":
+        return F.pad(tensor, (pad, pad, pad, pad), mode="constant", value=float(value))
+    return F.pad(tensor, (pad, pad, pad, pad), mode=mode)
+
+
+def _center_embed_spatial_tensor(tensor: torch.Tensor, halo_px: int, fill_value: float = 0.0) -> torch.Tensor:
+    halo = int(max(0, halo_px))
+    if halo <= 0:
+        return tensor
+    if tensor.ndim == 3:
+        out = torch.full(
+            (tensor.shape[0], tensor.shape[1] + (2 * halo), tensor.shape[2] + (2 * halo)),
+            float(fill_value),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        out[:, halo : halo + tensor.shape[1], halo : halo + tensor.shape[2]] = tensor
+        return out
+    if tensor.ndim == 4:
+        out = torch.full(
+            (tensor.shape[0], tensor.shape[1], tensor.shape[2] + (2 * halo), tensor.shape[3] + (2 * halo)),
+            float(fill_value),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        out[:, :, halo : halo + tensor.shape[2], halo : halo + tensor.shape[3]] = tensor
+        return out
+    raise ValueError(f"unexpected tensor rank for center embed: {tuple(tensor.shape)}")
+
+
 def _linear_schedule(start: float, end: float, step: int, total_steps: int) -> float:
     if total_steps <= 0:
         return end
@@ -423,6 +1247,261 @@ def _find_channel_index(channel_names: List[str], target_name: str) -> int:
     if target_name not in channel_names:
         raise ValueError(f"required channel '{target_name}' not found in {channel_names}")
     return channel_names.index(target_name)
+
+
+def _fill_channel_with_value_and_clamp(
+    tensor: torch.Tensor,
+    channel_index: int,
+    value: float,
+    channel_specs: List[SemanticChannelSpec],
+) -> None:
+    tensor[:, channel_index, :, :] = value
+    if channel_index < len(channel_specs):
+        vmin, vmax = channel_specs[channel_index].semantic_range
+        tensor[:, channel_index, :, :] = tensor[:, channel_index, :, :].clamp(float(vmin), float(vmax))
+
+
+def _build_extreme_contrast_conditioning(
+    dataset: TerrainSemanticManifestDataset,
+    conditioning: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, List[int]]]:
+    """Construct a geometry-only flat-vs-wall pair.
+
+    Only terrain_mask / edge_* / openness_* channels are changed.
+    All other channels remain bit-identical for strict isolation.
+    """
+    channel_specs = dataset.channel_specs
+    channel_names = dataset.channel_names
+    flat = conditioning.clone()
+    wall = conditioning.clone()
+
+    terrain_idx = _find_channel_index(channel_names, "terrain_mask")
+    edge_indices = [idx for idx, spec in enumerate(channel_specs) if spec.atlas_name == "edge"]
+
+    openness_indices = [
+        idx
+        for idx, spec in enumerate(channel_specs)
+        if "open" in spec.name.lower() or "open" in spec.channel_name.lower()
+    ]
+    if not openness_indices:
+        openness_indices = [
+            idx
+            for idx, spec in enumerate(channel_specs)
+            if spec.atlas_name == "interior" and spec.channel_name in {"G", "B", "A"}
+        ]
+
+    _, _, _, width = conditioning.shape
+    split_col = width // 2
+    boundary_start = max(0, split_col - 1)
+    boundary_end = min(width, split_col + 1)
+
+    # terrain_mask is geometry-critical: flat is constant, wall has sharp left/right split.
+    _fill_channel_with_value_and_clamp(flat, terrain_idx, 0.5, channel_specs)
+    wall[:, terrain_idx, :, :split_col] = 0.0
+    wall[:, terrain_idx, :, split_col:] = 1.0
+    if terrain_idx < len(channel_specs):
+        vmin, vmax = channel_specs[terrain_idx].semantic_range
+        wall[:, terrain_idx, :, :] = wall[:, terrain_idx, :, :].clamp(float(vmin), float(vmax))
+
+    # edge channels are zero in flat and only active on the wall boundary.
+    for idx in edge_indices:
+        _fill_channel_with_value_and_clamp(flat, idx, 0.0, channel_specs)
+        wall[:, idx, :, :] = 0.0
+        signed = idx < len(channel_specs) and channel_specs[idx].semantic_range[0] < 0.0
+        if signed:
+            wall[:, idx, :, :split_col] = -1.0
+            wall[:, idx, :, split_col:] = 1.0
+        else:
+            wall[:, idx, :, boundary_start:boundary_end] = 1.0
+        if idx < len(channel_specs):
+            vmin, vmax = channel_specs[idx].semantic_range
+            wall[:, idx, :, :] = wall[:, idx, :, :].clamp(float(vmin), float(vmax))
+
+    # openness channels are constant in flat and directional in wall.
+    for idx in openness_indices:
+        _fill_channel_with_value_and_clamp(flat, idx, 0.5, channel_specs)
+        signed = idx < len(channel_specs) and channel_specs[idx].semantic_range[0] < 0.0
+        if signed:
+            wall[:, idx, :, :split_col] = 1.0
+            wall[:, idx, :, split_col:] = -1.0
+        else:
+            wall[:, idx, :, :split_col] = 1.0
+            wall[:, idx, :, split_col:] = 0.0
+        if idx < len(channel_specs):
+            vmin, vmax = channel_specs[idx].semantic_range
+            wall[:, idx, :, :] = wall[:, idx, :, :].clamp(float(vmin), float(vmax))
+
+    return flat, wall, {
+        "terrain_mask": [terrain_idx],
+        "edge": edge_indices,
+        "openness": openness_indices,
+    }
+
+
+def _is_targeted_c_sample(
+    assigned_crop_class: str,
+    special_structure_tags: str,
+    targeted_classes: List[str],
+) -> bool:
+    cls = (assigned_crop_class or "").strip().lower()
+    tags = (special_structure_tags or "").strip().lower()
+    if cls and cls in targeted_classes:
+        return True
+    if "ceiling" in tags and "ceiling" in targeted_classes:
+        return True
+    return False
+
+
+def _gaussian_blur5x5(x: torch.Tensor) -> torch.Tensor:
+    """Lightweight gaussian low-pass used for haze suppression."""
+    if x.ndim != 4:
+        return x
+    dtype = x.dtype
+    device = x.device
+    k1 = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], device=device, dtype=dtype)
+    k2 = torch.outer(k1, k1)
+    k2 = (k2 / k2.sum()).view(1, 1, 5, 5)
+    weight = k2.repeat(x.shape[1], 1, 1, 1)
+    return F.conv2d(x, weight, stride=1, padding=2, groups=x.shape[1])
+
+
+def _build_corrupted_geometry_conditioning(
+    dataset: TerrainSemanticManifestDataset,
+    conditioning: torch.Tensor,
+    mode: str,
+    rng: random.Random,
+    alpha_config: Optional[Dict[str, object]] = None,
+    assigned_crop_class: Optional[List[str]] = None,
+    special_structure_tags: Optional[List[str]] = None,
+) -> Tuple[torch.Tensor, str, float]:
+    """Build plausible-but-wrong geometry conditioning while preserving non-geometry channels.
+
+    Returns a corrupted conditioning tensor and a mode string.
+    """
+    flat, wall, groups = _build_extreme_contrast_conditioning(dataset, conditioning)
+    terrain_indices = groups.get("terrain_mask", [])
+    edge_indices = groups.get("edge", [])
+    openness_indices = groups.get("openness", [])
+    non_mask_indices = edge_indices + openness_indices
+    geom_indices = terrain_indices + non_mask_indices
+    if not geom_indices:
+        return conditioning.clone(), "none", 0.0
+
+    base_geom = conditioning[:, geom_indices]
+    flat_geom = flat[:, geom_indices]
+    wall_geom = wall[:, geom_indices]
+    dist_to_flat = torch.mean((base_geom - flat_geom) ** 2).item()
+    dist_to_wall = torch.mean((base_geom - wall_geom) ** 2).item()
+    opposite = wall if dist_to_flat <= dist_to_wall else flat
+
+    corrupted = conditioning.clone()
+    if mode == "flat_to_wall_injection" and non_mask_indices:
+        indices_to_replace = non_mask_indices
+        realized_mode = "flat_to_wall_injection"
+    elif mode == "local_spatial_misalignment" and non_mask_indices:
+        indices_to_replace = non_mask_indices
+        realized_mode = "local_spatial_misalignment"
+    else:
+        indices_to_replace = geom_indices
+        realized_mode = "wall_to_flat_suppression"
+
+    if realized_mode == "local_spatial_misalignment":
+        shift_max = max(2, int(min(conditioning.shape[-2], conditioning.shape[-1]) * 0.06))
+        shift_x = rng.randint(1, shift_max) * (-1 if rng.random() < 0.5 else 1)
+        shift_y = rng.randint(1, shift_max) * (-1 if rng.random() < 0.5 else 1)
+        base_selected = conditioning[:, indices_to_replace, :, :]
+        shifted = torch.roll(base_selected, shifts=(shift_y, shift_x), dims=(2, 3))
+
+        cfg = alpha_config or {}
+        directional_strength = float(cfg.get("bind_c_directional_rejection_strength", 0.14))
+        polarity_strength = float(cfg.get("bind_c_signed_polarity_strength", 0.18))
+        haze_suppression = float(cfg.get("bind_c_interior_haze_suppression", 0.12))
+        transition_softness = float(cfg.get("bind_c_transition_softness", 0.12))
+        gate_threshold = max(1e-6, float(cfg.get("bind_c_directional_gate_threshold", 0.08)))
+        targeted_classes = [str(v).strip().lower() for v in cfg.get("bind_c_targeted_classes", ["mixed", "ceiling"]) or []]
+        if not targeted_classes:
+            targeted_classes = ["mixed", "ceiling"]
+
+        bsz = conditioning.shape[0]
+        if assigned_crop_class is None:
+            assigned_crop_class = [""] * bsz
+        if special_structure_tags is None:
+            special_structure_tags = [""] * bsz
+        target_mask = torch.zeros((bsz, 1, 1, 1), device=conditioning.device, dtype=conditioning.dtype)
+        for b in range(bsz):
+            if _is_targeted_c_sample(
+                assigned_crop_class[b] if b < len(assigned_crop_class) else "",
+                special_structure_tags[b] if b < len(special_structure_tags) else "",
+                targeted_classes,
+            ):
+                target_mask[b, 0, 0, 0] = 1.0
+
+        # Directional residual: normalize and gate low-signal regions to avoid unstable directions.
+        residual = shifted - base_selected
+        eps = 1e-6
+        magnitude = torch.abs(residual)
+        r_dir_raw = residual / (magnitude + eps)
+        gate_w = (magnitude / gate_threshold).clamp(0.0, 1.0)
+        r_dir = gate_w * r_dir_raw
+
+        anti = shifted - (directional_strength * r_dir)
+
+        # Signed channels only: optional polarity blend toward meaningful opposite references.
+        if polarity_strength > 0.0:
+            opposite_selected = opposite[:, indices_to_replace, :, :]
+            for local_idx, channel_idx in enumerate(indices_to_replace):
+                if channel_idx < len(dataset.channel_specs) and dataset.channel_specs[channel_idx].semantic_range[0] < 0.0:
+                    anti[:, local_idx : local_idx + 1, :, :] = (
+                        (1.0 - polarity_strength) * anti[:, local_idx : local_idx + 1, :, :]
+                        + polarity_strength * opposite_selected[:, local_idx : local_idx + 1, :, :]
+                    )
+
+        # Remove only low-frequency interior attenuation to reduce haze in openness channels.
+        if haze_suppression > 0.0 and openness_indices:
+            for openness_idx in openness_indices:
+                if openness_idx not in indices_to_replace:
+                    continue
+                local_idx = indices_to_replace.index(openness_idx)
+                channel = anti[:, local_idx : local_idx + 1, :, :]
+                low_freq = _gaussian_blur5x5(channel)
+                anti[:, local_idx : local_idx + 1, :, :] = channel - (haze_suppression * low_freq)
+
+        # Keep non-target classes near baseline shift behavior.
+        shifted = ((1.0 - target_mask) * shifted) + (target_mask * anti)
+
+        terrain_idx = terrain_indices[0] if terrain_indices else 0
+        terrain = conditioning[:, terrain_idx : terrain_idx + 1, :, :]
+        roi = (terrain > 0.5).float()
+        if float(roi.mean().item()) <= 0.0:
+            return conditioning.clone(), "none", 0.0
+        if transition_softness > 0.0:
+            roi_blur = _gaussian_blur5x5(roi)
+            roi = ((1.0 - transition_softness) * roi) + (transition_softness * roi_blur)
+            roi = roi.clamp(0.0, 1.0)
+        replacement = (
+            (1.0 - roi) * base_selected
+            + roi * shifted
+        )
+        corrupted[:, indices_to_replace, :, :] = replacement.to(corrupted.dtype)
+    else:
+        corrupted[:, indices_to_replace, :, :] = opposite[:, indices_to_replace, :, :].to(corrupted.dtype)
+
+    if terrain_indices and non_mask_indices:
+        terrain_idx = terrain_indices[0]
+        terrain = conditioning[:, terrain_idx : terrain_idx + 1, :, :]
+        wall_zone = terrain > 0.6
+        flat_zone = terrain < 0.4
+        for idx in non_mask_indices:
+            channel = corrupted[:, idx : idx + 1, :, :]
+            channel = torch.where(wall_zone, torch.zeros_like(channel), channel)
+            channel = torch.where(flat_zone, opposite[:, idx : idx + 1, :, :], channel)
+            if idx < len(dataset.channel_specs):
+                vmin, vmax = dataset.channel_specs[idx].semantic_range
+                channel = channel.clamp(float(vmin), float(vmax))
+            corrupted[:, idx : idx + 1, :, :] = channel
+
+    delta = torch.mean(torch.abs(corrupted[:, indices_to_replace, :, :] - conditioning[:, indices_to_replace, :, :])).item()
+    return corrupted, realized_mode, float(delta)
 
 
 def _expand_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -445,6 +1524,297 @@ def _masked_mean_per_sample(values: torch.Tensor, mask: torch.Tensor) -> torch.T
     masked_sum = (values * mask).sum(dim=(1, 2, 3))
     masked_area = mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
     return masked_sum / masked_area
+
+
+def _summarize_weighted_seam_regions(
+    error_map: torch.Tensor,
+    seam_maps: Dict[str, torch.Tensor],
+    region_weights: Dict[str, float],
+    normalize_region_losses: bool,
+) -> Dict[str, object]:
+    halo_regions = ("margin_inner", "margin_outer")
+    interior_regions = ("interior_inner", "interior_outer")
+    zero = error_map.new_tensor(0.0)
+
+    region_losses: Dict[str, torch.Tensor] = {}
+    region_raw_sums: Dict[str, torch.Tensor] = {}
+    region_areas: Dict[str, torch.Tensor] = {}
+    for region_name, region_mask in seam_maps.items():
+        area = region_mask.sum()
+        if float(area.detach().item()) <= 0.0:
+            continue
+        raw_sum = (error_map * region_mask).sum()
+        region_raw_sums[region_name] = raw_sum
+        region_areas[region_name] = area
+        region_losses[region_name] = raw_sum / area.clamp_min(1e-6)
+
+    def _sum_named(source: Dict[str, torch.Tensor], names: Tuple[str, ...]) -> torch.Tensor:
+        values = [source[name] for name in names if name in source]
+        if not values:
+            return zero
+        return torch.stack(values).sum()
+
+    def _sum_named_weights(names: Tuple[str, ...]) -> torch.Tensor:
+        weights = [zero.new_tensor(float(region_weights[name])) for name in names if name in region_losses and name in region_weights]
+        if not weights:
+            return zero
+        return torch.stack(weights).sum()
+
+    weighted_region_terms_raw = {
+        name: region_losses[name] * float(region_weights.get(name, 1.0))
+        for name in region_losses
+    }
+    region_weighted_contributions: Dict[str, torch.Tensor] = {}
+    halo_weight_den = _sum_named_weights(halo_regions).clamp_min(1e-6)
+    interior_weight_den = _sum_named_weights(interior_regions).clamp_min(1e-6)
+    for region_name, raw_term in weighted_region_terms_raw.items():
+        if normalize_region_losses:
+            if region_name in halo_regions:
+                region_weighted_contributions[region_name] = raw_term / halo_weight_den
+            elif region_name in interior_regions:
+                region_weighted_contributions[region_name] = raw_term / interior_weight_den
+            else:
+                region_weighted_contributions[region_name] = raw_term
+        else:
+            region_weighted_contributions[region_name] = raw_term
+
+    halo_weighted = _sum_named(region_weighted_contributions, halo_regions)
+    interior_weighted = _sum_named(region_weighted_contributions, interior_regions)
+
+    return {
+        "region_losses": region_losses,
+        "halo_loss_raw": _sum_named(region_raw_sums, halo_regions),
+        "interior_loss_raw": _sum_named(region_raw_sums, interior_regions),
+        "halo_supervised_px": _sum_named(region_areas, halo_regions),
+        "interior_supervised_px": _sum_named(region_areas, interior_regions),
+        "halo_loss_weighted": halo_weighted,
+        "interior_loss_weighted": interior_weighted,
+        "total_loss": halo_weighted + interior_weighted,
+        "region_weighted_contributions": region_weighted_contributions,
+    }
+
+
+def _build_seam_region_maps(
+    edge_band_masks: torch.Tensor,
+    seam_decay_maps: torch.Tensor,
+    edge_defined_flags: torch.Tensor,
+    seam_strip_width_px: torch.Tensor,
+    supervision_mask: torch.Tensor,
+    seam_config: Dict[str, object],
+    expanded_halo_px: int = 0,
+) -> Dict[str, torch.Tensor]:
+    """Build normalized seam supervision regions for margin and interior continuity bands."""
+    if edge_band_masks.ndim != 4 or seam_decay_maps.ndim != 4:
+        raise ValueError("seam maps must have shape [batch, edges, height, width]")
+
+    batch_size, _, height, width = edge_band_masks.shape
+    device = edge_band_masks.device
+    dtype = edge_band_masks.dtype
+
+    strip_width = seam_strip_width_px.to(device=device, dtype=dtype).view(batch_size, 1, 1, 1).clamp_min(1.0)
+    margin_inner_px = float(max(1, int(seam_config.get("margin_inner_px", 32))))
+    interior_inner_px = float(max(1, int(seam_config.get("interior_band_inner_px", 16))))
+    interior_outer_px = float(max(int(seam_config.get("interior_band_outer_px", 32)), int(interior_inner_px)))
+
+    yy = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1).expand(batch_size, 1, height, width)
+    xx = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width).expand(batch_size, 1, height, width)
+    dist_top = yy
+    dist_bottom = float(height - 1) - yy
+    dist_right = float(width - 1) - xx
+    dist_left = xx
+
+    margin_inner_limit = torch.minimum(strip_width, torch.full_like(strip_width, margin_inner_px)).clamp_min(1.0)
+
+    if int(expanded_halo_px) > 0:
+        halo = float(int(expanded_halo_px))
+        if halo <= 0.0 or halo * 2.0 >= float(min(height, width)):
+            raise ValueError(
+                "expanded seam geometry has invalid halo size for region construction: "
+                + f"halo_px={expanded_halo_px} hw={(height, width)}"
+            )
+
+        # Expanded mode: seam reference is the interior crop boundary. Assign each outside pixel
+        # to one edge deterministically by shortest distance to that boundary; this keeps corner
+        # ownership stable and inner/outer bands adjacent with no geometric gaps.
+        interior_min_y = halo
+        interior_max_y = float(height - 1) - halo
+        interior_min_x = halo
+        interior_max_x = float(width - 1) - halo
+
+        north_dist_outside = (interior_min_y - yy).clamp(min=0.0)
+        south_dist_outside = (yy - interior_max_y).clamp(min=0.0)
+        east_dist_outside = (xx - interior_max_x).clamp(min=0.0)
+        west_dist_outside = (interior_min_x - xx).clamp(min=0.0)
+
+        north_active = north_dist_outside > 0.0
+        south_active = south_dist_outside > 0.0
+        east_active = east_dist_outside > 0.0
+        west_active = west_dist_outside > 0.0
+        outside_any = north_active | south_active | east_active | west_active
+
+        inf = torch.full_like(north_dist_outside, float("inf"))
+        # Fixed order (north, south, east, west) provides deterministic tie breaks in corners.
+        side_dist_stack = torch.cat(
+            [
+                torch.where(north_active, north_dist_outside, inf),
+                torch.where(south_active, south_dist_outside, inf),
+                torch.where(east_active, east_dist_outside, inf),
+                torch.where(west_active, west_dist_outside, inf),
+            ],
+            dim=1,
+        )
+        side_owner_idx = side_dist_stack.argmin(dim=1, keepdim=True)
+
+        north_owner = outside_any & (side_owner_idx == 0)
+        south_owner = outside_any & (side_owner_idx == 1)
+        east_owner = outside_any & (side_owner_idx == 2)
+        west_owner = outside_any & (side_owner_idx == 3)
+
+        north_inner = (north_owner & (north_dist_outside <= margin_inner_limit)).to(dtype=dtype)
+        south_inner = (south_owner & (south_dist_outside <= margin_inner_limit)).to(dtype=dtype)
+        east_inner = (east_owner & (east_dist_outside <= margin_inner_limit)).to(dtype=dtype)
+        west_inner = (west_owner & (west_dist_outside <= margin_inner_limit)).to(dtype=dtype)
+        north_outer = (north_owner & (north_dist_outside > margin_inner_limit)).to(dtype=dtype)
+        south_outer = (south_owner & (south_dist_outside > margin_inner_limit)).to(dtype=dtype)
+        east_outer = (east_owner & (east_dist_outside > margin_inner_limit)).to(dtype=dtype)
+        west_outer = (west_owner & (west_dist_outside > margin_inner_limit)).to(dtype=dtype)
+
+        margin_inner_per_edge = torch.cat([north_inner, south_inner, east_inner, west_inner], dim=1)
+        margin_outer_per_edge = torch.cat([north_outer, south_outer, east_outer, west_outer], dim=1)
+    else:
+        north_inner = (dist_top < margin_inner_limit).to(dtype=dtype)
+        south_inner = (dist_bottom < margin_inner_limit).to(dtype=dtype)
+        east_inner = (dist_right < margin_inner_limit).to(dtype=dtype)
+        west_inner = (dist_left < margin_inner_limit).to(dtype=dtype)
+        margin_inner_per_edge = torch.cat([north_inner, south_inner, east_inner, west_inner], dim=1) * edge_band_masks
+        margin_outer_per_edge = (edge_band_masks - margin_inner_per_edge).clamp(0.0, 1.0)
+
+    inner_threshold = (1.0 - (interior_inner_px / strip_width)).clamp(0.0, 1.0)
+    outer_threshold = (1.0 - (interior_outer_px / strip_width)).clamp(0.0, 1.0)
+    interior_inner_per_edge = (seam_decay_maps >= inner_threshold).to(dtype=dtype)
+    interior_outer_per_edge = (
+        (seam_decay_maps >= outer_threshold) & (seam_decay_maps < inner_threshold)
+    ).to(dtype=dtype)
+
+    if bool(seam_config.get("require_defined_for_margin_and_band", True)):
+        edge_defined = edge_defined_flags.to(device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
+        margin_inner_per_edge = margin_inner_per_edge * edge_defined
+        margin_outer_per_edge = margin_outer_per_edge * edge_defined
+        interior_inner_per_edge = interior_inner_per_edge * edge_defined
+        interior_outer_per_edge = interior_outer_per_edge * edge_defined
+
+    margin_inner_map = margin_inner_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0) * supervision_mask
+    margin_outer_map = margin_outer_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0) * supervision_mask
+    # Continuation bands should be driven by seam geometry + per-edge defined gating only.
+    # Gating these again by supervision_mask can collapse valid continuation to zero.
+    interior_inner_map = interior_inner_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+    interior_outer_map = interior_outer_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+
+    return {
+        "margin_inner": margin_inner_map,
+        "margin_outer": margin_outer_map,
+        "interior_inner": interior_inner_map,
+        "interior_outer": interior_outer_map,
+        "margin_inner_per_edge": margin_inner_per_edge,
+        "margin_outer_per_edge": margin_outer_per_edge,
+        "interior_inner_per_edge": interior_inner_per_edge,
+        "interior_outer_per_edge": interior_outer_per_edge,
+    }
+
+
+def _build_seam_supervision_mask(
+    trusted_mask: torch.Tensor,
+    edge_band_masks: torch.Tensor,
+    edge_defined_flags: torch.Tensor,
+    seam_config: Dict[str, object],
+) -> torch.Tensor:
+    mask = trusted_mask.float().clamp(0.0, 1.0)
+    expand_px = int(max(0, int(seam_config.get("seam_supervision_expand_px", 0))))
+    if expand_px > 0:
+        mask = _expand_mask(mask, expand_px).clamp(0.0, 1.0)
+
+    if bool(seam_config.get("force_defined_strip_supervision", True)):
+        edge_defined = edge_defined_flags.float().unsqueeze(-1).unsqueeze(-1)
+        defined_edge_band = (edge_band_masks.float() * edge_defined).sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+        mask = torch.maximum(mask, defined_edge_band)
+
+    return mask
+
+
+def _mask_bounds(mask: torch.Tensor) -> Tuple[float, float, float, float]:
+    if mask.ndim != 4:
+        raise ValueError(f"mask bounds expect [batch, channels, height, width], got shape={tuple(mask.shape)}")
+    active = (mask.detach().float() > 0.0).any(dim=1)
+    batch_size, height, width = active.shape
+    y_coords = torch.arange(height, device=mask.device, dtype=torch.float32).view(1, height, 1).expand(batch_size, height, width)
+    x_coords = torch.arange(width, device=mask.device, dtype=torch.float32).view(1, 1, width).expand(batch_size, height, width)
+    has_active = active.view(batch_size, -1).any(dim=1)
+    if not bool(has_active.any().item()):
+        return -1.0, -1.0, -1.0, -1.0
+
+    inf = torch.full((batch_size, height, width), float("inf"), device=mask.device, dtype=torch.float32)
+    neg_inf = torch.full((batch_size, height, width), float("-inf"), device=mask.device, dtype=torch.float32)
+    min_x = torch.where(active, x_coords, inf).amin(dim=(1, 2))
+    max_x = torch.where(active, x_coords, neg_inf).amax(dim=(1, 2))
+    min_y = torch.where(active, y_coords, inf).amin(dim=(1, 2))
+    max_y = torch.where(active, y_coords, neg_inf).amax(dim=(1, 2))
+
+    valid = has_active.float().sum().clamp_min(1.0)
+    return (
+        float((min_x * has_active.float()).sum().item() / valid.item()),
+        float((max_x * has_active.float()).sum().item() / valid.item()),
+        float((min_y * has_active.float()).sum().item() / valid.item()),
+        float((max_y * has_active.float()).sum().item() / valid.item()),
+    )
+
+
+def _save_seam_visual_debug(
+    output_dir: str,
+    step: int,
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    supervision_mask: torch.Tensor,
+    seam_maps: Dict[str, torch.Tensor],
+) -> None:
+    seam_dir = os.path.join(output_dir, "sanity", "seam_debug")
+    os.makedirs(seam_dir, exist_ok=True)
+
+    pred0 = pred_rgb[0].detach().float().cpu()
+    target0 = target_rgb[0].detach().float().cpu()
+    supervision0 = supervision_mask[0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    halo_mask0 = (seam_maps["margin_inner"][0, 0] + seam_maps["margin_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
+    interior_mask0 = (seam_maps["interior_inner"][0, 0] + seam_maps["interior_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
+
+    diff_map = (pred0 - target0).abs().mean(dim=0)
+    halo_diff = (diff_map * halo_mask0).clamp(0.0, 1.0)
+    interior_diff = (diff_map * interior_mask0).clamp(0.0, 1.0)
+
+    halo_norm = halo_diff / max(float(halo_diff.max().item()), 1e-6)
+    interior_norm = interior_diff / max(float(interior_diff.max().item()), 1e-6)
+
+    _tensor_to_image(pred0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_prediction.png"))
+    _tensor_to_image(target0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_target.png"))
+    _mask_to_image(supervision0).save(os.path.join(seam_dir, f"step_{step:06d}_supervision_mask.png"))
+    _mask_to_image(halo_norm).save(os.path.join(seam_dir, f"step_{step:06d}_halo_only_diff_heatmap.png"))
+    _mask_to_image(interior_norm).save(os.path.join(seam_dir, f"step_{step:06d}_interior_band_diff.png"))
+
+    region_overlay = torch.zeros((3, target0.shape[-2], target0.shape[-1]), dtype=torch.float32)
+    margin_inner = seam_maps["margin_inner"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    margin_outer = seam_maps["margin_outer"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    interior_inner = seam_maps["interior_inner"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    interior_outer = seam_maps["interior_outer"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
+
+    # Color key: halo_inner=red, halo_outer=orange, interior_continuation=cyan, interior_core=blue.
+    region_overlay[0] = torch.maximum(region_overlay[0], margin_inner)
+    region_overlay[0] = torch.maximum(region_overlay[0], margin_outer * 0.95)
+    region_overlay[1] = torch.maximum(region_overlay[1], margin_outer * 0.55)
+    region_overlay[1] = torch.maximum(region_overlay[1], interior_inner * 0.9)
+    region_overlay[2] = torch.maximum(region_overlay[2], interior_inner * 0.95)
+    region_overlay[2] = torch.maximum(region_overlay[2], interior_outer)
+
+    base01 = ((target0.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    blended = (0.45 * base01) + (0.55 * region_overlay.clamp(0.0, 1.0))
+    _tensor_to_image((blended * 2.0) - 1.0).save(os.path.join(seam_dir, f"step_{step:06d}_region_overlay.png"))
 
 
 def _terrain_mask_to_occupancy(mask: torch.Tensor, black_is_terrain: bool) -> torch.Tensor:
@@ -762,13 +2132,19 @@ def _log_controlnet_diagnostics(global_step: int, diagnostics: Optional[Dict[str
     if diagnostics is None:
         return
     residuals = diagnostics.get("down_block_residual_norms") or []
+    activations = diagnostics.get("down_block_activation_norms") or []
+    ratios = diagnostics.get("down_block_residual_to_activation_ratios") or []
     residual_str = ",".join([f"{value:.4f}" for value in residuals])
+    activation_str = ",".join([f"{value:.4f}" for value in activations])
+    ratio_str = ",".join([f"{value:.4f}" for value in ratios])
     logger.info(
         "[verify/controlnet] "
         + f"step={global_step} multiplier={float(diagnostics.get('multiplier', 1.0)):.4f} "
         + f"cond_embedding_norm={float(diagnostics.get('cond_embedding_norm', 0.0) or 0.0):.4f} "
         + f"mid_norm={float(diagnostics.get('mid_block_residual_norm', 0.0)):.4f} "
-        + f"down_norms=[{residual_str}]"
+        + f"down_norms=[{residual_str}] "
+        + f"down_activation_norms=[{activation_str}] "
+        + f"down_ratio_residual_to_activation=[{ratio_str}]"
     )
 
 
@@ -785,6 +2161,7 @@ def run_controlnet_influence_sanity_check(
     cached_text: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    seam_config: Dict[str, object],
 ):
     sanity_dir = os.path.join(args.output_dir, "sanity")
     os.makedirs(sanity_dir, exist_ok=True)
@@ -793,7 +2170,20 @@ def run_controlnet_influence_sanity_check(
     control_dtype = next(control_net.parameters()).dtype
 
     sample = dataset[0]
-    conditioning = sample["conditioning_images"].unsqueeze(0).to(device=device, dtype=torch.float32)
+    sample_batch: Dict[str, object] = {
+        "conditioning_images": sample["conditioning_images"].unsqueeze(0),
+        "seam_strip_tensor": sample.get("seam_strip_tensor").unsqueeze(0) if sample.get("seam_strip_tensor") is not None else None,
+        "edge_defined_flags": sample.get("edge_defined_flags").unsqueeze(0) if sample.get("edge_defined_flags") is not None else None,
+        "edge_flag_maps": sample.get("edge_flag_maps").unsqueeze(0) if sample.get("edge_flag_maps") is not None else None,
+    }
+    conditioning, _, _ = build_model_visible_conditioning(
+        sample_batch,
+        dataset,
+        seam_config,
+        device,
+        torch.float32,
+    )
+    contrast_flat, contrast_wall, contrast_channel_groups = _build_extreme_contrast_conditioning(dataset, conditioning)
     target_size = sample["target_sizes_hw"].tolist()
     latent_h = target_size[0] // 8
     latent_w = target_size[1] // 8
@@ -818,10 +2208,15 @@ def run_controlnet_influence_sanity_check(
     vae_original_dtype = next(vae.parameters()).dtype
     vae.to(device=device, dtype=dtype)
 
-    def predict_x0(control_multiplier: float) -> torch.Tensor:
+    def predict_x0(
+        control_multiplier: float,
+        cond_tensor: torch.Tensor,
+        collect_alpha_logits: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         material_lora_unet.set_multiplier(args.material_lora_multiplier)
         material_lora_control.set_multiplier(args.material_lora_multiplier)
         control_net.multiplier = control_multiplier
+        last_alpha_logits: Optional[torch.Tensor] = None
         with torch.no_grad():
             inference_steps = max(2, int(verification_config["controlnet_sanity_steps"]))
             noise_scheduler.set_timesteps(inference_steps, device=device)
@@ -829,10 +2224,25 @@ def run_controlnet_influence_sanity_check(
             for timestep in noise_scheduler.timesteps:
                 t = timestep.expand(1).to(device=device, dtype=torch.long)
                 noisy_control = noisy.to(dtype=control_dtype)
-                cond_control = conditioning.to(dtype=control_dtype)
+                cond_control = cond_tensor.to(dtype=control_dtype)
                 text_control = text_embedding.to(dtype=control_dtype)
                 vector_control = vector_embedding.to(dtype=control_dtype)
-                input_resi_add, mid_add = control_net(noisy_control, t, text_control, vector_control, cond_control)
+                if collect_alpha_logits:
+                    input_resi_add, mid_add, alpha_outputs = control_net(
+                        noisy_control,
+                        t,
+                        text_control,
+                        vector_control,
+                        cond_control,
+                        return_alpha=True,
+                        alpha_target_size=tuple(sample["target_sizes_hw"].tolist()),
+                    )
+                    if alpha_outputs is not None:
+                        candidate_logits = alpha_outputs.get("fused_logits")
+                        if candidate_logits is not None:
+                            last_alpha_logits = candidate_logits.detach().float()
+                else:
+                    input_resi_add, mid_add = control_net(noisy_control, t, text_control, vector_control, cond_control)
 
                 noisy_unet = noisy.to(dtype=unet_dtype)
                 text_unet = text_embedding.to(dtype=unet_dtype)
@@ -845,10 +2255,24 @@ def run_controlnet_influence_sanity_check(
             alpha_t = noise_scheduler.alphas_cumprod[noise_scheduler.timesteps[-1]].to(device=device, dtype=torch.float32)
             alpha_t = alpha_t.view(1, 1, 1, 1)
             pred_x0 = noisy / alpha_t.sqrt()
-        return pred_x0
+        return pred_x0, last_alpha_logits
 
-    pred_on = predict_x0(1.0)
-    pred_off = predict_x0(0.0)
+    def _decode_preview(pred_latents: torch.Tensor) -> Image.Image:
+        vae_dtype = next(vae.parameters()).dtype
+        latents_for_decode = (pred_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
+        with torch.no_grad():
+            image = vae.decode(latents_for_decode).sample[0]
+        return _tensor_to_image(image)
+
+    def _alpha_logits_to_preview(alpha_logits: Optional[torch.Tensor]) -> Optional[Image.Image]:
+        if alpha_logits is None:
+            return None
+        alpha_prob = torch.sigmoid(alpha_logits[0, 0].detach().float()).clamp(0.0, 1.0)
+        alpha_img = (alpha_prob * 255.0).round().to(torch.uint8).cpu().numpy()
+        return Image.fromarray(alpha_img, mode="L")
+
+    pred_on, _ = predict_x0(1.0, conditioning)
+    pred_off, _ = predict_x0(0.0, conditioning)
     control_net.multiplier = original_multiplier
 
     mse_diff = F.mse_loss(pred_on.float(), pred_off.float()).item()
@@ -860,15 +2284,57 @@ def run_controlnet_influence_sanity_check(
         )
 
     if verification_config["save_sanity_previews"]:
-        with torch.no_grad():
-            vae_dtype = next(vae.parameters()).dtype
-            on_latents = (pred_on / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
-            off_latents = (pred_off / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
-            on_image = vae.decode(on_latents).sample[0]
-            off_image = vae.decode(off_latents).sample[0]
-        _tensor_to_image(on_image).save(os.path.join(sanity_dir, "controlnet_on.png"))
-        _tensor_to_image(off_image).save(os.path.join(sanity_dir, "controlnet_off.png"))
+        _decode_preview(pred_on).save(os.path.join(sanity_dir, "controlnet_on.png"))
+        _decode_preview(pred_off).save(os.path.join(sanity_dir, "controlnet_off.png"))
         logger.info(f"[verify/controlnet] saved previews: {sanity_dir}")
+
+    if verification_config.get("run_multiplier_sweep_sanity", True):
+        sweep_values = [float(v) for v in verification_config.get("multiplier_sweep", [2.0, 3.0, 5.0])]
+        logger.info(
+            "[verify/multiplier_sweep] "
+            + f"values={sweep_values} run_extreme_contrast={bool(verification_config.get('run_extreme_contrast_test', True))} "
+            + f"geometry_channels={contrast_channel_groups}"
+        )
+        for sweep_multiplier in sweep_values:
+            pred_full, _ = predict_x0(sweep_multiplier, conditioning)
+            pred_zero, _ = predict_x0(0.0, conditioning)
+            mse_full_vs_zero = float(F.mse_loss(pred_full.float(), pred_zero.float()).item())
+            logger.info(
+                "[verify/multiplier_sweep] "
+                + f"multiplier={sweep_multiplier:.4f} full_vs_zero_pred_x0_mse={mse_full_vs_zero:.8f}"
+            )
+
+            if verification_config.get("run_extreme_contrast_test", True):
+                collect_alpha = bool(verification_config.get("save_sanity_previews", False))
+                pred_flat, alpha_flat_logits = predict_x0(
+                    sweep_multiplier,
+                    contrast_flat,
+                    collect_alpha_logits=collect_alpha,
+                )
+                pred_wall, alpha_wall_logits = predict_x0(
+                    sweep_multiplier,
+                    contrast_wall,
+                    collect_alpha_logits=collect_alpha,
+                )
+                mse_flat_vs_wall = float(F.mse_loss(pred_flat.float(), pred_wall.float()).item())
+                logger.info(
+                    "[verify/extreme_contrast] "
+                    + f"multiplier={sweep_multiplier:.4f} flat_vs_wall_pred_x0_mse={mse_flat_vs_wall:.8f} "
+                    + "constraint=only_geometry_channels_changed"
+                )
+
+                if verification_config["save_sanity_previews"]:
+                    suffix = str(sweep_multiplier).replace(".", "p")
+                    _decode_preview(pred_flat).save(os.path.join(sanity_dir, f"controlnet_flat_m{suffix}.png"))
+                    _decode_preview(pred_wall).save(os.path.join(sanity_dir, f"controlnet_wall_m{suffix}.png"))
+                    alpha_flat_img = _alpha_logits_to_preview(alpha_flat_logits)
+                    alpha_wall_img = _alpha_logits_to_preview(alpha_wall_logits)
+                    if alpha_flat_img is not None:
+                        alpha_flat_img.save(os.path.join(sanity_dir, f"controlnet_alpha_flat_m{suffix}.png"))
+                    if alpha_wall_img is not None:
+                        alpha_wall_img.save(os.path.join(sanity_dir, f"controlnet_alpha_wall_m{suffix}.png"))
+
+    control_net.multiplier = original_multiplier
 
     vae.to(device=vae_original_device, dtype=vae_original_dtype)
 
@@ -883,6 +2349,7 @@ def run_channel_perturbation_sanity_check(
     cached_text: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    seam_config: Dict[str, object],
     sanity_steps: int = 6,
     min_nonzero_channels: int = 4,
 ) -> None:
@@ -896,7 +2363,19 @@ def run_channel_perturbation_sanity_check(
     unet_dtype = next(unet.parameters()).dtype
 
     sample = dataset[0]
-    full_conditioning = sample["conditioning_images"].unsqueeze(0).to(device=device, dtype=torch.float32)
+    sample_batch: Dict[str, object] = {
+        "conditioning_images": sample["conditioning_images"].unsqueeze(0),
+        "seam_strip_tensor": sample.get("seam_strip_tensor").unsqueeze(0) if sample.get("seam_strip_tensor") is not None else None,
+        "edge_defined_flags": sample.get("edge_defined_flags").unsqueeze(0) if sample.get("edge_defined_flags") is not None else None,
+        "edge_flag_maps": sample.get("edge_flag_maps").unsqueeze(0) if sample.get("edge_flag_maps") is not None else None,
+    }
+    full_conditioning, full_channel_names, _ = build_model_visible_conditioning(
+        sample_batch,
+        dataset,
+        seam_config,
+        device,
+        torch.float32,
+    )
     target_size = sample["target_sizes_hw"].tolist()
     latent_h = target_size[0] // 8
     latent_w = target_size[1] // 8
@@ -941,7 +2420,7 @@ def run_channel_perturbation_sanity_check(
 
     pred_full = predict_x0(full_conditioning)
 
-    channel_names = dataset.channel_names
+    channel_names = full_channel_names
     sensitivity_scores: List[Tuple[str, float]] = []
     dead_channels: List[str] = []
 
@@ -1264,6 +2743,7 @@ def run_material_lora_sanity_check(
     cached_text: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    seam_config: Dict[str, object],
 ):
     sanity_dir = os.path.join(args.output_dir, "sanity")
     os.makedirs(sanity_dir, exist_ok=True)
@@ -1272,7 +2752,19 @@ def run_material_lora_sanity_check(
     control_dtype = next(control_net.parameters()).dtype
 
     sample = dataset[0]
-    conditioning = sample["conditioning_images"].unsqueeze(0).to(device=device, dtype=torch.float32)
+    sample_batch: Dict[str, object] = {
+        "conditioning_images": sample["conditioning_images"].unsqueeze(0),
+        "seam_strip_tensor": sample.get("seam_strip_tensor").unsqueeze(0) if sample.get("seam_strip_tensor") is not None else None,
+        "edge_defined_flags": sample.get("edge_defined_flags").unsqueeze(0) if sample.get("edge_defined_flags") is not None else None,
+        "edge_flag_maps": sample.get("edge_flag_maps").unsqueeze(0) if sample.get("edge_flag_maps") is not None else None,
+    }
+    conditioning, _, _ = build_model_visible_conditioning(
+        sample_batch,
+        dataset,
+        seam_config,
+        device,
+        torch.float32,
+    )
     target_size = sample["target_sizes_hw"].tolist()
     latent_h = target_size[0] // 8
     latent_w = target_size[1] // 8
@@ -1462,11 +2954,43 @@ def train(args: argparse.Namespace) -> None:
     alpha_config = parse_alpha_config(semantic_config)
     verification_config = parse_verification_config(semantic_config)
     conditioning_config = parse_conditioning_config(semantic_config)
+    seam_config = parse_seam_config(semantic_config)
     evaluation_config = parse_evaluation_config(semantic_config, alpha_config, args.output_name, args.max_train_steps)
+    if args.eval_steps_csv:
+        override_steps = [step for step in _parse_steps_csv(args.eval_steps_csv) if step > 0 and step <= int(args.max_train_steps)]
+        evaluation_config["eval_steps"] = override_steps
+        logger.info(f"[eval/config] override eval_steps via --eval_steps_csv: {override_steps}")
+    binding_config = parse_binding_eval_config(semantic_config, alpha_config)
+    training_expanded_supervision_enabled = bool(verification_config.get("train_expanded_supervision_enabled", False))
+    training_expanded_halo_px = int(verification_config.get("train_expanded_halo_px", 0))
+    if (
+        not training_expanded_supervision_enabled
+        and bool(evaluation_config.get("expanded_prediction_enabled", False))
+        and int(evaluation_config.get("expanded_halo_px", 0)) > 0
+    ):
+        # Keep training and eval geometry consistent unless explicitly disabled.
+        training_expanded_supervision_enabled = True
+        if training_expanded_halo_px <= 0:
+            training_expanded_halo_px = int(evaluation_config.get("expanded_halo_px", 0))
+
     if args.seed is None:
         args.seed = random.randint(0, 2**32)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    if torch.cuda.is_available():
+        if bool(args.enable_tf32):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = True
+        if bool(args.enable_cudnn_benchmark):
+            torch.backends.cudnn.benchmark = True
+
+    if args.bind_pair_seed is not None:
+        alpha_config["bind_pair_seed"] = args.bind_pair_seed
+    bind_pair_rng = random.Random(alpha_config["bind_pair_seed"])
+    logger.info(f"[seed] train_seed={args.seed} bind_pair_seed={alpha_config['bind_pair_seed']}")
+    bind_pair_batch_count = 0
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1476,9 +3000,44 @@ def train(args: argparse.Namespace) -> None:
     save_dtype = resolve_save_dtype(args.save_dtype)
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
-    dataset = build_dataset(args, semantic_config, alpha_config)
+    dataset = build_dataset(args, semantic_config, alpha_config, seam_config=seam_config)
+    if bool(evaluation_config.get("expanded_prediction_enabled", False)) and int(evaluation_config.get("expanded_halo_px", 0)) > 0:
+        logger.warning(
+            "[seam/geometry] eval uses expanded prediction; training expanded supervision is "
+            + ("enabled" if training_expanded_supervision_enabled else "disabled")
+        )
+    logger.info(
+        "[seam/geometry] "
+        + f"training_expanded_supervision_enabled={'yes' if training_expanded_supervision_enabled else 'no'} "
+        + f"training_expanded_halo_px={int(training_expanded_halo_px)} "
+        + f"eval_expanded_prediction_enabled={'yes' if evaluation_config.get('expanded_prediction_enabled', False) else 'no'} "
+        + f"eval_expanded_halo_px={int(evaluation_config.get('expanded_halo_px', 0))}"
+    )
+    training_prompt_pool = load_training_prompt_pool(semantic_config)
+    training_prompt_sampler = None
+    if training_prompt_pool:
+        prompt_seed = args.seed if args.seed is not None else int(alpha_config.get("bind_pair_seed", 1337))
+        training_prompt_sampler = TrainingPromptSampler(training_prompt_pool, prompt_seed)
+        logger.info(
+            "[sanity/prompt_pool] enabled count=%d seed=%d weights=%s",
+            len(training_prompt_pool),
+            prompt_seed,
+            summarize_training_prompt_pool(training_prompt_pool),
+        )
+        for prompt_spec in training_prompt_pool:
+            logger.info(
+                "[sanity/prompt_pool] prompt name=%s mode=%s weight=%.4f prompt='%s' prompt2='%s'",
+                prompt_spec.name,
+                prompt_spec.mode,
+                prompt_spec.weight,
+                prompt_spec.prompt,
+                prompt_spec.prompt2,
+            )
     resolved_eval_samples = []
     eval_output_dir = os.path.join(args.output_dir, "eval")
+    use_ema = args.ema_decay > 0.0
+    eval_output_dir_raw = os.path.join(eval_output_dir, "raw") if use_ema and args.ema_eval_at_anchors else eval_output_dir
+    eval_output_dir_ema = os.path.join(eval_output_dir, "ema") if use_ema and args.ema_eval_at_anchors else None
     eval_step_summaries: Dict[str, Dict[str, float]] = {}
     if evaluation_config["enabled"]:
         resolved_eval_samples = resolve_eval_samples(
@@ -1497,17 +3056,37 @@ def train(args: argparse.Namespace) -> None:
                 + f"eval_id={sample_info.eval_id} category={sample_info.category} sample_key={sample_info.sample_key} "
                 + f"dataset_index={sample_info.dataset_index} image_name={sample_info.image_name}"
             )
+        resolved_swap_pairs = []
+        if binding_config["enabled"]:
+            resolved_swap_pairs = resolve_swap_pairs(dataset, binding_config["swap_manifest_path"])
+            logger.info(
+                "[binding_eval/config] "
+                + f"pairs={len(resolved_swap_pairs)} manifest={binding_config['swap_manifest_path']}"
+            )
+            for sp in resolved_swap_pairs:
+                logger.info(
+                    "[binding_eval/pair] "
+                    + f"pair_id={sp.pair_id} base={sp.base_image} swap={sp.swap_image} type={sp.edit_type}"
+                )
     _run_pre_gate_target_terrain_iou_sanity(dataset, alpha_config, resolved_eval_samples)
     run_startup_sanity_report(args, dataset, alpha_config)
     write_debug_alignment_dump(args, dataset)
     sampler = WeightedRandomSampler(dataset.sampling_weights, num_samples=len(dataset), replacement=True)
+    dataloader_kwargs: Dict[str, object] = {
+        "batch_size": args.train_batch_size,
+        "sampler": sampler,
+        "num_workers": args.num_workers,
+        "collate_fn": semantic_collate,
+        "drop_last": True,
+        "pin_memory": bool(args.dataloader_pin_memory),
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = bool(args.dataloader_persistent_workers)
+        if int(args.dataloader_prefetch_factor) > 0:
+            dataloader_kwargs["prefetch_factor"] = int(args.dataloader_prefetch_factor)
     dataloader = DataLoader(
         dataset,
-        batch_size=args.train_batch_size,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        collate_fn=semantic_collate,
-        drop_last=True,
+        **dataloader_kwargs,
     )
 
     tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
@@ -1539,21 +3118,63 @@ def train(args: argparse.Namespace) -> None:
     )
     terrain_mask_index_for_baseline = _find_channel_index(dataset.channel_names, "terrain_mask") if alpha_config["enabled"] else 3
     control_net = SdxlControlNet(
-        conditioning_channels=len(dataset.channel_names),
+        conditioning_channels=dataset.full_conditioning_channels if seam_config["enabled"] else len(dataset.channel_names),
         conditioning_pre_embed_channels=[32, 32],
         alpha_head_indices=selected_alpha_head_indices,
         alpha_baseline_mode=alpha_config["baseline_mode"] if alpha_config["enabled"] else "none",
         alpha_baseline_terrain_channel_index=terrain_mask_index_for_baseline,
     )
+    if args.controlnet_multiplier is not None:
+        control_net.multiplier = float(args.controlnet_multiplier)
+        logger.info(f"[config] controlnet_multiplier_override={control_net.multiplier:.4f}")
     if args.controlnet_model_name_or_path:
-        if os.path.splitext(args.controlnet_model_name_or_path)[1] == ".safetensors":
-            state_dict = load_safetensors(args.controlnet_model_name_or_path)
+        ckpt_path = args.controlnet_model_name_or_path
+        if os.path.isdir(ckpt_path):
+            # Allow passing an Accelerator state directory directly.
+            candidates = [
+                os.path.join(ckpt_path, "ema_state.safetensors"),
+                os.path.join(ckpt_path, "controlnet.safetensors"),
+                os.path.join(ckpt_path, "model.safetensors"),
+                os.path.join(ckpt_path, "pytorch_model.bin"),
+            ]
+            resolved = next((p for p in candidates if os.path.isfile(p)), None)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"No supported checkpoint artifact found in directory: {ckpt_path}. "
+                    "Expected one of ema_state.safetensors, controlnet.safetensors, model.safetensors, pytorch_model.bin"
+                )
+            ckpt_path = resolved
+            logger.info(f"[config] resolved controlnet checkpoint file: {ckpt_path}")
+
+        if os.path.splitext(ckpt_path)[1] == ".safetensors":
+            state_dict = load_safetensors(ckpt_path)
         else:
-            state_dict = torch.load(args.controlnet_model_name_or_path, map_location="cpu")
+            state_dict = torch.load(ckpt_path, map_location="cpu")
+
+        # Seam migration support: skip keys with incompatible tensor shapes.
+        model_sd = control_net.state_dict()
+        filtered_state_dict = {}
+        skipped_shape_keys: List[str] = []
+        for key, value in state_dict.items():
+            if key in model_sd and hasattr(value, "shape") and hasattr(model_sd[key], "shape"):
+                if tuple(value.shape) != tuple(model_sd[key].shape):
+                    skipped_shape_keys.append(key)
+                    continue
+            filtered_state_dict[key] = value
+
+        if skipped_shape_keys:
+            logger.warning(
+                "[config] skipped incompatible checkpoint tensors for ControlNet init: "
+                + ", ".join(skipped_shape_keys[:8])
+                + (" ..." if len(skipped_shape_keys) > 8 else "")
+            )
+
         strict_load = not alpha_config["enabled"]
-        info = control_net.load_state_dict(state_dict, strict=strict_load)
+        info = control_net.load_state_dict(filtered_state_dict, strict=strict_load)
         if alpha_config["enabled"]:
             allowed_prefixes = ("controlnet_alpha_heads", "controlnet_alpha_baseline_heads")
+            if seam_config["enabled"]:
+                allowed_prefixes = allowed_prefixes + ("controlnet_cond_embedding",)
             unexpected = [key for key in info.unexpected_keys if not key.startswith(allowed_prefixes)]
             missing = [key for key in info.missing_keys if not key.startswith(allowed_prefixes)]
             if unexpected or missing:
@@ -1653,6 +3274,10 @@ def train(args: argparse.Namespace) -> None:
     material_lora_control.eval()
     control_net.train()
 
+    needs_vae_decode_during_train = (
+        seam_config["enabled"] and float(seam_config.get("rgb_recon_loss_weight", 0.0)) > 0.0
+    )
+
     if args.cache_latents:
         vae.to(accelerator.device, dtype=vae_dtype)
         vae.requires_grad_(False)
@@ -1667,8 +3292,14 @@ def train(args: argparse.Namespace) -> None:
             + f"disk_misses={cache_report['disk_misses']} "
             + f"cache_dir={cache_report['cache_dir'] or '<none>'}"
         )
-        vae.to("cpu")
-        clean_memory_on_device(accelerator.device)
+        if needs_vae_decode_during_train:
+            vae.to(accelerator.device, dtype=vae_dtype)
+            vae.requires_grad_(False)
+            vae.eval()
+            logger.info("[sanity/latents] retaining VAE on accelerator for seam RGB reconstruction decode")
+        else:
+            vae.to("cpu")
+            clean_memory_on_device(accelerator.device)
     else:
         if args.latent_cache_dir:
             logger.info(
@@ -1678,7 +3309,10 @@ def train(args: argparse.Namespace) -> None:
         vae.requires_grad_(False)
         vae.eval()
 
-    cached_text = prepare_text_conditioning(
+    text_conditioning_cache: Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    logged_prompt_names = set()
+    cached_text = get_or_prepare_text_conditioning(
+        text_conditioning_cache,
         dataset.prompt,
         dataset.prompt2,
         tokenize_strategy,
@@ -1738,6 +3372,7 @@ def train(args: argparse.Namespace) -> None:
             lora_sanity_text,
             accelerator.device,
             weight_dtype,
+            seam_config,
         )
 
     if verification_config["enabled"] and verification_config["run_controlnet_sanity"]:
@@ -1760,6 +3395,7 @@ def train(args: argparse.Namespace) -> None:
             cached_text,
             accelerator.device,
             weight_dtype,
+            seam_config,
         )
 
 
@@ -1779,10 +3415,32 @@ def train(args: argparse.Namespace) -> None:
             cached_text,
             accelerator.device,
             weight_dtype,
+            seam_config,
             sanity_steps=int(verification_config["controlnet_sanity_steps"]),
         )
 
     control_net, optimizer, dataloader = accelerator.prepare(control_net, optimizer, dataloader)
+
+    ema_state: Optional[Dict[str, torch.Tensor]] = None
+    if use_ema:
+        ema_decay = float(args.ema_decay)
+        if ema_decay <= 0.0 or ema_decay >= 1.0:
+            raise ValueError("--ema_decay must be in (0,1) when EMA is enabled")
+        ema_state = init_ema_state(unwrap_model(accelerator, control_net))
+        logger.info(f"[ema] enabled decay={ema_decay:.6f} eval_at_anchors={args.ema_eval_at_anchors}")
+
+    resumed_step, resumed_ema_state = load_extended_training_state(
+        args,
+        accelerator,
+        use_ema,
+        control_net_model=unwrap_model(accelerator, control_net),
+    )
+    if resumed_ema_state is not None:
+        ema_state = resumed_ema_state
+
+    # Resume fallback can load tensors from CPU artifacts; reassert runtime device placement.
+    control_net.to(accelerator.device, dtype=torch.float32)
+    material_lora_control.to(accelerator.device, dtype=torch.float32)
 
     scheduler_config = {
         "beta_start": 0.00085,
@@ -1792,20 +3450,21 @@ def train(args: argparse.Namespace) -> None:
         "clip_sample": False,
     }
 
-    if evaluation_config["enabled"] and evaluation_config["include_step0"]:
+    if resumed_step == 0 and evaluation_config["enabled"] and evaluation_config["include_step0"] and not args.skip_step0_eval:
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            os.makedirs(eval_output_dir, exist_ok=True)
+            os.makedirs(eval_output_dir_raw, exist_ok=True)
+            raw_model = unwrap_model(accelerator, control_net)
             step0_summary = run_eval_step(
                 step_label="step_0000_pretrain",
-                output_dir=eval_output_dir,
+                output_dir=eval_output_dir_raw,
                 run_name=args.output_name,
                 pretrain=True,
                 optimizer_steps_completed=0,
                 dataset=dataset,
                 resolved_samples=resolved_eval_samples,
                 unet=unet,
-                control_net=unwrap_model(accelerator, control_net),
+                control_net=raw_model,
                 vae=vae,
                 cached_text=cached_text,
                 eval_config=evaluation_config,
@@ -1816,27 +3475,172 @@ def train(args: argparse.Namespace) -> None:
                 vae_dtype=vae_dtype,
             )
             eval_step_summaries["step_0000_pretrain"] = step0_summary
+            if binding_config["enabled"] and resolved_swap_pairs:
+                run_semantic_binding_eval(
+                    step_label="step_0000_pretrain",
+                    output_dir=eval_output_dir_raw,
+                    run_name=args.output_name,
+                    dataset=dataset,
+                    swap_pairs=resolved_swap_pairs,
+                    unet=unet,
+                    control_net=raw_model,
+                    vae=vae,
+                    cached_text=cached_text,
+                    binding_config=binding_config,
+                    scheduler_config=scheduler_config,
+                    device=accelerator.device,
+                    weight_dtype=weight_dtype,
+                    control_dtype=torch.float32,
+                    vae_dtype=vae_dtype,
+                )
+            clean_memory_on_device(accelerator.device)
+            if ema_state is not None and args.ema_eval_at_anchors and eval_output_dir_ema is not None:
+                os.makedirs(eval_output_dir_ema, exist_ok=True)
+                backup_state = swap_model_state(raw_model, ema_state)
+                try:
+                    run_eval_step(
+                        step_label="step_0000_pretrain",
+                        output_dir=eval_output_dir_ema,
+                        run_name=args.output_name,
+                        pretrain=True,
+                        optimizer_steps_completed=0,
+                        dataset=dataset,
+                        resolved_samples=resolved_eval_samples,
+                        unet=unet,
+                        control_net=raw_model,
+                        vae=vae,
+                        cached_text=cached_text,
+                        eval_config=evaluation_config,
+                        scheduler_config=scheduler_config,
+                        device=accelerator.device,
+                        weight_dtype=weight_dtype,
+                        control_dtype=torch.float32,
+                        vae_dtype=vae_dtype,
+                    )
+                    if binding_config["enabled"] and resolved_swap_pairs:
+                        run_semantic_binding_eval(
+                            step_label="step_0000_pretrain",
+                            output_dir=eval_output_dir_ema,
+                            run_name=args.output_name,
+                            dataset=dataset,
+                            swap_pairs=resolved_swap_pairs,
+                            unet=unet,
+                            control_net=raw_model,
+                            vae=vae,
+                            cached_text=cached_text,
+                            binding_config=binding_config,
+                            scheduler_config=scheduler_config,
+                            device=accelerator.device,
+                            weight_dtype=weight_dtype,
+                            control_dtype=torch.float32,
+                            vae_dtype=vae_dtype,
+                        )
+                finally:
+                    restore_model_state(raw_model, backup_state)
+                    clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
         control_net.train()
 
     noise_scheduler = DDPMScheduler(**scheduler_config)
 
     terrain_mask_index = _find_channel_index(dataset.channel_names, "terrain_mask") if alpha_config["enabled"] else -1
-    global_step = 0
+    global_step = resumed_step
+    if (
+        int(getattr(args, "save_warmup_every_n_steps", 0) or 0) > 0
+        and int(getattr(args, "save_warmup_steps", 0) or 0) > 0
+        and int(getattr(args, "save_every_n_steps_after_warmup", 0) or 0) > 0
+    ):
+        logger.info(
+            "[checkpoint/schedule] mode=warmup_then_regular resumed_step=%d warmup_every=%d warmup_steps=%d after_every=%d",
+            resumed_step,
+            int(args.save_warmup_every_n_steps),
+            int(args.save_warmup_steps),
+            int(args.save_every_n_steps_after_warmup),
+        )
+    else:
+        logger.info(
+            "[checkpoint/schedule] mode=fixed every=%d",
+            int(args.save_every_n_steps),
+        )
     loss_trace: List[Dict[str, float]] = []
+    loss_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
+    if resumed_step > 0 and os.path.exists(loss_trace_path):
+        with open(loss_trace_path, "r", newline="", encoding="utf-8") as handle:
+            loss_trace = list(csv.DictReader(handle))
+
+    def _append_loss_trace_row_live(row: Dict[str, object]) -> None:
+        if not accelerator.is_main_process:
+            return
+        try:
+            sanity_dir = os.path.join(args.output_dir, "sanity")
+            os.makedirs(sanity_dir, exist_ok=True)
+            write_header = (not os.path.exists(loss_trace_path)) or os.path.getsize(loss_trace_path) == 0
+            with open(loss_trace_path, "a", newline="", encoding="utf-8") as _fh:
+                _writer = csv.DictWriter(_fh, fieldnames=list(row.keys()), extrasaction="ignore")
+                if write_header:
+                    _writer.writeheader()
+                _writer.writerow(row)
+        except Exception as _e:
+            logger.warning("[sanity/loss] live append failed: %s", _e)
     tiny_overfit_run = bool(
         verification_config["always_log_during_tiny_overfit"]
         and args.max_train_steps <= int(verification_config["tiny_overfit_max_steps"])
     )
-    progress_bar = tqdm(total=args.max_train_steps, disable=not accelerator.is_local_main_process, desc="steps")
+    warned_expanded_latent_cache_bypass = False
+    progress_bar = tqdm(total=args.max_train_steps, initial=global_step, disable=not accelerator.is_local_main_process, desc="steps")
     while global_step < args.max_train_steps:
         for batch in dataloader:
             with accelerator.accumulate(control_net):
-                if batch["latents"] is not None:
+                batch_images = batch["images"].to(accelerator.device, dtype=vae_dtype)
+                trusted_mask = batch["trusted_mask"].to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
+                alpha_target = batch["alpha_target"]
+                if alpha_target is not None:
+                    alpha_target = alpha_target.to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
+
+                conditioning_images = batch["conditioning_images"].to(accelerator.device, dtype=weight_dtype)
+                model_conditioning_images, model_channel_names, seam_diag = build_model_visible_conditioning(
+                    batch,
+                    dataset,
+                    seam_config,
+                    accelerator.device,
+                    weight_dtype,
+                )
+
+                if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
+                    halo_px = int(training_expanded_halo_px)
+                    if batch.get("expanded_images") is None or batch.get("expanded_trusted_mask") is None or batch.get("expanded_target_sizes_hw") is None:
+                        raise ValueError(
+                            "expanded supervision requires dataset-provided expanded target tensors; padding fallback is disabled"
+                        )
+                    batch_images = batch["expanded_images"].to(accelerator.device, dtype=vae_dtype)
+                    trusted_mask = batch["expanded_trusted_mask"].to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
+                    if alpha_target is not None:
+                        if batch.get("expanded_alpha_target") is None:
+                            raise ValueError("expanded supervision requires expanded alpha targets when alpha supervision is enabled")
+                        alpha_target = batch["expanded_alpha_target"].to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
+                    conditioning_images = batch["conditioning_images"].to(accelerator.device, dtype=weight_dtype)
+                    model_conditioning_images = _center_embed_spatial_tensor(model_conditioning_images, halo_px, fill_value=0.0)
+
+                    target_sizes_hw = batch["expanded_target_sizes_hw"].to(accelerator.device).clone()
+                    size_embeddings = sdxl_train_util.get_size_embeddings(
+                        target_sizes_hw,
+                        torch.zeros_like(target_sizes_hw),
+                        target_sizes_hw,
+                        accelerator.device,
+                    ).to(weight_dtype)
+                else:
+                    size_embeddings = build_size_embeddings(batch, accelerator.device, weight_dtype)
+
+                if batch["latents"] is not None and not training_expanded_supervision_enabled:
                     latents = batch["latents"].to(accelerator.device, dtype=weight_dtype)
                 else:
+                    if batch["latents"] is not None and training_expanded_supervision_enabled and not warned_expanded_latent_cache_bypass:
+                        logger.warning(
+                            "[seam/geometry] training expanded supervision bypasses cached latents and re-encodes expanded images"
+                        )
+                        warned_expanded_latent_cache_bypass = True
                     with torch.no_grad():
-                        latents = vae.encode(batch["images"].to(accelerator.device, dtype=vae_dtype)).latent_dist.sample()
+                        latents = vae.encode(batch_images).latent_dist.sample()
                         latents = latents.to(dtype=weight_dtype)
                 latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
 
@@ -1851,29 +3655,120 @@ def train(args: argparse.Namespace) -> None:
                 )
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                encoder_hidden_states1, encoder_hidden_states2, pool2 = cached_text
+                train_prompt = batch["prompt"]
+                train_prompt2 = batch["prompt2"]
+                train_prompt_name = "default"
+                train_prompt_mode = "default"
+                if training_prompt_sampler is not None:
+                    selected_prompt = training_prompt_sampler.sample()
+                    train_prompt = selected_prompt.prompt
+                    train_prompt2 = selected_prompt.prompt2
+                    train_prompt_name = selected_prompt.name
+                    train_prompt_mode = selected_prompt.mode
+                if train_prompt_name not in logged_prompt_names:
+                    logger.info(
+                        "[train/prompt] activated name=%s prompt='%s' prompt2='%s'",
+                        train_prompt_name,
+                        train_prompt,
+                        train_prompt2,
+                    )
+                    logged_prompt_names.add(train_prompt_name)
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = get_or_prepare_text_conditioning(
+                    text_conditioning_cache,
+                    train_prompt,
+                    train_prompt2,
+                    tokenize_strategy,
+                    text_encoding_strategy,
+                    text_encoders,
+                    accelerator.device,
+                    weight_dtype,
+                )
                 text_embedding = torch.cat(
                     [encoder_hidden_states1.expand(batch_size, -1, -1), encoder_hidden_states2.expand(batch_size, -1, -1)],
                     dim=2,
                 ).to(dtype=weight_dtype)
-                size_embeddings = build_size_embeddings(batch, accelerator.device, weight_dtype)
                 vector_embedding = torch.cat([pool2.expand(batch_size, -1), size_embeddings], dim=1).to(dtype=weight_dtype)
-
-                conditioning_images = batch["conditioning_images"].to(accelerator.device, dtype=weight_dtype)
-                trusted_mask = batch["trusted_mask"].to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
-                alpha_target = batch["alpha_target"]
-                if alpha_target is not None:
-                    alpha_target = alpha_target.to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
 
                 diffusion_loss_value = 0.0
                 alpha_bce_value = 0.0
                 alpha_edge_value = 0.0
                 alpha_total_value = 0.0
+                seam_alpha_local_value = 0.0
+                seam_margin_inner_loss_value = 0.0
+                seam_margin_outer_loss_value = 0.0
+                seam_interior_inner_loss_value = 0.0
+                seam_interior_outer_loss_value = 0.0
+                seam_continuation_loss_value = 0.0
+                seam_rgb_margin_inner_loss_value = 0.0
+                seam_rgb_margin_outer_loss_value = 0.0
+                seam_rgb_interior_inner_loss_value = 0.0
+                seam_rgb_interior_outer_loss_value = 0.0
+                seam_rgb_total_loss_value = 0.0
+                seam_rgb_halo_loss_raw_value = 0.0
+                seam_rgb_interior_loss_raw_value = 0.0
+                seam_rgb_halo_loss_weighted_value = 0.0
+                seam_rgb_interior_loss_weighted_value = 0.0
+                seam_halo_supervised_px_value = 0.0
+                seam_interior_supervised_px_value = 0.0
+                seam_halo_to_interior_px_ratio_value = 0.0
+                seam_margin_inner_coverage_ratio = 0.0
+                seam_margin_inner_coverage_px = 0.0
+                seam_margin_inner_raw_px = 0.0
+                seam_active_edges_count = 0.0
+                seam_edge_recon_score = 0.0
+                seam_alpha_halo_loss_raw_value = 0.0
+                seam_alpha_interior_loss_raw_value = 0.0
+                seam_alpha_halo_loss_weighted_value = 0.0
+                seam_alpha_interior_loss_weighted_value = 0.0
+                seam_halo_target_energy_value = 0.0
+                seam_loss_contribution_ratio_value = 0.0
+                halo_inner_weighted_contribution = 0.0
+                halo_outer_weighted_contribution = 0.0
+                interior_continuation_weighted_contribution = 0.0
+                interior_core_weighted_contribution = 0.0
+                # Per-edge gating diagnostics (computed after seam_maps_supervised)
+                seam_total_edges_defined = 0.0
+                seam_valid_edges_for_loss_count = 0.0
+                seam_valid_edge_ratio = 0.0
+                halo_without_continuation_count_after_gate = 0.0
+                seam_edge_north_valid_for_seam_supervision = 0.0
+                seam_edge_south_valid_for_seam_supervision = 0.0
+                seam_edge_east_valid_for_seam_supervision = 0.0
+                seam_edge_west_valid_for_seam_supervision = 0.0
+                seam_edge_north_halo_inner_px_after_gate = 0.0
+                seam_edge_south_halo_inner_px_after_gate = 0.0
+                seam_edge_east_halo_inner_px_after_gate = 0.0
+                seam_edge_west_halo_inner_px_after_gate = 0.0
+                seam_edge_north_halo_outer_px_after_gate = 0.0
+                seam_edge_south_halo_outer_px_after_gate = 0.0
+                seam_edge_east_halo_outer_px_after_gate = 0.0
+                seam_edge_west_halo_outer_px_after_gate = 0.0
+                seam_edge_north_continuation_px_after_gate = 0.0
+                seam_edge_south_continuation_px_after_gate = 0.0
+                seam_edge_east_continuation_px_after_gate = 0.0
+                seam_edge_west_continuation_px_after_gate = 0.0
+                prompt_conflict_score = 0.0
+                prompt_conflict_score_norm = 0.0
                 alpha_terrain_bce_value = 0.0
                 alpha_terrain_iou_value = 0.0
                 terrain_curriculum_factor = 0.0
                 alpha_temperature = 1.0
                 alpha_prior_weight = 0.0
+                train_prediction_h = float(batch_images.shape[-2])
+                train_prediction_w = float(batch_images.shape[-1])
+                train_alpha_target_h = 0.0
+                train_alpha_target_w = 0.0
+                train_supervision_mask_h = 0.0
+                train_supervision_mask_w = 0.0
+                train_target_min_x = 0.0
+                train_target_max_x = 0.0
+                train_target_min_y = 0.0
+                train_target_max_y = 0.0
+                train_halo_min_x = -1.0
+                train_halo_max_x = -1.0
+                train_halo_min_y = -1.0
+                train_halo_max_y = -1.0
+                train_geometry_mode = "interior_only"
                 controlnet_diagnostics = None
                 grad_l2_alpha = 0.0
                 grad_l2_control_residual = 0.0
@@ -1881,18 +3776,34 @@ def train(args: argparse.Namespace) -> None:
                 param_delta_alpha = 0.0
                 param_delta_control_residual = 0.0
                 param_delta_control_mid = 0.0
+                bind_loss_value = 0.0
+                bind_margin_loss_value = 0.0
+                bind_pos_loss_value = 0.0
+                bind_neg_loss_value = 0.0
+                bind_ranking_gap_value = 0.0
+                bind_win_rate_value = 0.0
+                bind_active_batch = 0.0
+                bind_negative_mode = "none"
                 step_for_logging = global_step + 1
                 verification_log_now = verification_config["enabled"] and (
                     step_for_logging == 1
                     or step_for_logging % max(1, int(verification_config["log_every"])) == 0
                     or tiny_overfit_run
                 )
+                if verification_log_now:
+                    logger.info(
+                        "[train/prompt] step=%d prompt_name=%s prompt='%s' prompt2='%s'",
+                        step_for_logging,
+                        train_prompt_name,
+                        train_prompt,
+                        train_prompt2,
+                    )
                 pre_step_param_stats = None
 
                 if verification_log_now:
-                    _cond_fp32 = batch["conditioning_images"].float()
-                    _cond_dtype = conditioning_images
-                    _ch_names = batch.get("channel_names") or dataset.channel_names
+                    _cond_fp32 = model_conditioning_images.float()
+                    _cond_dtype = model_conditioning_images
+                    _ch_names = model_channel_names
                     for _ci in range(_cond_fp32.shape[1]):
                         _ch_fp32 = _cond_fp32[:, _ci]
                         _ch_cast = _cond_dtype[:, _ci].detach().float()
@@ -1904,6 +3815,24 @@ def train(args: argparse.Namespace) -> None:
                             f"cast_range=[{_ch_cast.min():.4f},{_ch_cast.max():.4f}] "
                             f"cast_mean={_ch_cast.mean():.4f}"
                         )
+                    if seam_config["enabled"]:
+                        logger.info(
+                            "[verify/seam] step=%d seam_enabled=1 defined_ratio=%.4f pre_gate_l2=%.6f post_gate_l2=%.6f",
+                            step_for_logging,
+                            seam_diag["seam_defined_ratio"],
+                            seam_diag["seam_pre_gate_l2"],
+                            seam_diag["seam_post_gate_l2"],
+                        )
+                        for _edge_name in ("north", "south", "east", "west"):
+                            logger.info(
+                                "[verify/seam_edge] step=%d edge=%s defined=%.4f pre_gate_l2=%.6f post_gate_l2=%.6f visible_l2=%.6f",
+                                step_for_logging,
+                                _edge_name,
+                                seam_diag.get(f"seam_edge_{_edge_name}_defined", 0.0),
+                                seam_diag.get(f"seam_edge_{_edge_name}_pre_gate_l2", 0.0),
+                                seam_diag.get(f"seam_edge_{_edge_name}_post_gate_l2", 0.0),
+                                seam_diag.get(f"seam_edge_{_edge_name}_visible_l2", 0.0),
+                            )
 
                 with accelerator.autocast():
                     if alpha_config["enabled"]:
@@ -1912,10 +3841,10 @@ def train(args: argparse.Namespace) -> None:
                             timesteps,
                             text_embedding,
                             vector_embedding,
-                            conditioning_images,
+                            model_conditioning_images,
                             return_alpha=True,
                             return_diagnostics=verification_log_now,
-                            alpha_target_size=tuple(batch["images"].shape[-2:]),
+                            alpha_target_size=tuple(batch_images.shape[-2:]),
                         )
                         controlnet_diagnostics = alpha_outputs.get("diagnostics") if alpha_outputs is not None else None
                     else:
@@ -1925,7 +3854,7 @@ def train(args: argparse.Namespace) -> None:
                                 timesteps,
                                 text_embedding,
                                 vector_embedding,
-                                conditioning_images,
+                                model_conditioning_images,
                                 return_diagnostics=True,
                             )
                         else:
@@ -1934,7 +3863,7 @@ def train(args: argparse.Namespace) -> None:
                                 timesteps,
                                 text_embedding,
                                 vector_embedding,
-                                conditioning_images,
+                                model_conditioning_images,
                             )
                         alpha_outputs = None
                     noise_pred = unet(
@@ -1954,8 +3883,376 @@ def train(args: argparse.Namespace) -> None:
                     )
                     masked_sum = (pixel_loss * latent_mask).sum(dim=(1, 2, 3))
                     masked_area = latent_mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
-                    diffusion_loss = (masked_sum / masked_area).mean()
+                    pos_loss_per_sample = masked_sum / masked_area
+                    diffusion_loss = pos_loss_per_sample.mean()
                     loss = diffusion_loss
+
+                    seam_decay_maps = None
+                    edge_band_masks = None
+                    edge_defined = None
+                    seam_strip_width_px = None
+                    seam_supervision_mask = trusted_mask.float()
+                    seam_maps_supervised: Optional[Dict[str, torch.Tensor]] = None
+                    if (
+                        seam_config["enabled"]
+                        and batch.get("seam_decay_maps") is not None
+                        and batch.get("edge_defined_flags") is not None
+                        and batch.get("edge_band_masks") is not None
+                        and batch.get("seam_strip_width_px") is not None
+                    ):
+                        seam_decay_maps = batch["seam_decay_maps"].to(accelerator.device, dtype=weight_dtype)
+                        edge_band_masks = batch["edge_band_masks"].to(accelerator.device, dtype=weight_dtype)
+                        edge_defined = batch["edge_defined_flags"].to(accelerator.device, dtype=weight_dtype)
+                        # Enforce fixed_defined_edge: override batch flags to allow only the configured edge.
+                        _fixed_edge_name = str(seam_config.get("fixed_defined_edge", "") or "").strip().lower()
+                        _edge_name_to_idx = {"north": 0, "south": 1, "east": 2, "west": 3}
+                        if _fixed_edge_name in _edge_name_to_idx:
+                            _forced_idx = _edge_name_to_idx[_fixed_edge_name]
+                            _override = torch.zeros_like(edge_defined)
+                            _override[:, _forced_idx] = 1.0
+                            edge_defined = _override
+                        seam_strip_width_px = batch["seam_strip_width_px"].to(accelerator.device, dtype=weight_dtype)
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
+                            if batch.get("expanded_seam_decay_maps") is None or batch.get("expanded_edge_band_masks") is None:
+                                raise ValueError(
+                                    "expanded supervision requires dataset-provided expanded seam geometry tensors; padding fallback is disabled"
+                                )
+                            seam_decay_maps = batch["expanded_seam_decay_maps"].to(accelerator.device, dtype=weight_dtype)
+                            edge_band_masks = batch["expanded_edge_band_masks"].to(accelerator.device, dtype=weight_dtype)
+                        seam_supervision_mask = _build_seam_supervision_mask(
+                            trusted_mask=trusted_mask.float(),
+                            edge_band_masks=edge_band_masks,
+                            edge_defined_flags=edge_defined,
+                            seam_config=seam_config,
+                        )
+                        seam_maps_supervised = _build_seam_region_maps(
+                            edge_band_masks=edge_band_masks,
+                            seam_decay_maps=seam_decay_maps,
+                            edge_defined_flags=edge_defined,
+                            seam_strip_width_px=seam_strip_width_px,
+                            supervision_mask=seam_supervision_mask,
+                            seam_config=seam_config,
+                            expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                        )
+                        seam_maps_raw = _build_seam_region_maps(
+                            edge_band_masks=edge_band_masks,
+                            seam_decay_maps=seam_decay_maps,
+                            edge_defined_flags=edge_defined,
+                            seam_strip_width_px=seam_strip_width_px,
+                            supervision_mask=torch.ones_like(trusted_mask.float()),
+                            seam_config=seam_config,
+                            expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                        )
+                        seam_margin_inner_coverage_px = float(seam_maps_supervised["margin_inner"].sum().detach().item())
+                        seam_margin_inner_raw_px = float(seam_maps_raw["margin_inner"].sum().detach().item())
+                        seam_margin_inner_coverage_ratio = seam_margin_inner_coverage_px / max(seam_margin_inner_raw_px, 1e-6)
+                        seam_active_edges_count = float((edge_defined >= 0.5).float().sum(dim=1).mean().detach().item())
+                        if seam_active_edges_count > 0.0 and seam_margin_inner_coverage_ratio < 0.2:
+                            logger.warning(
+                                "[seam/coverage] step=%d low margin_inner coverage ratio=%.4f active_edges=%.2f",
+                                step_for_logging,
+                                seam_margin_inner_coverage_ratio,
+                                seam_active_edges_count,
+                            )
+                        # Per-edge gating diagnostics
+                        _mi_pe = seam_maps_supervised["margin_inner_per_edge"]   # [B,4,H,W]
+                        _mo_pe = seam_maps_supervised["margin_outer_per_edge"]   # [B,4,H,W]
+                        _ii_pe = seam_maps_supervised["interior_inner_per_edge"] # [B,4,H,W]
+                        _def_pe = (edge_defined >= 0.5)  # [B,4]
+                        _total_def = float(_def_pe.float().sum(dim=1).mean().detach().item())
+                        seam_total_edges_defined = _total_def
+                        _vcnt = 0.0
+                        _hno = 0.0
+                        for _ei, _en in enumerate(["north", "south", "east", "west"]):
+                            _isdef = float(_def_pe[:, _ei].float().mean().detach().item())
+                            _hip = float(_mi_pe[:, _ei].sum(dim=(-2, -1)).mean().detach().item())
+                            _hop = float(_mo_pe[:, _ei].sum(dim=(-2, -1)).mean().detach().item())
+                            _cp = float(_ii_pe[:, _ei].sum(dim=(-2, -1)).mean().detach().item())
+                            _vld = 1.0 if (_isdef >= 0.5 and (_hip > 0 or _hop > 0) and _cp > 0) else 0.0
+                            if _en == "north":
+                                seam_edge_north_valid_for_seam_supervision = _vld
+                                seam_edge_north_halo_inner_px_after_gate = _hip
+                                seam_edge_north_halo_outer_px_after_gate = _hop
+                                seam_edge_north_continuation_px_after_gate = _cp
+                            elif _en == "south":
+                                seam_edge_south_valid_for_seam_supervision = _vld
+                                seam_edge_south_halo_inner_px_after_gate = _hip
+                                seam_edge_south_halo_outer_px_after_gate = _hop
+                                seam_edge_south_continuation_px_after_gate = _cp
+                            elif _en == "east":
+                                seam_edge_east_valid_for_seam_supervision = _vld
+                                seam_edge_east_halo_inner_px_after_gate = _hip
+                                seam_edge_east_halo_outer_px_after_gate = _hop
+                                seam_edge_east_continuation_px_after_gate = _cp
+                            else:
+                                seam_edge_west_valid_for_seam_supervision = _vld
+                                seam_edge_west_halo_inner_px_after_gate = _hip
+                                seam_edge_west_halo_outer_px_after_gate = _hop
+                                seam_edge_west_continuation_px_after_gate = _cp
+                            _vcnt += _vld
+                            if _isdef >= 0.5 and (_hip > 0 or _hop > 0) and _cp <= 0:
+                                _hno += 1.0
+                        seam_valid_edges_for_loss_count = _vcnt
+                        seam_valid_edge_ratio = _vcnt / max(_total_def, 1.0)
+                        halo_without_continuation_count_after_gate = _hno
+                        if _hno > 0.0:
+                            logger.warning(
+                                "[seam/per_edge_gate] step=%d halo_without_continuation=%.0f valid=%.0f defined=%.0f",
+                                step_for_logging, _hno, _vcnt, _total_def,
+                            )
+
+                    # Explicit seam-supervised RGB reconstruction on known seam margins and seam-adjacent interior.
+                    if (
+                        seam_config["enabled"]
+                        and float(seam_config.get("rgb_recon_loss_weight", 0.0)) > 0.0
+                        and seam_maps_supervised is not None
+                    ):
+                        alpha_t = noise_scheduler.alphas_cumprod[timesteps].to(
+                            device=noisy_latents.device,
+                            dtype=noisy_latents.dtype,
+                        ).view(-1, 1, 1, 1)
+                        sqrt_alpha_t = alpha_t.sqrt().clamp_min(1e-6)
+                        sqrt_one_minus_alpha_t = (1.0 - alpha_t).clamp_min(0.0).sqrt()
+                        pred_x0_latents = (noisy_latents - (sqrt_one_minus_alpha_t * noise_pred)) / sqrt_alpha_t
+                        pred_rgb = vae.decode((pred_x0_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample.to(dtype=weight_dtype)
+                        target_rgb = batch_images.to(dtype=weight_dtype)
+                        expanded_rgb_mask = seam_supervision_mask.expand(-1, pred_rgb.shape[1], -1, -1)
+                        assert pred_rgb.shape == target_rgb.shape == expanded_rgb_mask.shape, (
+                            f"seam RGB geometry mismatch pred={tuple(pred_rgb.shape)} target={tuple(target_rgb.shape)} mask={tuple(expanded_rgb_mask.shape)}"
+                        )
+                        train_prediction_h = float(pred_rgb.shape[-2])
+                        train_prediction_w = float(pred_rgb.shape[-1])
+                        train_alpha_target_h = float(target_rgb.shape[-2])
+                        train_alpha_target_w = float(target_rgb.shape[-1])
+                        train_supervision_mask_h = float(expanded_rgb_mask.shape[-2])
+                        train_supervision_mask_w = float(expanded_rgb_mask.shape[-1])
+                        train_target_min_x = 0.0
+                        train_target_max_x = float(target_rgb.shape[-1] - 1)
+                        train_target_min_y = 0.0
+                        train_target_max_y = float(target_rgb.shape[-2] - 1)
+                        halo_mask = (seam_maps_supervised["margin_inner"] + seam_maps_supervised["margin_outer"]).clamp(0.0, 1.0)
+                        train_halo_min_x, train_halo_max_x, train_halo_min_y, train_halo_max_y = _mask_bounds(halo_mask)
+                        halo_supervised_px_now = float(halo_mask.sum().detach().item())
+                        if halo_supervised_px_now > 0.0:
+                            if train_halo_min_x < 0.0 or train_halo_max_x > train_target_max_x or train_halo_min_y < 0.0 or train_halo_max_y > train_target_max_y:
+                                raise RuntimeError(
+                                    "seam halo bounds fall outside supervised RGB tensor: "
+                                    + f"target_x=[{train_target_min_x:.1f},{train_target_max_x:.1f}] "
+                                    + f"target_y=[{train_target_min_y:.1f},{train_target_max_y:.1f}] "
+                                    + f"halo_bounds=[x:{train_halo_min_x:.1f}-{train_halo_max_x:.1f},y:{train_halo_min_y:.1f}-{train_halo_max_y:.1f}]"
+                                )
+                        train_geometry_mode = "expanded" if training_expanded_supervision_enabled else "interior"
+                        rgb_l1_map = (pred_rgb.float() - target_rgb.float()).abs().mean(dim=1, keepdim=True)
+
+                        seam_maps = seam_maps_supervised
+
+                        region_weights = {
+                            "margin_inner": float(seam_config.get("margin_inner_weight", 1.0)),
+                            "margin_outer": float(seam_config.get("margin_outer_weight", 0.7)),
+                            "interior_inner": float(seam_config.get("interior_band_inner_weight", 0.8)),
+                            "interior_outer": float(seam_config.get("interior_band_outer_weight", 0.5)),
+                        }
+                        seam_rgb_summary = _summarize_weighted_seam_regions(
+                            error_map=rgb_l1_map,
+                            seam_maps=seam_maps,
+                            region_weights=region_weights,
+                            normalize_region_losses=bool(seam_config.get("normalize_region_losses", True)),
+                        )
+                        seam_rgb_region_losses = seam_rgb_summary["region_losses"]
+
+                        if seam_rgb_region_losses:
+                            seam_rgb_total_loss = seam_rgb_summary["total_loss"]
+                            loss = loss + (float(seam_config.get("rgb_recon_loss_weight", 0.0)) * seam_rgb_total_loss)
+                            seam_rgb_total_loss_value = float(seam_rgb_total_loss.detach().item())
+                            seam_rgb_halo_loss_raw_value = float(seam_rgb_summary["halo_loss_raw"].detach().item())
+                            seam_rgb_interior_loss_raw_value = float(seam_rgb_summary["interior_loss_raw"].detach().item())
+                            seam_rgb_halo_loss_weighted_value = float(seam_rgb_summary["halo_loss_weighted"].detach().item())
+                            seam_rgb_interior_loss_weighted_value = float(seam_rgb_summary["interior_loss_weighted"].detach().item())
+                            seam_halo_supervised_px_value = float(seam_rgb_summary["halo_supervised_px"].detach().item())
+                            seam_interior_supervised_px_value = float(seam_rgb_summary["interior_supervised_px"].detach().item())
+                            seam_halo_to_interior_px_ratio_value = seam_halo_supervised_px_value / max(seam_interior_supervised_px_value, 1e-6)
+                            halo_area = halo_mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+                            halo_target_energy = ((target_rgb.float().abs().mean(dim=1, keepdim=True) * halo_mask).sum(dim=(1, 2, 3)) / halo_area).mean()
+                            seam_halo_target_energy_value = float(halo_target_energy.detach().item())
+                            if verification_config.get("enable_seam_diagnostic_guards", False):
+                                min_halo_energy = float(verification_config.get("seam_halo_target_energy_min", 1e-3))
+                                if seam_halo_supervised_px_value > 0.0 and seam_halo_target_energy_value <= min_halo_energy:
+                                    raise RuntimeError(
+                                        "seam halo target is structurally empty or constant despite supervised halo pixels: "
+                                        + f"halo_target_energy={seam_halo_target_energy_value:.6f} "
+                                        + f"halo_supervised_px={seam_halo_supervised_px_value:.1f}"
+                                    )
+
+                            if (
+                                verification_config.get("save_seam_visual_debug", False)
+                                and (step_for_logging - int(resumed_step)) <= int(verification_config.get("seam_visual_debug_max_steps", 2))
+                            ):
+                                _save_seam_visual_debug(
+                                    output_dir=args.output_dir,
+                                    step=step_for_logging,
+                                    pred_rgb=pred_rgb,
+                                    target_rgb=target_rgb,
+                                    supervision_mask=seam_supervision_mask,
+                                    seam_maps=seam_maps_supervised,
+                                )
+
+                        seam_rgb_margin_inner_loss_value = float(
+                            seam_rgb_region_losses.get("margin_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_rgb_margin_outer_loss_value = float(
+                            seam_rgb_region_losses.get("margin_outer", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_rgb_interior_inner_loss_value = float(
+                            seam_rgb_region_losses.get("interior_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_rgb_interior_outer_loss_value = float(
+                            seam_rgb_region_losses.get("interior_outer", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_edge_recon_score = 0.5 * (seam_rgb_margin_inner_loss_value + seam_rgb_margin_outer_loss_value)
+                        prompt_conflict_score = seam_rgb_total_loss_value / max(seam_margin_inner_coverage_ratio, 1e-3)
+
+                    bind_weight = float(alpha_config.get("bind_preference_weight", 0.0))
+                    bind_ratio = float(alpha_config.get("bind_paired_batch_ratio", 0.0))
+                    bind_enabled = bind_weight > 0.0 and bind_ratio > 0.0
+                    if seam_config["enabled"] and bind_enabled:
+                        bind_enabled = False
+                    bind_active_batch = 0.0
+                    bind_active_count = 0.0
+                    precondition_c_true_count = 0.0
+                    candidate_c_count = 0.0
+                    eligible_c_count = 0.0
+                    requested_c_count = 0.0
+                    realized_c_count = 0.0
+                    fallback_from_c_count = 0.0
+                    rejected_c_count_total = 0.0
+                    rejected_c_count_precondition = 0.0
+                    retry_count_for_c = 0.0
+                    delta_c_mean = 0.0
+                    delta_c_min = 0.0
+                    delta_c_max = 0.0
+                    drop_stage_for_c = "none"
+                    bind_negative_mode_requested = "none"
+                    bind_negative_mode_realized = "none"
+                    bind_negative_delta_retry_count = 0.0
+                    bind_negative_fallback_triggered = 0.0
+                    bind_negative_fallback_reason = "none"
+                    bind_negative_delta_mean = 0.0
+                    bind_schedule_name = str(alpha_config.get("bind_negative_mode_schedule", "none"))
+                    bind_effective_weight_a = 0.0
+                    bind_effective_weight_b = 0.0
+                    bind_effective_weight_c = 0.0
+
+                    bind_negative_mode = "none"
+                    effective_mode_weights = _resolve_effective_mode_weights(alpha_config, current_step=global_step + 1)
+                    bind_effective_weight_a = float(effective_mode_weights.get("wall_to_flat_suppression", 0.0))
+                    bind_effective_weight_b = float(effective_mode_weights.get("flat_to_wall_injection", 0.0))
+                    bind_effective_weight_c = float(effective_mode_weights.get("local_spatial_misalignment", 0.0))
+                    if (global_step + 1) in set(alpha_config.get("bind_negative_mode_schedule_probe_steps", [])):
+                        logger.info(
+                            "[bind/schedule] "
+                            + f"step={global_step + 1} schedule={bind_schedule_name} "
+                            + f"wA={bind_effective_weight_a:.6f} "
+                            + f"wB={bind_effective_weight_b:.6f} "
+                            + f"wC={bind_effective_weight_c:.6f} "
+                            + f"sum={bind_effective_weight_a + bind_effective_weight_b + bind_effective_weight_c:.6f}"
+                        )
+                    if bind_enabled and bind_pair_rng.random() < bind_ratio:
+                        bind_pair_batch_count += 1
+                        bind_active_count = 1.0
+                        bind_negative_mode_requested = _sample_negative_mode(alpha_config, bind_pair_rng, current_step=global_step + 1)
+                        bind_negative_mode_realized = bind_negative_mode_requested
+
+                        precondition_c_ok, precondition_c_reason = _mode_c_precondition(
+                            dataset,
+                            conditioning_images,
+                            terrain_mask_black_is_terrain=bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+                        )
+                        if precondition_c_ok:
+                            precondition_c_true_count = 1.0
+
+                        if bind_negative_mode_requested == "local_spatial_misalignment":
+                            candidate_c_count = 1.0
+                            if precondition_c_ok:
+                                eligible_c_count = 1.0
+                                requested_c_count = 1.0
+                            else:
+                                rejected_c_count_total = 1.0
+                                rejected_c_count_precondition = 1.0
+                                drop_stage_for_c = "eligibility"
+                                bind_negative_fallback_triggered = 1.0
+                                fallback_from_c_count = 1.0
+                                bind_negative_fallback_reason = precondition_c_reason
+                                bind_negative_mode_realized = "wall_to_flat_suppression"
+
+                        corrupted_conditioning, bind_negative_mode_realized, bind_negative_delta_mean = _build_corrupted_geometry_conditioning(
+                            dataset,
+                            conditioning_images,
+                            mode=bind_negative_mode_realized,
+                            rng=bind_pair_rng,
+                            alpha_config=alpha_config,
+                            assigned_crop_class=batch.get("assigned_crop_class", None),
+                            special_structure_tags=batch.get("special_structure_tags", None),
+                        )
+
+                        if bind_negative_mode_requested == "local_spatial_misalignment" and bind_negative_mode_realized == "local_spatial_misalignment":
+                            realized_c_count = 1.0
+                            drop_stage_for_c = "none"
+                            delta_c_mean = bind_negative_delta_mean
+                            delta_c_min = bind_negative_delta_mean
+                            delta_c_max = bind_negative_delta_mean
+                        elif bind_negative_mode_requested == "local_spatial_misalignment" and bind_negative_mode_realized != "local_spatial_misalignment":
+                            if drop_stage_for_c == "none":
+                                drop_stage_for_c = "fallback"
+                            bind_negative_fallback_triggered = 1.0
+                            fallback_from_c_count = 1.0
+                            if bind_negative_fallback_reason == "none":
+                                bind_negative_fallback_reason = "mode_realization_mismatch"
+
+                        bind_negative_mode = bind_negative_mode_realized
+                        if (global_step + 1) in set(alpha_config.get("bind_negative_mode_schedule_probe_steps", [])):
+                            logger.info(
+                                "[bind/realized] "
+                                + f"step={global_step + 1} requested={bind_negative_mode_requested} "
+                                + f"realized={bind_negative_mode_realized} c_ok={realized_c_count} "
+                                + f"reason={bind_negative_fallback_reason if bind_negative_fallback_reason != 'none' else 'success'}"
+                            )
+                        input_resi_add_neg, mid_add_neg = control_net(
+                            noisy_latents,
+                            timesteps,
+                            text_embedding,
+                            vector_embedding,
+                            corrupted_conditioning,
+                        )
+                        noise_pred_neg = unet(
+                            noisy_latents,
+                            timesteps,
+                            text_embedding,
+                            vector_embedding,
+                            input_resi_add_neg,
+                            mid_add_neg,
+                        )
+                        neg_loss_map = F.mse_loss(noise_pred_neg.float(), noise.float(), reduction="none")
+                        neg_pixel_loss = neg_loss_map.mean(dim=1, keepdim=True)
+                        neg_masked_sum = (neg_pixel_loss * latent_mask).sum(dim=(1, 2, 3))
+                        neg_loss_per_sample = neg_masked_sum / masked_area
+                        diffusion_loss_neg = neg_loss_per_sample.mean()
+                        ranking_gap = diffusion_loss_neg - diffusion_loss
+                        bind_loss = F.relu(-ranking_gap)
+                        loss = loss + (bind_weight * bind_loss)
+                        bind_active_batch = 1.0
+
+                        bind_pos_loss_value = float(diffusion_loss.detach().item())
+                        bind_neg_loss_value = float(diffusion_loss_neg.detach().item())
+                        bind_ranking_gap_value = float(ranking_gap.detach().item())
+                        bind_loss_value = float(bind_loss.detach().item())
+                        bind_win_rate_value = float((neg_loss_per_sample > pos_loss_per_sample).float().mean().detach().item())
+                        bind_negative_delta_retry_count = retry_count_for_c
+                        if alpha_config.get("bind_log_margin_variant", True):
+                            bind_margin = float(alpha_config.get("bind_preference_margin", 0.0))
+                            bind_margin_loss = F.relu(
+                                torch.tensor(bind_margin, device=ranking_gap.device, dtype=ranking_gap.dtype) - ranking_gap
+                            )
+                            bind_margin_loss_value = float(bind_margin_loss.detach().item())
 
                     if alpha_config["enabled"]:
                         if alpha_outputs is None:
@@ -1978,6 +4275,12 @@ def train(args: argparse.Namespace) -> None:
 
                         binary_alpha_target = (alpha_target >= alpha_config["binary_threshold"]).to(dtype=weight_dtype)
                         terrain_mask_prior_raw = conditioning_images[:, terrain_mask_index : terrain_mask_index + 1].clamp(0.0, 1.0)
+                        if terrain_mask_prior_raw.shape[-2:] != alpha_target.shape[-2:]:
+                            terrain_mask_prior_raw = F.interpolate(
+                                terrain_mask_prior_raw,
+                                size=alpha_target.shape[-2:],
+                                mode="area",
+                            )
                         terrain_mask_prior = _terrain_mask_to_occupancy(
                             terrain_mask_prior_raw,
                             bool(alpha_config["terrain_mask_black_is_terrain"]),
@@ -1987,8 +4290,28 @@ def train(args: argparse.Namespace) -> None:
                             + alpha_prior_weight * terrain_mask_prior
                         )
 
-                        supervision_mask = _expand_mask(trusted_mask, alpha_config["supervision_expand_px"]).clamp(0.0, 1.0)
+                        # Alpha loss is scored only over the interior crop region (no expanded seam halo).
+                        supervision_mask = torch.ones_like(alpha_target, dtype=weight_dtype)
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
+                            _halo = int(training_expanded_halo_px)
+                            _h = int(alpha_target.shape[-2])
+                            _w = int(alpha_target.shape[-1])
+                            if _h <= (2 * _halo) or _w <= (2 * _halo):
+                                raise ValueError(
+                                    f"invalid expanded interior geometry for alpha supervision: hw=({_h},{_w}) halo={_halo}"
+                                )
+                            supervision_mask = torch.zeros_like(alpha_target, dtype=weight_dtype)
+                            supervision_mask[:, :, _halo:-_halo, _halo:-_halo] = 1.0
                         selected_alpha_logits = _select_alpha_logits(alpha_outputs, alpha_config["output_source"])
+                        assert selected_alpha_logits.shape == alpha_target.shape == supervision_mask.shape, (
+                            f"seam alpha geometry mismatch pred={tuple(selected_alpha_logits.shape)} target={tuple(alpha_target.shape)} mask={tuple(supervision_mask.shape)}"
+                        )
+                        train_prediction_h = float(selected_alpha_logits.shape[-2])
+                        train_prediction_w = float(selected_alpha_logits.shape[-1])
+                        train_alpha_target_h = float(alpha_target.shape[-2])
+                        train_alpha_target_w = float(alpha_target.shape[-1])
+                        train_supervision_mask_h = float(supervision_mask.shape[-2])
+                        train_supervision_mask_w = float(supervision_mask.shape[-1])
                         scaled_alpha_logits = selected_alpha_logits / max(alpha_temperature, 1e-6)
                         alpha_bce_map = F.binary_cross_entropy_with_logits(
                             scaled_alpha_logits.float(),
@@ -2042,6 +4365,63 @@ def train(args: argparse.Namespace) -> None:
                         alpha_total = alpha_config["loss_weight"] * (
                             alpha_bce + (alpha_config["edge_loss_scale"] * alpha_edge)
                         )
+
+                        seam_alpha_local_loss = None
+                        if (
+                            False
+                            and seam_config["enabled"]
+                            and float(seam_config.get("alpha_local_loss_weight", 0.0)) > 0.0
+                            and seam_maps_supervised is not None
+                        ):
+                            seam_maps = seam_maps_supervised
+
+                            seam_region_losses: Dict[str, torch.Tensor] = {}
+                            for region_name, region_mask in seam_maps.items():
+                                area = region_mask.sum()
+                                if float(area.detach().item()) <= 0.0:
+                                    continue
+                                seam_region_losses[region_name] = (alpha_bce_map * region_mask).sum() / area.clamp_min(1e-6)
+
+                            region_weights = {
+                                "margin_inner": float(seam_config.get("margin_inner_weight", 1.0)),
+                                "margin_outer": float(seam_config.get("margin_outer_weight", 0.7)),
+                                "interior_inner": float(seam_config.get("interior_band_inner_weight", 0.8)),
+                                "interior_outer": float(seam_config.get("interior_band_outer_weight", 0.5)),
+                            }
+                            seam_alpha_summary = _summarize_weighted_seam_regions(
+                                error_map=alpha_bce_map,
+                                seam_maps=seam_maps,
+                                region_weights=region_weights,
+                                normalize_region_losses=bool(seam_config.get("normalize_region_losses", True)),
+                            )
+                            seam_region_losses = seam_alpha_summary["region_losses"]
+
+                            if seam_region_losses:
+                                seam_alpha_local_loss = seam_alpha_summary["total_loss"]
+                                seam_alpha_halo_loss_raw_value = float(seam_alpha_summary["halo_loss_raw"].detach().item())
+                                seam_alpha_interior_loss_raw_value = float(seam_alpha_summary["interior_loss_raw"].detach().item())
+                                seam_alpha_halo_loss_weighted_value = float(seam_alpha_summary["halo_loss_weighted"].detach().item())
+                                seam_alpha_interior_loss_weighted_value = float(seam_alpha_summary["interior_loss_weighted"].detach().item())
+
+                            seam_margin_inner_loss_value = float(
+                                seam_region_losses.get("margin_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                            )
+                            seam_margin_outer_loss_value = float(
+                                seam_region_losses.get("margin_outer", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                            )
+                            seam_interior_inner_loss_value = float(
+                                seam_region_losses.get("interior_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                            )
+                            seam_interior_outer_loss_value = float(
+                                seam_region_losses.get("interior_outer", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                            )
+                            seam_continuation_loss_value = (
+                                seam_interior_inner_loss_value + seam_interior_outer_loss_value
+                            )
+
+                        if seam_alpha_local_loss is not None:
+                            alpha_total = alpha_total + float(seam_config["alpha_local_loss_weight"]) * seam_alpha_local_loss
+
                         alpha_total = alpha_total + terrain_coupling_loss
                         loss = loss + alpha_total
 
@@ -2050,9 +4430,87 @@ def train(args: argparse.Namespace) -> None:
                         alpha_edge_value = float(alpha_edge.detach().item())
                         alpha_terrain_bce_value = float(terrain_bce.detach().item())
                         alpha_terrain_iou_value = float(terrain_iou_loss.detach().item())
+                        seam_alpha_local_value = (
+                            0.0 if seam_alpha_local_loss is None else float(seam_alpha_local_loss.detach().item())
+                        )
                         alpha_total_value = float(alpha_total.detach().item())
                     else:
                         diffusion_loss_value = float(diffusion_loss.detach().item())
+
+                    halo_loss_contribution = (
+                        float(seam_config.get("rgb_recon_loss_weight", 0.0)) * seam_rgb_halo_loss_weighted_value
+                        + float(seam_config.get("alpha_local_loss_weight", 0.0)) * seam_alpha_halo_loss_weighted_value
+                    )
+
+                    rgb_region_contrib = seam_rgb_summary["region_weighted_contributions"] if "seam_rgb_summary" in locals() else {}
+                    alpha_region_contrib = seam_alpha_summary["region_weighted_contributions"] if "seam_alpha_summary" in locals() else {}
+                    rgb_scale = float(seam_config.get("rgb_recon_loss_weight", 0.0))
+                    alpha_scale = float(seam_config.get("alpha_local_loss_weight", 0.0))
+
+                    def _region_term_value(source: Dict[str, torch.Tensor], key: str) -> float:
+                        if key not in source:
+                            return 0.0
+                        return float(source[key].detach().item())
+
+                    halo_inner_weighted_contribution = (
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "margin_inner"))
+                        + (alpha_scale * _region_term_value(alpha_region_contrib, "margin_inner"))
+                    )
+                    halo_outer_weighted_contribution = (
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "margin_outer"))
+                        + (alpha_scale * _region_term_value(alpha_region_contrib, "margin_outer"))
+                    )
+                    interior_continuation_weighted_contribution = (
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "interior_inner"))
+                        + (alpha_scale * _region_term_value(alpha_region_contrib, "interior_inner"))
+                    )
+                    interior_core_weighted_contribution = (
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "interior_outer"))
+                        + (alpha_scale * _region_term_value(alpha_region_contrib, "interior_outer"))
+                    )
+
+                    seam_loss_contribution_ratio_value = halo_loss_contribution / max(float(loss.detach().item()), 1e-6)
+                    if verification_config.get("enable_seam_diagnostic_guards", False) and step_for_logging == 1:
+                        min_ratio = float(verification_config.get("seam_loss_contribution_ratio_min", 0.05))
+                        if seam_loss_contribution_ratio_value <= min_ratio:
+                            raise RuntimeError(
+                                "seam halo loss contribution is too small on the first batch: "
+                                + f"ratio={seam_loss_contribution_ratio_value:.6f} threshold={min_ratio:.6f}"
+                            )
+
+                    if verification_log_now:
+                        logger.info(
+                            "[verify/seam_geometry] step=%d geometry_mode=%s pred_hw=%sx%s target_hw=%sx%s supervision_hw=%sx%s target_x=[%.1f,%.1f] target_y=[%.1f,%.1f] halo_bounds=[x:%.1f-%.1f,y:%.1f-%.1f] halo_target_energy=%.6f halo_loss_ratio=%.6f",
+                            step_for_logging,
+                            train_geometry_mode,
+                            int(train_prediction_h),
+                            int(train_prediction_w),
+                            int(train_alpha_target_h),
+                            int(train_alpha_target_w),
+                            int(train_supervision_mask_h),
+                            int(train_supervision_mask_w),
+                            train_target_min_x,
+                            train_target_max_x,
+                            train_target_min_y,
+                            train_target_max_y,
+                            train_halo_min_x,
+                            train_halo_max_x,
+                            train_halo_min_y,
+                            train_halo_max_y,
+                            seam_halo_target_energy_value,
+                            seam_loss_contribution_ratio_value,
+                        )
+                        logger.info(
+                            "[verify/seam_region_contrib] step=%d halo_inner_weighted_contribution=%.6f halo_outer_weighted_contribution=%.6f interior_continuation_weighted_contribution=%.6f interior_core_weighted_contribution=%.6f",
+                            step_for_logging,
+                            halo_inner_weighted_contribution,
+                            halo_outer_weighted_contribution,
+                            interior_continuation_weighted_contribution,
+                            interior_core_weighted_contribution,
+                        )
+
+                    if diffusion_loss_value > 0.0:
+                        prompt_conflict_score_norm = prompt_conflict_score / max(diffusion_loss_value, 1e-6)
 
                     if verification_log_now and accelerator.sync_gradients:
                         pre_step_param_stats = _collect_trainable_module_stats(control_net)
@@ -2065,6 +4523,8 @@ def train(args: argparse.Namespace) -> None:
                     if args.max_grad_norm > 0.0:
                         accelerator.clip_grad_norm_(control_net.parameters(), args.max_grad_norm)
                 optimizer.step()
+                if ema_state is not None:
+                    update_ema_state(unwrap_model(accelerator, control_net), ema_state, float(args.ema_decay))
                 post_step_param_stats = None
                 if verification_log_now and accelerator.sync_gradients and pre_step_param_stats is not None:
                     post_step_param_stats = _collect_trainable_module_stats(control_net)
@@ -2111,7 +4571,102 @@ def train(args: argparse.Namespace) -> None:
                             "alpha_edge_loss": alpha_edge_value,
                             "alpha_terrain_bce_loss": alpha_terrain_bce_value,
                             "alpha_terrain_iou_loss": alpha_terrain_iou_value,
+                            "seam_alpha_local_loss": seam_alpha_local_value,
+                            "seam_margin_inner_loss": seam_margin_inner_loss_value,
+                            "seam_margin_outer_loss": seam_margin_outer_loss_value,
+                            "seam_interior_inner_loss": seam_interior_inner_loss_value,
+                            "seam_interior_outer_loss": seam_interior_outer_loss_value,
+                            "seam_continuation_loss": seam_continuation_loss_value,
+                            "seam_rgb_margin_inner_loss": seam_rgb_margin_inner_loss_value,
+                            "seam_rgb_margin_outer_loss": seam_rgb_margin_outer_loss_value,
+                            "seam_rgb_interior_inner_loss": seam_rgb_interior_inner_loss_value,
+                            "seam_rgb_interior_outer_loss": seam_rgb_interior_outer_loss_value,
+                            "seam_rgb_total_loss": seam_rgb_total_loss_value,
+                            "seam_edge_recon_score": seam_edge_recon_score,
+                            "seam_margin_inner_coverage_ratio": seam_margin_inner_coverage_ratio,
+                            "seam_margin_inner_coverage_px": seam_margin_inner_coverage_px,
+                            "seam_margin_inner_raw_px": seam_margin_inner_raw_px,
+                            "seam_active_edges_count": seam_active_edges_count,
+                            "prompt_conflict_score": prompt_conflict_score,
+                            "prompt_conflict_score_norm": prompt_conflict_score_norm,
                             "alpha_total_loss": alpha_total_value,
+                            "seam_defined_ratio": seam_diag.get("seam_defined_ratio", 0.0),
+                            "seam_pre_gate_l2": seam_diag.get("seam_pre_gate_l2", 0.0),
+                            "seam_post_gate_l2": seam_diag.get("seam_post_gate_l2", 0.0),
+                            "seam_undefined_edges_count": seam_diag.get("seam_undefined_edges_count", 0.0),
+                            "seam_undefined_pre_gate_l2": seam_diag.get("seam_undefined_pre_gate_l2", 0.0),
+                            "seam_undefined_post_gate_l2": seam_diag.get("seam_undefined_post_gate_l2", 0.0),
+                            "seam_halo_supervised_px": seam_halo_supervised_px_value,
+                            "seam_interior_supervised_px": seam_interior_supervised_px_value,
+                            "seam_halo_to_interior_px_ratio": seam_halo_to_interior_px_ratio_value,
+                            "seam_rgb_halo_loss_raw": seam_rgb_halo_loss_raw_value,
+                            "seam_rgb_interior_loss_raw": seam_rgb_interior_loss_raw_value,
+                            "seam_rgb_halo_loss_weighted": seam_rgb_halo_loss_weighted_value,
+                            "seam_rgb_interior_loss_weighted": seam_rgb_interior_loss_weighted_value,
+                            "seam_alpha_halo_loss_raw": seam_alpha_halo_loss_raw_value,
+                            "seam_alpha_interior_loss_raw": seam_alpha_interior_loss_raw_value,
+                            "seam_alpha_halo_loss_weighted": seam_alpha_halo_loss_weighted_value,
+                            "seam_alpha_interior_loss_weighted": seam_alpha_interior_loss_weighted_value,
+                            "seam_halo_target_energy": seam_halo_target_energy_value,
+                            "seam_loss_contribution_ratio": seam_loss_contribution_ratio_value,
+                            "halo_inner_weighted_contribution": halo_inner_weighted_contribution,
+                            "halo_outer_weighted_contribution": halo_outer_weighted_contribution,
+                            "interior_continuation_weighted_contribution": interior_continuation_weighted_contribution,
+                            "interior_core_weighted_contribution": interior_core_weighted_contribution,
+                            "train_prediction_h": train_prediction_h,
+                            "train_prediction_w": train_prediction_w,
+                            "train_alpha_target_h": train_alpha_target_h,
+                            "train_alpha_target_w": train_alpha_target_w,
+                            "train_supervision_mask_h": train_supervision_mask_h,
+                            "train_supervision_mask_w": train_supervision_mask_w,
+                            "train_target_min_x": train_target_min_x,
+                            "train_target_max_x": train_target_max_x,
+                            "train_target_min_y": train_target_min_y,
+                            "train_target_max_y": train_target_max_y,
+                            "train_halo_min_x": train_halo_min_x,
+                            "train_halo_max_x": train_halo_max_x,
+                            "train_halo_min_y": train_halo_min_y,
+                            "train_halo_max_y": train_halo_max_y,
+                            "training_expanded_supervision_enabled": 1.0 if training_expanded_supervision_enabled else 0.0,
+                            "eval_expanded_prediction_enabled": 1.0 if evaluation_config.get("expanded_prediction_enabled", False) else 0.0,
+                            "eval_expanded_halo_px": float(int(evaluation_config.get("expanded_halo_px", 0))),
+                            "train_geometry_mode": train_geometry_mode,
+                            "seam_edge_north_defined": seam_diag.get("seam_edge_north_defined", 0.0),
+                            "seam_edge_south_defined": seam_diag.get("seam_edge_south_defined", 0.0),
+                            "seam_edge_east_defined": seam_diag.get("seam_edge_east_defined", 0.0),
+                            "seam_edge_west_defined": seam_diag.get("seam_edge_west_defined", 0.0),
+                            "seam_edge_north_pre_gate_l2": seam_diag.get("seam_edge_north_pre_gate_l2", 0.0),
+                            "seam_edge_south_pre_gate_l2": seam_diag.get("seam_edge_south_pre_gate_l2", 0.0),
+                            "seam_edge_east_pre_gate_l2": seam_diag.get("seam_edge_east_pre_gate_l2", 0.0),
+                            "seam_edge_west_pre_gate_l2": seam_diag.get("seam_edge_west_pre_gate_l2", 0.0),
+                            "seam_edge_north_post_gate_l2": seam_diag.get("seam_edge_north_post_gate_l2", 0.0),
+                            "seam_edge_south_post_gate_l2": seam_diag.get("seam_edge_south_post_gate_l2", 0.0),
+                            "seam_edge_east_post_gate_l2": seam_diag.get("seam_edge_east_post_gate_l2", 0.0),
+                            "seam_edge_west_post_gate_l2": seam_diag.get("seam_edge_west_post_gate_l2", 0.0),
+                            "seam_edge_north_visible_l2": seam_diag.get("seam_edge_north_visible_l2", 0.0),
+                            "seam_edge_south_visible_l2": seam_diag.get("seam_edge_south_visible_l2", 0.0),
+                            "seam_edge_east_visible_l2": seam_diag.get("seam_edge_east_visible_l2", 0.0),
+                            "seam_edge_west_visible_l2": seam_diag.get("seam_edge_west_visible_l2", 0.0),
+                            "seam_total_edges_defined": seam_total_edges_defined,
+                            "seam_valid_edges_for_loss_count": seam_valid_edges_for_loss_count,
+                            "seam_valid_edge_ratio": seam_valid_edge_ratio,
+                            "halo_without_continuation_count_after_gate": halo_without_continuation_count_after_gate,
+                            "seam_edge_north_valid_for_seam_supervision": seam_edge_north_valid_for_seam_supervision,
+                            "seam_edge_south_valid_for_seam_supervision": seam_edge_south_valid_for_seam_supervision,
+                            "seam_edge_east_valid_for_seam_supervision": seam_edge_east_valid_for_seam_supervision,
+                            "seam_edge_west_valid_for_seam_supervision": seam_edge_west_valid_for_seam_supervision,
+                            "seam_edge_north_halo_inner_px_after_gate": seam_edge_north_halo_inner_px_after_gate,
+                            "seam_edge_south_halo_inner_px_after_gate": seam_edge_south_halo_inner_px_after_gate,
+                            "seam_edge_east_halo_inner_px_after_gate": seam_edge_east_halo_inner_px_after_gate,
+                            "seam_edge_west_halo_inner_px_after_gate": seam_edge_west_halo_inner_px_after_gate,
+                            "seam_edge_north_halo_outer_px_after_gate": seam_edge_north_halo_outer_px_after_gate,
+                            "seam_edge_south_halo_outer_px_after_gate": seam_edge_south_halo_outer_px_after_gate,
+                            "seam_edge_east_halo_outer_px_after_gate": seam_edge_east_halo_outer_px_after_gate,
+                            "seam_edge_west_halo_outer_px_after_gate": seam_edge_west_halo_outer_px_after_gate,
+                            "seam_edge_north_continuation_px_after_gate": seam_edge_north_continuation_px_after_gate,
+                            "seam_edge_south_continuation_px_after_gate": seam_edge_south_continuation_px_after_gate,
+                            "seam_edge_east_continuation_px_after_gate": seam_edge_east_continuation_px_after_gate,
+                            "seam_edge_west_continuation_px_after_gate": seam_edge_west_continuation_px_after_gate,
                             "terrain_curriculum_factor": terrain_curriculum_factor,
                             "alpha_temperature": alpha_temperature,
                             "alpha_prior_weight": alpha_prior_weight,
@@ -2121,8 +4676,46 @@ def train(args: argparse.Namespace) -> None:
                             "param_delta_alpha_heads": param_delta_alpha,
                             "param_delta_control_residual_blocks": param_delta_control_residual,
                             "param_delta_control_mid_block": param_delta_control_mid,
+                            "bind_active_count": bind_active_count,
+                            "precondition_c_true_count": precondition_c_true_count,
+                            "candidate_c_count": candidate_c_count,
+                            "eligible_c_count": eligible_c_count,
+                            "requested_c_count": requested_c_count,
+                            "realized_c_count": realized_c_count,
+                            "fallback_from_c_count": fallback_from_c_count,
+                            "rejected_c_count_total": rejected_c_count_total,
+                            "rejected_c_count_precondition": rejected_c_count_precondition,
+                            "retry_count_for_c": retry_count_for_c,
+                            "delta_c_mean": delta_c_mean,
+                            "delta_c_min": delta_c_min,
+                            "delta_c_max": delta_c_max,
+                            "drop_stage_for_c": drop_stage_for_c,
+                            "bind_negative_mode_requested": bind_negative_mode_requested,
+                            "bind_negative_mode_realized": bind_negative_mode_realized,
+                            "bind_negative_delta_retry_count": bind_negative_delta_retry_count,
+                            "bind_negative_fallback_triggered": bind_negative_fallback_triggered,
+                            "bind_negative_fallback_reason": bind_negative_fallback_reason,
+                            "bind_negative_delta_mean": bind_negative_delta_mean,
+                            "bind_active_batch": bind_active_batch,
+                            "bind_negative_mode": bind_negative_mode,
+                            "bind_schedule_name": bind_schedule_name,
+                            "bind_effective_weight_a": bind_effective_weight_a,
+                            "bind_effective_weight_b": bind_effective_weight_b,
+                            "bind_effective_weight_c": bind_effective_weight_c,
+                            "bind_pos_denoise_loss": bind_pos_loss_value,
+                            "bind_neg_denoise_loss": bind_neg_loss_value,
+                            "bind_ranking_gap": bind_ranking_gap_value,
+                            "bind_loss": bind_loss_value,
+                            "bind_margin_loss": bind_margin_loss_value,
+                            "bind_win_rate": bind_win_rate_value,
+                            "train_prompt_name": train_prompt_name,
+                            "train_prompt_mode": train_prompt_mode,
+                            "train_prompt": train_prompt,
+                            "train_prompt2": train_prompt2,
                         }
                     )
+                    if loss_trace:
+                        _append_loss_trace_row_live(loss_trace[-1])
 
                 if verification_log_now:
                     _log_controlnet_diagnostics(global_step, controlnet_diagnostics)
@@ -2171,7 +4764,7 @@ def train(args: argparse.Namespace) -> None:
                             edge_band,
                         )
 
-                if global_step % args.save_every_n_steps == 0:
+                if should_save_checkpoint(args, global_step, resumed_step):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         save_controlnet_checkpoint(
@@ -2182,22 +4775,37 @@ def train(args: argparse.Namespace) -> None:
                             global_step,
                             save_dtype,
                         )
+                        if args.save_state:
+                            save_extended_training_state(args, accelerator, global_step, ema_state, on_train_end=False)
+                        if loss_trace:
+                            _ckpt_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
+                            try:
+                                os.makedirs(os.path.join(args.output_dir, "sanity"), exist_ok=True)
+                                _fieldnames = list(loss_trace[0].keys())
+                                with open(_ckpt_trace_path, "w", newline="", encoding="utf-8") as _fh:
+                                    _w = csv.DictWriter(_fh, fieldnames=_fieldnames, extrasaction="ignore")
+                                    _w.writeheader()
+                                    _w.writerows(loss_trace)
+                                logger.info("[sanity/loss] checkpoint trace written to %s (%d rows)", _ckpt_trace_path, len(loss_trace))
+                            except Exception as _e:
+                                logger.warning("[sanity/loss] failed to write checkpoint trace: %s", _e)
 
                 if evaluation_config["enabled"] and global_step in evaluation_config["eval_steps"]:
                     step_label = f"step_{global_step:04d}"
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        os.makedirs(eval_output_dir, exist_ok=True)
+                        os.makedirs(eval_output_dir_raw, exist_ok=True)
+                        raw_model = unwrap_model(accelerator, control_net)
                         summary = run_eval_step(
                             step_label=step_label,
-                            output_dir=eval_output_dir,
+                            output_dir=eval_output_dir_raw,
                             run_name=args.output_name,
                             pretrain=False,
                             optimizer_steps_completed=global_step,
                             dataset=dataset,
                             resolved_samples=resolved_eval_samples,
                             unet=unet,
-                            control_net=unwrap_model(accelerator, control_net),
+                            control_net=raw_model,
                             vae=vae,
                             cached_text=cached_text,
                             eval_config=evaluation_config,
@@ -2215,12 +4823,82 @@ def train(args: argparse.Namespace) -> None:
                             [f"step_{s:04d}" for s in evaluation_config["eval_steps"] if f"step_{s:04d}" in eval_step_summaries]
                         )
                         build_progression_boards(
-                            output_dir=eval_output_dir,
+                            output_dir=eval_output_dir_raw,
                             run_name=args.output_name,
                             resolved_samples=resolved_eval_samples,
                             step_labels=progression_steps,
                             primary_seed=evaluation_config["seeds"][0],
                         )
+                        if binding_config["enabled"] and resolved_swap_pairs:
+                            run_semantic_binding_eval(
+                                step_label=step_label,
+                                output_dir=eval_output_dir_raw,
+                                run_name=args.output_name,
+                                dataset=dataset,
+                                swap_pairs=resolved_swap_pairs,
+                                unet=unet,
+                                control_net=raw_model,
+                                vae=vae,
+                                cached_text=cached_text,
+                                binding_config=binding_config,
+                                scheduler_config=scheduler_config,
+                                device=accelerator.device,
+                                weight_dtype=weight_dtype,
+                                control_dtype=torch.float32,
+                                vae_dtype=vae_dtype,
+                            )
+                        clean_memory_on_device(accelerator.device)
+                        if ema_state is not None and args.ema_eval_at_anchors and eval_output_dir_ema is not None:
+                            os.makedirs(eval_output_dir_ema, exist_ok=True)
+                            backup_state = swap_model_state(raw_model, ema_state)
+                            try:
+                                run_eval_step(
+                                    step_label=step_label,
+                                    output_dir=eval_output_dir_ema,
+                                    run_name=args.output_name,
+                                    pretrain=False,
+                                    optimizer_steps_completed=global_step,
+                                    dataset=dataset,
+                                    resolved_samples=resolved_eval_samples,
+                                    unet=unet,
+                                    control_net=raw_model,
+                                    vae=vae,
+                                    cached_text=cached_text,
+                                    eval_config=evaluation_config,
+                                    scheduler_config=scheduler_config,
+                                    device=accelerator.device,
+                                    weight_dtype=weight_dtype,
+                                    control_dtype=torch.float32,
+                                    vae_dtype=vae_dtype,
+                                )
+                                build_progression_boards(
+                                    output_dir=eval_output_dir_ema,
+                                    run_name=args.output_name,
+                                    resolved_samples=resolved_eval_samples,
+                                    step_labels=progression_steps,
+                                    primary_seed=evaluation_config["seeds"][0],
+                                )
+                                if binding_config["enabled"] and resolved_swap_pairs:
+                                    run_semantic_binding_eval(
+                                        step_label=step_label,
+                                        output_dir=eval_output_dir_ema,
+                                        run_name=args.output_name,
+                                        dataset=dataset,
+                                        swap_pairs=resolved_swap_pairs,
+                                        unet=unet,
+                                        control_net=raw_model,
+                                        vae=vae,
+                                        cached_text=cached_text,
+                                        binding_config=binding_config,
+                                        scheduler_config=scheduler_config,
+                                        device=accelerator.device,
+                                        weight_dtype=weight_dtype,
+                                        control_dtype=torch.float32,
+                                        vae_dtype=vae_dtype,
+                                    )
+                            finally:
+                                restore_model_state(raw_model, backup_state)
+                                clean_memory_on_device(accelerator.device)
                     accelerator.wait_for_everyone()
                     control_net.train()
 
@@ -2247,7 +4925,82 @@ def train(args: argparse.Namespace) -> None:
                         "alpha_edge_loss",
                         "alpha_terrain_bce_loss",
                         "alpha_terrain_iou_loss",
+                        "seam_alpha_local_loss",
+                        "seam_margin_inner_loss",
+                        "seam_margin_outer_loss",
+                        "seam_interior_inner_loss",
+                        "seam_interior_outer_loss",
+                        "seam_continuation_loss",
+                        "seam_rgb_margin_inner_loss",
+                        "seam_rgb_margin_outer_loss",
+                        "seam_rgb_interior_inner_loss",
+                        "seam_rgb_interior_outer_loss",
+                        "seam_rgb_total_loss",
+                        "seam_edge_recon_score",
+                        "seam_margin_inner_coverage_ratio",
+                        "seam_margin_inner_coverage_px",
+                        "seam_margin_inner_raw_px",
+                        "seam_active_edges_count",
+                        "prompt_conflict_score",
+                        "prompt_conflict_score_norm",
                         "alpha_total_loss",
+                        "seam_defined_ratio",
+                        "seam_pre_gate_l2",
+                        "seam_post_gate_l2",
+                        "seam_undefined_edges_count",
+                        "seam_undefined_pre_gate_l2",
+                        "seam_undefined_post_gate_l2",
+                        "seam_halo_supervised_px",
+                        "seam_interior_supervised_px",
+                        "seam_halo_to_interior_px_ratio",
+                        "seam_rgb_halo_loss_raw",
+                        "seam_rgb_interior_loss_raw",
+                        "seam_rgb_halo_loss_weighted",
+                        "seam_rgb_interior_loss_weighted",
+                        "seam_alpha_halo_loss_raw",
+                        "seam_alpha_interior_loss_raw",
+                        "seam_alpha_halo_loss_weighted",
+                        "seam_alpha_interior_loss_weighted",
+                        "seam_halo_target_energy",
+                        "seam_loss_contribution_ratio",
+                        "halo_inner_weighted_contribution",
+                        "halo_outer_weighted_contribution",
+                        "interior_continuation_weighted_contribution",
+                        "interior_core_weighted_contribution",
+                        "train_prediction_h",
+                        "train_prediction_w",
+                        "train_alpha_target_h",
+                        "train_alpha_target_w",
+                        "train_supervision_mask_h",
+                        "train_supervision_mask_w",
+                        "train_target_min_x",
+                        "train_target_max_x",
+                        "train_target_min_y",
+                        "train_target_max_y",
+                        "train_halo_min_x",
+                        "train_halo_max_x",
+                        "train_halo_min_y",
+                        "train_halo_max_y",
+                        "training_expanded_supervision_enabled",
+                        "eval_expanded_prediction_enabled",
+                        "eval_expanded_halo_px",
+                        "train_geometry_mode",
+                        "seam_edge_north_defined",
+                        "seam_edge_south_defined",
+                        "seam_edge_east_defined",
+                        "seam_edge_west_defined",
+                        "seam_edge_north_pre_gate_l2",
+                        "seam_edge_south_pre_gate_l2",
+                        "seam_edge_east_pre_gate_l2",
+                        "seam_edge_west_pre_gate_l2",
+                        "seam_edge_north_post_gate_l2",
+                        "seam_edge_south_post_gate_l2",
+                        "seam_edge_east_post_gate_l2",
+                        "seam_edge_west_post_gate_l2",
+                        "seam_edge_north_visible_l2",
+                        "seam_edge_south_visible_l2",
+                        "seam_edge_east_visible_l2",
+                        "seam_edge_west_visible_l2",
                         "terrain_curriculum_factor",
                         "alpha_temperature",
                         "alpha_prior_weight",
@@ -2257,6 +5010,42 @@ def train(args: argparse.Namespace) -> None:
                         "param_delta_alpha_heads",
                         "param_delta_control_residual_blocks",
                         "param_delta_control_mid_block",
+                        "bind_active_count",
+                        "precondition_c_true_count",
+                        "candidate_c_count",
+                        "eligible_c_count",
+                        "requested_c_count",
+                        "realized_c_count",
+                        "fallback_from_c_count",
+                        "rejected_c_count_total",
+                        "rejected_c_count_precondition",
+                        "retry_count_for_c",
+                        "delta_c_mean",
+                        "delta_c_min",
+                        "delta_c_max",
+                        "drop_stage_for_c",
+                        "bind_negative_mode_requested",
+                        "bind_negative_mode_realized",
+                        "bind_negative_delta_retry_count",
+                        "bind_negative_fallback_triggered",
+                        "bind_negative_fallback_reason",
+                        "bind_negative_delta_mean",
+                        "bind_active_batch",
+                        "bind_negative_mode",
+                        "bind_schedule_name",
+                        "bind_effective_weight_a",
+                        "bind_effective_weight_b",
+                        "bind_effective_weight_c",
+                        "bind_pos_denoise_loss",
+                        "bind_neg_denoise_loss",
+                        "bind_ranking_gap",
+                        "bind_loss",
+                        "bind_margin_loss",
+                        "bind_win_rate",
+                        "train_prompt_name",
+                        "train_prompt_mode",
+                        "train_prompt",
+                        "train_prompt2",
                     ]
                 )
                 for row in loss_trace:
@@ -2269,7 +5058,82 @@ def train(args: argparse.Namespace) -> None:
                             row["alpha_edge_loss"],
                             row["alpha_terrain_bce_loss"],
                             row["alpha_terrain_iou_loss"],
+                            row.get("seam_alpha_local_loss", 0.0),
+                            row.get("seam_margin_inner_loss", 0.0),
+                            row.get("seam_margin_outer_loss", 0.0),
+                            row.get("seam_interior_inner_loss", 0.0),
+                            row.get("seam_interior_outer_loss", 0.0),
+                            row.get("seam_continuation_loss", 0.0),
+                            row.get("seam_rgb_margin_inner_loss", 0.0),
+                            row.get("seam_rgb_margin_outer_loss", 0.0),
+                            row.get("seam_rgb_interior_inner_loss", 0.0),
+                            row.get("seam_rgb_interior_outer_loss", 0.0),
+                            row.get("seam_rgb_total_loss", 0.0),
+                            row.get("seam_edge_recon_score", 0.0),
+                            row.get("seam_margin_inner_coverage_ratio", 0.0),
+                            row.get("seam_margin_inner_coverage_px", 0.0),
+                            row.get("seam_margin_inner_raw_px", 0.0),
+                            row.get("seam_active_edges_count", 0.0),
+                            row.get("prompt_conflict_score", 0.0),
+                            row.get("prompt_conflict_score_norm", 0.0),
                             row["alpha_total_loss"],
+                            row.get("seam_defined_ratio", 0.0),
+                            row.get("seam_pre_gate_l2", 0.0),
+                            row.get("seam_post_gate_l2", 0.0),
+                            row.get("seam_undefined_edges_count", 0.0),
+                            row.get("seam_undefined_pre_gate_l2", 0.0),
+                            row.get("seam_undefined_post_gate_l2", 0.0),
+                            row.get("seam_halo_supervised_px", 0.0),
+                            row.get("seam_interior_supervised_px", 0.0),
+                            row.get("seam_halo_to_interior_px_ratio", 0.0),
+                            row.get("seam_rgb_halo_loss_raw", 0.0),
+                            row.get("seam_rgb_interior_loss_raw", 0.0),
+                            row.get("seam_rgb_halo_loss_weighted", 0.0),
+                            row.get("seam_rgb_interior_loss_weighted", 0.0),
+                            row.get("seam_alpha_halo_loss_raw", 0.0),
+                            row.get("seam_alpha_interior_loss_raw", 0.0),
+                            row.get("seam_alpha_halo_loss_weighted", 0.0),
+                            row.get("seam_alpha_interior_loss_weighted", 0.0),
+                            row.get("seam_halo_target_energy", 0.0),
+                            row.get("seam_loss_contribution_ratio", 0.0),
+                            row.get("halo_inner_weighted_contribution", 0.0),
+                            row.get("halo_outer_weighted_contribution", 0.0),
+                            row.get("interior_continuation_weighted_contribution", 0.0),
+                            row.get("interior_core_weighted_contribution", 0.0),
+                            row.get("train_prediction_h", 0.0),
+                            row.get("train_prediction_w", 0.0),
+                            row.get("train_alpha_target_h", 0.0),
+                            row.get("train_alpha_target_w", 0.0),
+                            row.get("train_supervision_mask_h", 0.0),
+                            row.get("train_supervision_mask_w", 0.0),
+                            row.get("train_target_min_x", 0.0),
+                            row.get("train_target_max_x", 0.0),
+                            row.get("train_target_min_y", 0.0),
+                            row.get("train_target_max_y", 0.0),
+                            row.get("train_halo_min_x", 0.0),
+                            row.get("train_halo_max_x", 0.0),
+                            row.get("train_halo_min_y", 0.0),
+                            row.get("train_halo_max_y", 0.0),
+                            row.get("training_expanded_supervision_enabled", 0.0),
+                            row.get("eval_expanded_prediction_enabled", 0.0),
+                            row.get("eval_expanded_halo_px", 0.0),
+                            row.get("train_geometry_mode", "interior_only"),
+                            row.get("seam_edge_north_defined", 0.0),
+                            row.get("seam_edge_south_defined", 0.0),
+                            row.get("seam_edge_east_defined", 0.0),
+                            row.get("seam_edge_west_defined", 0.0),
+                            row.get("seam_edge_north_pre_gate_l2", 0.0),
+                            row.get("seam_edge_south_pre_gate_l2", 0.0),
+                            row.get("seam_edge_east_pre_gate_l2", 0.0),
+                            row.get("seam_edge_west_pre_gate_l2", 0.0),
+                            row.get("seam_edge_north_post_gate_l2", 0.0),
+                            row.get("seam_edge_south_post_gate_l2", 0.0),
+                            row.get("seam_edge_east_post_gate_l2", 0.0),
+                            row.get("seam_edge_west_post_gate_l2", 0.0),
+                            row.get("seam_edge_north_visible_l2", 0.0),
+                            row.get("seam_edge_south_visible_l2", 0.0),
+                            row.get("seam_edge_east_visible_l2", 0.0),
+                            row.get("seam_edge_west_visible_l2", 0.0),
                             row["terrain_curriculum_factor"],
                             row["alpha_temperature"],
                             row["alpha_prior_weight"],
@@ -2279,6 +5143,42 @@ def train(args: argparse.Namespace) -> None:
                             row.get("param_delta_alpha_heads", 0.0),
                             row.get("param_delta_control_residual_blocks", 0.0),
                             row.get("param_delta_control_mid_block", 0.0),
+                            row.get("bind_active_count", 0.0),
+                            row.get("precondition_c_true_count", 0.0),
+                            row.get("candidate_c_count", 0.0),
+                            row.get("eligible_c_count", 0.0),
+                            row.get("requested_c_count", 0.0),
+                            row.get("realized_c_count", 0.0),
+                            row.get("fallback_from_c_count", 0.0),
+                            row.get("rejected_c_count_total", 0.0),
+                            row.get("rejected_c_count_precondition", 0.0),
+                            row.get("retry_count_for_c", 0.0),
+                            row.get("delta_c_mean", 0.0),
+                            row.get("delta_c_min", 0.0),
+                            row.get("delta_c_max", 0.0),
+                            row.get("drop_stage_for_c", "none"),
+                            row.get("bind_negative_mode_requested", "none"),
+                            row.get("bind_negative_mode_realized", "none"),
+                            row.get("bind_negative_delta_retry_count", 0.0),
+                            row.get("bind_negative_fallback_triggered", 0.0),
+                            row.get("bind_negative_fallback_reason", "none"),
+                            row.get("bind_negative_delta_mean", 0.0),
+                            row.get("bind_active_batch", 0.0),
+                            row.get("bind_negative_mode", "none"),
+                            row.get("bind_schedule_name", "none"),
+                            row.get("bind_effective_weight_a", 0.0),
+                            row.get("bind_effective_weight_b", 0.0),
+                            row.get("bind_effective_weight_c", 0.0),
+                            row.get("bind_pos_denoise_loss", 0.0),
+                            row.get("bind_neg_denoise_loss", 0.0),
+                            row.get("bind_ranking_gap", 0.0),
+                            row.get("bind_loss", 0.0),
+                            row.get("bind_margin_loss", 0.0),
+                            row.get("bind_win_rate", 0.0),
+                            row.get("train_prompt_name", "default"),
+                            row.get("train_prompt_mode", "default"),
+                            row.get("train_prompt", dataset.prompt),
+                            row.get("train_prompt2", dataset.prompt2),
                         ]
                     )
             logger.info(f"[sanity/loss] wrote trace to {loss_trace_path} ({len(loss_trace)} rows)")
@@ -2291,10 +5191,12 @@ def train(args: argparse.Namespace) -> None:
             global_step,
             save_dtype,
         )
+        if args.save_state_on_train_end:
+            save_extended_training_state(args, accelerator, global_step, ema_state, on_train_end=True)
 
         if evaluation_config["enabled"]:
             attempt_summary = summarize_attempt(
-                output_dir=eval_output_dir,
+                output_dir=eval_output_dir_raw,
                 eval_step_summaries=eval_step_summaries,
                 loss_trace=loss_trace,
                 eval_config=evaluation_config,

@@ -175,6 +175,8 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         hs = []
         alpha_per_scale = []
         residual_norms = []
+        activation_norms = []
+        residual_to_activation_ratios = []
         cond_embedding_norm = None
         cond_embedding = None
         for i, module in enumerate(self.input_blocks):
@@ -186,7 +188,11 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
             control_residual = self.controlnet_down_blocks[i](h) * multiplier
             hs.append(control_residual)
             if return_diagnostics:
-                residual_norms.append(float(control_residual.detach().float().norm().item()))
+                residual_norm = float(control_residual.detach().float().norm().item())
+                activation_norm = float(h.detach().float().norm().item())
+                residual_norms.append(residual_norm)
+                activation_norms.append(activation_norm)
+                residual_to_activation_ratios.append(residual_norm / max(activation_norm, 1e-12))
             if return_alpha and str(i) in self.controlnet_alpha_heads:
                 alpha_per_scale.append((i, self.controlnet_alpha_heads[str(i)](control_residual)))
 
@@ -199,6 +205,8 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                     "multiplier": float(multiplier),
                     "cond_embedding_norm": cond_embedding_norm,
                     "down_block_residual_norms": residual_norms,
+                    "down_block_activation_norms": activation_norms,
+                    "down_block_residual_to_activation_ratios": residual_to_activation_ratios,
                     "mid_block_residual_norm": float(h.detach().float().norm().item()),
                 }
             return hs, h
@@ -254,6 +262,8 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                 "multiplier": float(multiplier),
                 "cond_embedding_norm": cond_embedding_norm,
                 "down_block_residual_norms": residual_norms,
+                "down_block_activation_norms": activation_norms,
+                "down_block_residual_to_activation_ratios": residual_to_activation_ratios,
                 "mid_block_residual_norm": float(h.detach().float().norm().item()),
             }
 
