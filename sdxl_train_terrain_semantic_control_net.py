@@ -17,6 +17,7 @@ from diffusers import DDPMScheduler
 from diffusers.utils.torch_utils import is_compiled_module
 from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 from PIL import Image, ImageDraw
@@ -33,7 +34,16 @@ from library.terrain_semantic_eval import (
     resolve_swap_pairs,
     run_semantic_binding_eval,
 )
-from library.terrain_semantic_manifest_dataset import SemanticChannelSpec, TerrainSemanticManifestDataset
+from library.terrain_semantic_manifest_dataset import (
+    SemanticChannelSpec,
+    TerrainSemanticManifestDataset,
+    build_seam_region_maps as shared_build_seam_region_maps,
+    build_seam_supervision_mask as shared_build_seam_supervision_mask,
+    center_embed_spatial_tensor as shared_center_embed_spatial_tensor,
+    resolve_fixed_defined_edge_index,
+    summarize_seam_edge_qualification,
+    terrain_mask_to_occupancy as shared_terrain_mask_to_occupancy,
+)
 from library.utils import setup_logging
 import networks.lora as lora_network
 
@@ -46,6 +56,28 @@ logger = logging.getLogger(__name__)
 
 
 STEP_STATE_RE = re.compile(r"step(\d+)-state$")
+
+COMPACT_SEAM_LOSS_TRACE_FIELDS = (
+    "step",
+    "total_loss",
+    "diffusion_loss",
+    "rgb_total_loss",
+    "continuation_weighted_rgb_loss",
+    "continuation_gradient_loss",
+    "continuation_gradient_weight",
+    "halo_inner_rgb_loss",
+    "halo_outer_rgb_loss",
+    "interior_core_rgb_loss",
+    "continuation_falloff_power",
+    "continuation_peak_weight",
+    "continuation_weight_sum",
+    "seam_valid_edge_ratio",
+    "valid_edges_for_loss",
+    "continuation_px",
+    "halo_inner_px",
+    "halo_outer_px",
+    "halo_without_continuation_count_after_gate",
+)
 
 
 @dataclass(frozen=True)
@@ -421,6 +453,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_dtype", type=str, default="fp16", choices=["fp16", "bf16", "float"])
     parser.add_argument("--save_state", action="store_true")
     parser.add_argument("--save_state_on_train_end", action="store_true")
+    parser.add_argument(
+        "--skip_step_checkpoint_weights",
+        action="store_true",
+        help="Do not write top-level step-XXXXXX.safetensors files during intermediate checkpoints; state folders still save normally.",
+    )
     parser.add_argument("--save_last_n_steps_state", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--sanity_samples", type=int, default=32)
@@ -451,6 +488,83 @@ def _parse_steps_csv(steps_csv: str) -> List[int]:
             continue
         steps.append(int(token))
     return sorted(set(steps))
+
+
+def _normalize_loss_trace_mode(mode: object) -> str:
+    normalized = str(mode or "full").strip().lower() or "full"
+    if normalized not in {"full", "compact_seam"}:
+        raise ValueError(f"unsupported loss_trace_mode='{mode}'")
+    return normalized
+
+
+def _compact_edge_metric_sum(row: Dict[str, object], names: Tuple[str, ...], fallback_key: str) -> float:
+    values: List[float] = []
+    for name in names:
+        if name in row:
+            values.append(float(row.get(name, 0.0) or 0.0))
+    if values:
+        return float(sum(values))
+    return float(row.get(fallback_key, 0.0) or 0.0)
+
+
+def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, object]:
+    normalized_mode = _normalize_loss_trace_mode(mode)
+    if normalized_mode == "full":
+        return row
+
+    continuation_px = _compact_edge_metric_sum(
+        row,
+        (
+            "seam_edge_north_continuation_px_after_gate",
+            "seam_edge_south_continuation_px_after_gate",
+            "seam_edge_east_continuation_px_after_gate",
+            "seam_edge_west_continuation_px_after_gate",
+        ),
+        "seam_continuation_distance_band_px_count",
+    )
+    halo_inner_px = _compact_edge_metric_sum(
+        row,
+        (
+            "seam_edge_north_halo_inner_px_after_gate",
+            "seam_edge_south_halo_inner_px_after_gate",
+            "seam_edge_east_halo_inner_px_after_gate",
+            "seam_edge_west_halo_inner_px_after_gate",
+        ),
+        "seam_halo_supervised_px",
+    )
+    halo_outer_px = _compact_edge_metric_sum(
+        row,
+        (
+            "seam_edge_north_halo_outer_px_after_gate",
+            "seam_edge_south_halo_outer_px_after_gate",
+            "seam_edge_east_halo_outer_px_after_gate",
+            "seam_edge_west_halo_outer_px_after_gate",
+        ),
+        "seam_halo_supervised_px",
+    )
+
+    compact_row = {
+        "step": float(row.get("step", 0.0) or 0.0),
+        "total_loss": float(row.get("loss", 0.0) or 0.0),
+        "diffusion_loss": float(row.get("diffusion_loss", 0.0) or 0.0),
+        "rgb_total_loss": float(row.get("seam_rgb_total_loss", 0.0) or 0.0),
+        "continuation_weighted_rgb_loss": float(row.get("seam_rgb_continuation_weighted_loss", 0.0) or 0.0),
+        "continuation_gradient_loss": float(row.get("seam_continuation_gradient_loss", 0.0) or 0.0),
+        "continuation_gradient_weight": float(row.get("seam_continuation_gradient_loss_weight", 0.0) or 0.0),
+        "halo_inner_rgb_loss": float(row.get("seam_rgb_halo_inner_loss", 0.0) or 0.0),
+        "halo_outer_rgb_loss": float(row.get("seam_rgb_halo_outer_loss", 0.0) or 0.0),
+        "interior_core_rgb_loss": float(row.get("seam_rgb_interior_core_loss", 0.0) or 0.0),
+        "continuation_falloff_power": float(row.get("seam_continuation_falloff_power", 0.0) or 0.0),
+        "continuation_peak_weight": float(row.get("seam_continuation_peak_weight", 0.0) or 0.0),
+        "continuation_weight_sum": float(row.get("seam_continuation_weight_sum", 0.0) or 0.0),
+        "seam_valid_edge_ratio": float(row.get("seam_valid_edge_ratio", 0.0) or 0.0),
+        "valid_edges_for_loss": float(row.get("seam_valid_edges_for_loss_count", 0.0) or 0.0),
+        "continuation_px": float(continuation_px),
+        "halo_inner_px": float(halo_inner_px),
+        "halo_outer_px": float(halo_outer_px),
+        "halo_without_continuation_count_after_gate": float(row.get("halo_without_continuation_count_after_gate", 0.0) or 0.0),
+    }
+    return {field: compact_row[field] for field in COMPACT_SEAM_LOSS_TRACE_FIELDS}
 
 
 def should_save_checkpoint(args: argparse.Namespace, global_step: int, resumed_step: int) -> bool:
@@ -783,6 +897,7 @@ def parse_verification_config(config: Dict[str, object]) -> Dict[str, object]:
         "train_expanded_halo_px": int(verification.get("train_expanded_halo_px", 0)),
         "save_seam_visual_debug": bool(verification.get("save_seam_visual_debug", False)),
         "seam_visual_debug_max_steps": int(verification.get("seam_visual_debug_max_steps", 2)),
+        "loss_trace_mode": _normalize_loss_trace_mode(verification.get("loss_trace_mode", "full")),
     }
 
 
@@ -793,8 +908,68 @@ def parse_conditioning_config(config: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def _parse_step_value_schedule(raw_schedule: object, field_name: str) -> List[Tuple[int, float]]:
+    if raw_schedule is None:
+        return []
+    if not isinstance(raw_schedule, list):
+        raise ValueError(f"{field_name} must be a list of {{step, value}} entries")
+
+    schedule: List[Tuple[int, float]] = []
+    for index, entry in enumerate(raw_schedule):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{field_name}[{index}] must be a table with step and value")
+        if entry.get("step") is None or entry.get("value") is None:
+            raise ValueError(f"{field_name}[{index}] must include step and value")
+        schedule.append((max(0, int(entry["step"])), float(entry["value"])))
+
+    schedule.sort(key=lambda item: item[0])
+    return schedule
+
+
+def _resolve_step_value_schedule(default_value: float, schedule: object, current_step: int) -> float:
+    resolved_value = float(default_value)
+    if current_step < 0 or not isinstance(schedule, list):
+        return resolved_value
+
+    for start_step, step_value in schedule:
+        if current_step < int(start_step):
+            break
+        resolved_value = float(step_value)
+
+    return resolved_value
+
+
 def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
     seam = config.get("seam", {})
+
+    def _get_float(keys: List[str], default: float) -> float:
+        for key in keys:
+            if seam.get(key) is not None:
+                return float(seam.get(key))
+        return float(default)
+
+    def _get_int(keys: List[str], default: int) -> int:
+        for key in keys:
+            if seam.get(key) is not None:
+                return int(seam.get(key))
+        return int(default)
+
+    halo_inner_rgb_weight = _get_float(["halo_inner_rgb_weight", "halo_inner_weight", "margin_inner_weight"], 2.0)
+    halo_outer_rgb_weight = _get_float(["halo_outer_rgb_weight", "halo_outer_weight", "margin_outer_weight"], 1.5)
+    continuation_width_px = _get_int(["continuation_width_px", "continuation_band_px", "interior_band_inner_px"], 48)
+    continuation_peak_rgb_weight = _get_float(
+        ["continuation_peak_rgb_weight", "interior_continuation_weight", "interior_band_inner_weight"],
+        2.5,
+    )
+    interior_core_rgb_weight = _get_float(["interior_core_rgb_weight", "interior_core_weight", "interior_band_outer_weight"], 0.10)
+    continuation_gradient_loss_weight = _get_float(["continuation_gradient_loss_weight"], 0.25)
+    continuation_gradient_loss_weight_schedule = _parse_step_value_schedule(
+        seam.get("continuation_gradient_loss_weight_schedule"),
+        "seam.continuation_gradient_loss_weight_schedule",
+    )
+    continuation_falloff_power = _get_float(["continuation_falloff_power"], 2.0)
+    gradient_loss_sobel_radius_px = _get_int(["gradient_loss_sobel_radius_px"], 1)
+
     return {
         "enabled": bool(seam.get("enabled", False)),
         "strip_width_px": int(seam.get("strip_width_px", 64)),
@@ -807,16 +982,28 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "alpha_local_loss_weight": float(seam.get("alpha_local_loss_weight", 0.0)),
         "loss_narrow_min_decay": float(seam.get("loss_narrow_min_decay", 0.5)),
         "margin_inner_px": int(seam.get("margin_inner_px", 32)),
-        "margin_inner_weight": float(seam.get("margin_inner_weight", 1.0)),
-        "margin_outer_weight": float(seam.get("margin_outer_weight", 0.7)),
-        "interior_band_inner_px": int(seam.get("interior_band_inner_px", 16)),
-        "interior_band_outer_px": int(seam.get("interior_band_outer_px", 32)),
-        "interior_band_inner_weight": float(seam.get("interior_band_inner_weight", 0.8)),
-        "interior_band_outer_weight": float(seam.get("interior_band_outer_weight", 0.5)),
+        "margin_inner_weight": halo_inner_rgb_weight,
+        "margin_outer_weight": halo_outer_rgb_weight,
+        "interior_band_inner_px": int(seam.get("interior_band_inner_px", continuation_width_px)),
+        "interior_band_outer_px": int(seam.get("interior_band_outer_px", max(continuation_width_px, 32))),
+        "interior_band_inner_weight": continuation_peak_rgb_weight,
+        "interior_band_outer_weight": interior_core_rgb_weight,
+        "halo_inner_rgb_weight": halo_inner_rgb_weight,
+        "halo_outer_rgb_weight": halo_outer_rgb_weight,
+        "continuation_width_px": continuation_width_px,
+        "continuation_peak_rgb_weight": continuation_peak_rgb_weight,
+        "interior_core_rgb_weight": interior_core_rgb_weight,
+        "continuation_gradient_loss_weight": continuation_gradient_loss_weight,
+        "continuation_gradient_loss_weight_schedule": continuation_gradient_loss_weight_schedule,
+        "continuation_falloff_power": continuation_falloff_power,
+        "gradient_loss_sobel_radius_px": gradient_loss_sobel_radius_px,
         "rgb_recon_loss_weight": float(seam.get("rgb_recon_loss_weight", 0.0)),
         "normalize_region_losses": bool(seam.get("normalize_region_losses", True)),
         "require_defined_for_margin_and_band": bool(seam.get("require_defined_for_margin_and_band", True)),
         "force_defined_strip_supervision": bool(seam.get("force_defined_strip_supervision", True)),
+        "seam_qualified_sampling_enabled": bool(seam.get("seam_qualified_sampling_enabled", False)),
+        "seam_qualified_min_continuation_px": int(seam.get("seam_qualified_min_continuation_px", 0)),
+        "seam_qualified_min_halo_px": int(seam.get("seam_qualified_min_halo_px", 0)),
         "seam_supervision_expand_px": int(seam.get("seam_supervision_expand_px", 0)),
         "boundary_chunk_stride_px": int(seam.get("boundary_chunk_stride_px", 16)),
         "boundary_grid_offset_x_px": int(seam.get("boundary_grid_offset_x_px", 0)),
@@ -994,11 +1181,15 @@ def build_dataset(
         seam_partial_one_edge_ratio=float((seam_config or {}).get("partial_one_edge_ratio", 0.45)),
         seam_undefined_zero_prob=float((seam_config or {}).get("undefined_zero_prob", 0.40)),
         seam_undefined_noise_prob=float((seam_config or {}).get("undefined_noise_prob", 0.40)),
+        seam_fixed_defined_edge_index=resolve_fixed_defined_edge_index((seam_config or {}).get("fixed_defined_edge", "")),
+        seam_runtime_config=dict(seam_config or {}),
         expanded_target_halo_px=(
             int(verification.get("train_expanded_halo_px", 0))
             if bool(verification.get("train_expanded_supervision_enabled", False))
             else 0
         ),
+        terrain_mask_black_is_terrain=bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+        alpha_binary_threshold=float(alpha_config.get("binary_threshold", 0.5)),
         boundary_chunk_stride_px=int((seam_config or {}).get("boundary_chunk_stride_px", 16)),
         boundary_grid_offset_x_px=int((seam_config or {}).get("boundary_grid_offset_x_px", 0)),
         boundary_grid_offset_y_px=int((seam_config or {}).get("boundary_grid_offset_y_px", 0)),
@@ -1043,6 +1234,12 @@ def semantic_collate(samples: List[Dict[str, object]]) -> Dict[str, object]:
         "seam_state_label",
         "seam_undefined_mode",
         "seam_strip_width_px",
+        "seam_qualified_edge_mask",
+        "seam_qualified_continuation_px",
+        "seam_qualified_halo_inner_px",
+        "seam_qualified_halo_outer_px",
+        "seam_qualified_continuation_weight_sum",
+        "seam_qualified_valid_edges_count",
         "boundary_alignment_error",
         "boundary_consistency_error",
     }
@@ -1212,28 +1409,7 @@ def _pad_spatial_tensor(tensor: torch.Tensor, pad_px: int, mode: str = "constant
 
 
 def _center_embed_spatial_tensor(tensor: torch.Tensor, halo_px: int, fill_value: float = 0.0) -> torch.Tensor:
-    halo = int(max(0, halo_px))
-    if halo <= 0:
-        return tensor
-    if tensor.ndim == 3:
-        out = torch.full(
-            (tensor.shape[0], tensor.shape[1] + (2 * halo), tensor.shape[2] + (2 * halo)),
-            float(fill_value),
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        out[:, halo : halo + tensor.shape[1], halo : halo + tensor.shape[2]] = tensor
-        return out
-    if tensor.ndim == 4:
-        out = torch.full(
-            (tensor.shape[0], tensor.shape[1], tensor.shape[2] + (2 * halo), tensor.shape[3] + (2 * halo)),
-            float(fill_value),
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        out[:, :, halo : halo + tensor.shape[2], halo : halo + tensor.shape[3]] = tensor
-        return out
-    raise ValueError(f"unexpected tensor rank for center embed: {tuple(tensor.shape)}")
+    return shared_center_embed_spatial_tensor(tensor, halo_px, fill_value=fill_value)
 
 
 def _linear_schedule(start: float, end: float, step: int, total_steps: int) -> float:
@@ -1531,7 +1707,91 @@ def _summarize_weighted_seam_regions(
     seam_maps: Dict[str, torch.Tensor],
     region_weights: Dict[str, float],
     normalize_region_losses: bool,
+    continuation_weighted_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, object]:
+    if continuation_weighted_mask is not None:
+        zero = error_map.new_tensor(0.0)
+
+        def _mask_or_zeros(*keys: str) -> torch.Tensor:
+            for key in keys:
+                value = seam_maps.get(key)
+                if isinstance(value, torch.Tensor):
+                    return value.float()
+            return torch.zeros_like(error_map, dtype=error_map.dtype)
+
+        def _masked_mean(mask: torch.Tensor) -> torch.Tensor:
+            area = mask.sum()
+            if float(area.detach().item()) <= 0.0:
+                return zero
+            return (error_map * mask).sum() / area.clamp_min(1e-6)
+
+        def _weighted_mean(mask: torch.Tensor) -> torch.Tensor:
+            weight_sum = mask.sum()
+            if float(weight_sum.detach().item()) <= 0.0:
+                return zero
+            return (error_map * mask).sum() / weight_sum.clamp_min(1e-6)
+
+        halo_inner_mask = _mask_or_zeros("halo_inner", "margin_inner")
+        halo_outer_mask = _mask_or_zeros("halo_outer", "margin_outer")
+        continuation_binary_mask = _mask_or_zeros("interior_continuation", "interior_inner")
+        interior_core_mask = _mask_or_zeros("interior_core")
+        interior_union_mask = torch.maximum(interior_core_mask, continuation_binary_mask)
+
+        halo_inner_loss = _masked_mean(halo_inner_mask)
+        halo_outer_loss = _masked_mean(halo_outer_mask)
+        continuation_raw_loss = _masked_mean(continuation_binary_mask)
+        continuation_weighted_loss = _weighted_mean(continuation_weighted_mask.float()) * float(
+            region_weights.get("interior_continuation", region_weights.get("continuation_distance_weighted", 1.0))
+        )
+        interior_core_loss = _masked_mean(interior_core_mask)
+
+        halo_inner_contribution = halo_inner_loss * float(region_weights.get("halo_inner", 1.0))
+        halo_outer_contribution = halo_outer_loss * float(region_weights.get("halo_outer", 1.0))
+        interior_core_contribution = interior_core_loss * float(region_weights.get("interior_core", 1.0))
+
+        region_losses = {
+            "halo_inner": halo_inner_loss,
+            "halo_outer": halo_outer_loss,
+            "interior_continuation": continuation_raw_loss,
+            "interior_core": interior_core_loss,
+            "margin_inner": halo_inner_loss,
+            "margin_outer": halo_outer_loss,
+            "interior_inner": continuation_raw_loss,
+            "interior_outer": interior_core_loss,
+        }
+        region_weighted_contributions = {
+            "halo_inner": halo_inner_contribution,
+            "halo_outer": halo_outer_contribution,
+            "interior_continuation": continuation_weighted_loss,
+            "continuation_distance_weighted": continuation_weighted_loss,
+            "interior_core": interior_core_contribution,
+            "margin_inner": halo_inner_contribution,
+            "margin_outer": halo_outer_contribution,
+            "interior_inner": continuation_weighted_loss,
+            "interior_outer": interior_core_contribution,
+        }
+        halo_raw_sum = (error_map * halo_inner_mask).sum() + (error_map * halo_outer_mask).sum()
+        interior_raw_sum = (error_map * interior_union_mask).sum()
+        halo_supervised_px = halo_inner_mask.sum() + halo_outer_mask.sum()
+        interior_supervised_px = interior_union_mask.sum()
+
+        return {
+            "region_losses": region_losses,
+            "halo_loss_raw": halo_raw_sum,
+            "interior_loss_raw": interior_raw_sum,
+            "halo_supervised_px": halo_supervised_px,
+            "interior_supervised_px": interior_supervised_px,
+            "halo_loss_weighted": halo_inner_contribution + halo_outer_contribution,
+            "interior_loss_weighted": continuation_weighted_loss + interior_core_contribution,
+            "total_loss": halo_inner_contribution + halo_outer_contribution + continuation_weighted_loss + interior_core_contribution,
+            "region_weighted_contributions": region_weighted_contributions,
+            "continuation_loss_raw": continuation_raw_loss,
+            "continuation_loss_weighted": continuation_weighted_loss,
+            "continuation_supervised_px": continuation_binary_mask.sum(),
+            "continuation_weight_sum": continuation_weighted_mask.float().sum(),
+            "interior_core_supervised_px": interior_core_mask.sum(),
+        }
+
     halo_regions = ("margin_inner", "margin_outer")
     interior_regions = ("interior_inner", "interior_outer")
     zero = error_map.new_tensor(0.0)
@@ -1594,6 +1854,58 @@ def _summarize_weighted_seam_regions(
     }
 
 
+_SOBEL_X_KERNEL = torch.tensor(
+    [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32
+).view(1, 1, 3, 3)
+_SOBEL_Y_KERNEL = torch.tensor(
+    [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32
+).view(1, 1, 3, 3)
+
+
+def _compute_continuation_gradient_loss(
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    continuation_distance_weighted_mask: torch.Tensor,
+    sobel_radius_px: int = 1,
+) -> Dict[str, torch.Tensor]:
+    if pred_rgb.ndim != 4 or target_rgb.ndim != 4 or pred_rgb.shape[1] != 3 or target_rgb.shape[1] != 3:
+        raise ValueError(
+            "continuation gradient loss expects RGB tensors with shape [batch, 3, height, width]: "
+            + f"pred={tuple(pred_rgb.shape)} target={tuple(target_rgb.shape)}"
+        )
+    if int(sobel_radius_px) != 1:
+        logger.warning("[seam/gradient] only 3x3 Sobel is implemented; requested radius=%d, using 1", int(sobel_radius_px))
+
+    sobel_x = _SOBEL_X_KERNEL.to(device=pred_rgb.device, dtype=pred_rgb.dtype).expand(3, 1, 3, 3)
+    sobel_y = _SOBEL_Y_KERNEL.to(device=pred_rgb.device, dtype=pred_rgb.dtype).expand(3, 1, 3, 3)
+
+    pred_grad_x = F.conv2d(pred_rgb, sobel_x, padding=1, groups=3)
+    pred_grad_y = F.conv2d(pred_rgb, sobel_y, padding=1, groups=3)
+    target_grad_x = F.conv2d(target_rgb, sobel_x, padding=1, groups=3)
+    target_grad_y = F.conv2d(target_rgb, sobel_y, padding=1, groups=3)
+
+    pred_grad_mag = torch.sqrt(pred_grad_x.square() + pred_grad_y.square() + 1e-6)
+    target_grad_mag = torch.sqrt(target_grad_x.square() + target_grad_y.square() + 1e-6)
+    grad_diff = (pred_grad_mag - target_grad_mag).abs().mean(dim=1, keepdim=True)
+
+    active_mask = (continuation_distance_weighted_mask > 0.0).to(dtype=grad_diff.dtype)
+    active_px = active_mask.sum()
+    weight_sum = continuation_distance_weighted_mask.sum()
+    raw_loss = grad_diff.new_tensor(0.0)
+    weighted_loss = grad_diff.new_tensor(0.0)
+    if float(active_px.detach().item()) > 0.0:
+        raw_loss = (grad_diff * active_mask).sum() / active_px.clamp_min(1e-6)
+    if float(weight_sum.detach().item()) > 0.0:
+        weighted_loss = (grad_diff * continuation_distance_weighted_mask).sum() / weight_sum.clamp_min(1e-6)
+
+    return {
+        "raw_loss": raw_loss,
+        "weighted_loss": weighted_loss,
+        "active_px": active_px,
+        "weight_sum": weight_sum,
+    }
+
+
 def _build_seam_region_maps(
     edge_band_masks: torch.Tensor,
     seam_decay_maps: torch.Tensor,
@@ -1602,124 +1914,18 @@ def _build_seam_region_maps(
     supervision_mask: torch.Tensor,
     seam_config: Dict[str, object],
     expanded_halo_px: int = 0,
+    continuation_valid_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build normalized seam supervision regions for margin and interior continuity bands."""
-    if edge_band_masks.ndim != 4 or seam_decay_maps.ndim != 4:
-        raise ValueError("seam maps must have shape [batch, edges, height, width]")
-
-    batch_size, _, height, width = edge_band_masks.shape
-    device = edge_band_masks.device
-    dtype = edge_band_masks.dtype
-
-    strip_width = seam_strip_width_px.to(device=device, dtype=dtype).view(batch_size, 1, 1, 1).clamp_min(1.0)
-    margin_inner_px = float(max(1, int(seam_config.get("margin_inner_px", 32))))
-    interior_inner_px = float(max(1, int(seam_config.get("interior_band_inner_px", 16))))
-    interior_outer_px = float(max(int(seam_config.get("interior_band_outer_px", 32)), int(interior_inner_px)))
-
-    yy = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1).expand(batch_size, 1, height, width)
-    xx = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width).expand(batch_size, 1, height, width)
-    dist_top = yy
-    dist_bottom = float(height - 1) - yy
-    dist_right = float(width - 1) - xx
-    dist_left = xx
-
-    margin_inner_limit = torch.minimum(strip_width, torch.full_like(strip_width, margin_inner_px)).clamp_min(1.0)
-
-    if int(expanded_halo_px) > 0:
-        halo = float(int(expanded_halo_px))
-        if halo <= 0.0 or halo * 2.0 >= float(min(height, width)):
-            raise ValueError(
-                "expanded seam geometry has invalid halo size for region construction: "
-                + f"halo_px={expanded_halo_px} hw={(height, width)}"
-            )
-
-        # Expanded mode: seam reference is the interior crop boundary. Assign each outside pixel
-        # to one edge deterministically by shortest distance to that boundary; this keeps corner
-        # ownership stable and inner/outer bands adjacent with no geometric gaps.
-        interior_min_y = halo
-        interior_max_y = float(height - 1) - halo
-        interior_min_x = halo
-        interior_max_x = float(width - 1) - halo
-
-        north_dist_outside = (interior_min_y - yy).clamp(min=0.0)
-        south_dist_outside = (yy - interior_max_y).clamp(min=0.0)
-        east_dist_outside = (xx - interior_max_x).clamp(min=0.0)
-        west_dist_outside = (interior_min_x - xx).clamp(min=0.0)
-
-        north_active = north_dist_outside > 0.0
-        south_active = south_dist_outside > 0.0
-        east_active = east_dist_outside > 0.0
-        west_active = west_dist_outside > 0.0
-        outside_any = north_active | south_active | east_active | west_active
-
-        inf = torch.full_like(north_dist_outside, float("inf"))
-        # Fixed order (north, south, east, west) provides deterministic tie breaks in corners.
-        side_dist_stack = torch.cat(
-            [
-                torch.where(north_active, north_dist_outside, inf),
-                torch.where(south_active, south_dist_outside, inf),
-                torch.where(east_active, east_dist_outside, inf),
-                torch.where(west_active, west_dist_outside, inf),
-            ],
-            dim=1,
-        )
-        side_owner_idx = side_dist_stack.argmin(dim=1, keepdim=True)
-
-        north_owner = outside_any & (side_owner_idx == 0)
-        south_owner = outside_any & (side_owner_idx == 1)
-        east_owner = outside_any & (side_owner_idx == 2)
-        west_owner = outside_any & (side_owner_idx == 3)
-
-        north_inner = (north_owner & (north_dist_outside <= margin_inner_limit)).to(dtype=dtype)
-        south_inner = (south_owner & (south_dist_outside <= margin_inner_limit)).to(dtype=dtype)
-        east_inner = (east_owner & (east_dist_outside <= margin_inner_limit)).to(dtype=dtype)
-        west_inner = (west_owner & (west_dist_outside <= margin_inner_limit)).to(dtype=dtype)
-        north_outer = (north_owner & (north_dist_outside > margin_inner_limit)).to(dtype=dtype)
-        south_outer = (south_owner & (south_dist_outside > margin_inner_limit)).to(dtype=dtype)
-        east_outer = (east_owner & (east_dist_outside > margin_inner_limit)).to(dtype=dtype)
-        west_outer = (west_owner & (west_dist_outside > margin_inner_limit)).to(dtype=dtype)
-
-        margin_inner_per_edge = torch.cat([north_inner, south_inner, east_inner, west_inner], dim=1)
-        margin_outer_per_edge = torch.cat([north_outer, south_outer, east_outer, west_outer], dim=1)
-    else:
-        north_inner = (dist_top < margin_inner_limit).to(dtype=dtype)
-        south_inner = (dist_bottom < margin_inner_limit).to(dtype=dtype)
-        east_inner = (dist_right < margin_inner_limit).to(dtype=dtype)
-        west_inner = (dist_left < margin_inner_limit).to(dtype=dtype)
-        margin_inner_per_edge = torch.cat([north_inner, south_inner, east_inner, west_inner], dim=1) * edge_band_masks
-        margin_outer_per_edge = (edge_band_masks - margin_inner_per_edge).clamp(0.0, 1.0)
-
-    inner_threshold = (1.0 - (interior_inner_px / strip_width)).clamp(0.0, 1.0)
-    outer_threshold = (1.0 - (interior_outer_px / strip_width)).clamp(0.0, 1.0)
-    interior_inner_per_edge = (seam_decay_maps >= inner_threshold).to(dtype=dtype)
-    interior_outer_per_edge = (
-        (seam_decay_maps >= outer_threshold) & (seam_decay_maps < inner_threshold)
-    ).to(dtype=dtype)
-
-    if bool(seam_config.get("require_defined_for_margin_and_band", True)):
-        edge_defined = edge_defined_flags.to(device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
-        margin_inner_per_edge = margin_inner_per_edge * edge_defined
-        margin_outer_per_edge = margin_outer_per_edge * edge_defined
-        interior_inner_per_edge = interior_inner_per_edge * edge_defined
-        interior_outer_per_edge = interior_outer_per_edge * edge_defined
-
-    margin_inner_map = margin_inner_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0) * supervision_mask
-    margin_outer_map = margin_outer_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0) * supervision_mask
-    # Continuation bands should be driven by seam geometry + per-edge defined gating only.
-    # Gating these again by supervision_mask can collapse valid continuation to zero.
-    interior_inner_map = interior_inner_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
-    interior_outer_map = interior_outer_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
-
-    return {
-        "margin_inner": margin_inner_map,
-        "margin_outer": margin_outer_map,
-        "interior_inner": interior_inner_map,
-        "interior_outer": interior_outer_map,
-        "margin_inner_per_edge": margin_inner_per_edge,
-        "margin_outer_per_edge": margin_outer_per_edge,
-        "interior_inner_per_edge": interior_inner_per_edge,
-        "interior_outer_per_edge": interior_outer_per_edge,
-    }
+    return shared_build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=edge_defined_flags,
+        seam_strip_width_px=seam_strip_width_px,
+        supervision_mask=supervision_mask,
+        seam_config=seam_config,
+        expanded_halo_px=expanded_halo_px,
+        continuation_valid_mask=continuation_valid_mask,
+    )
 
 
 def _build_seam_supervision_mask(
@@ -1728,17 +1934,7 @@ def _build_seam_supervision_mask(
     edge_defined_flags: torch.Tensor,
     seam_config: Dict[str, object],
 ) -> torch.Tensor:
-    mask = trusted_mask.float().clamp(0.0, 1.0)
-    expand_px = int(max(0, int(seam_config.get("seam_supervision_expand_px", 0))))
-    if expand_px > 0:
-        mask = _expand_mask(mask, expand_px).clamp(0.0, 1.0)
-
-    if bool(seam_config.get("force_defined_strip_supervision", True)):
-        edge_defined = edge_defined_flags.float().unsqueeze(-1).unsqueeze(-1)
-        defined_edge_band = (edge_band_masks.float() * edge_defined).sum(dim=1, keepdim=True).clamp(0.0, 1.0)
-        mask = torch.maximum(mask, defined_edge_band)
-
-    return mask
+    return shared_build_seam_supervision_mask(trusted_mask, edge_band_masks, edge_defined_flags, seam_config)
 
 
 def _mask_bounds(mask: torch.Tensor) -> Tuple[float, float, float, float]:
@@ -1818,9 +2014,7 @@ def _save_seam_visual_debug(
 
 
 def _terrain_mask_to_occupancy(mask: torch.Tensor, black_is_terrain: bool) -> torch.Tensor:
-    mask = mask.detach().float() if not mask.is_floating_point() else mask.float()
-    mask = mask.clamp(0.0, 1.0)
-    return (1.0 - mask) if black_is_terrain else mask
+    return shared_terrain_mask_to_occupancy(mask, black_is_terrain)
 
 
 def _resolve_alpha_head_indices(head_scales: List[int], head_mode: str, single_scale_index: int) -> List[int]:
@@ -3277,6 +3471,12 @@ def train(args: argparse.Namespace) -> None:
     needs_vae_decode_during_train = (
         seam_config["enabled"] and float(seam_config.get("rgb_recon_loss_weight", 0.0)) > 0.0
     )
+    if needs_vae_decode_during_train:
+        if hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+        logger.info("[sanity/latents] enabled VAE slicing+tiling for seam RGB reconstruction decode")
 
     if args.cache_latents:
         vae.to(accelerator.device, dtype=vae_dtype)
@@ -3563,6 +3763,7 @@ def train(args: argparse.Namespace) -> None:
             int(args.save_every_n_steps),
         )
     loss_trace: List[Dict[str, float]] = []
+    loss_trace_mode = _normalize_loss_trace_mode(verification_config.get("loss_trace_mode", "full"))
     loss_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
     if resumed_step > 0 and os.path.exists(loss_trace_path):
         with open(loss_trace_path, "r", newline="", encoding="utf-8") as handle:
@@ -3699,10 +3900,23 @@ def train(args: argparse.Namespace) -> None:
                 seam_interior_inner_loss_value = 0.0
                 seam_interior_outer_loss_value = 0.0
                 seam_continuation_loss_value = 0.0
+                seam_continuation_gradient_loss_value = 0.0
+                seam_continuation_gradient_loss_raw_value = 0.0
+                seam_continuation_rgb_loss_raw_value = 0.0
+                seam_continuation_distance_band_px_count_value = 0.0
+                seam_continuation_width_px_value = float(seam_config.get("continuation_width_px", 0.0))
+                seam_continuation_peak_weight_value = float(seam_config.get("continuation_peak_rgb_weight", 0.0))
+                seam_continuation_falloff_power_value = float(seam_config.get("continuation_falloff_power", 2.0))
+                seam_continuation_gradient_loss_weight_value = 0.0
+                seam_continuation_weight_sum_value = 0.0
                 seam_rgb_margin_inner_loss_value = 0.0
                 seam_rgb_margin_outer_loss_value = 0.0
                 seam_rgb_interior_inner_loss_value = 0.0
                 seam_rgb_interior_outer_loss_value = 0.0
+                seam_rgb_halo_inner_loss_value = 0.0
+                seam_rgb_halo_outer_loss_value = 0.0
+                seam_rgb_interior_core_loss_value = 0.0
+                seam_rgb_continuation_weighted_loss_value = 0.0
                 seam_rgb_total_loss_value = 0.0
                 seam_rgb_halo_loss_raw_value = 0.0
                 seam_rgb_interior_loss_raw_value = 0.0
@@ -3726,11 +3940,15 @@ def train(args: argparse.Namespace) -> None:
                 halo_outer_weighted_contribution = 0.0
                 interior_continuation_weighted_contribution = 0.0
                 interior_core_weighted_contribution = 0.0
+                continuation_gradient_weighted_contribution = 0.0
                 # Per-edge gating diagnostics (computed after seam_maps_supervised)
                 seam_total_edges_defined = 0.0
                 seam_valid_edges_for_loss_count = 0.0
                 seam_valid_edge_ratio = 0.0
+                seam_dataset_qualified_edges_count = 0.0
+                seam_trainer_qualified_edges_count = 0.0
                 halo_without_continuation_count_after_gate = 0.0
+                seam_halo_without_continuation_count = 0.0
                 seam_edge_north_valid_for_seam_supervision = 0.0
                 seam_edge_south_valid_for_seam_supervision = 0.0
                 seam_edge_east_valid_for_seam_supervision = 0.0
@@ -3784,7 +4002,15 @@ def train(args: argparse.Namespace) -> None:
                 bind_win_rate_value = 0.0
                 bind_active_batch = 0.0
                 bind_negative_mode = "none"
+                seam_rgb_summary: Dict[str, object] = {}
+                seam_alpha_summary: Dict[str, object] = {}
                 step_for_logging = global_step + 1
+                seam_resume_relative_step = max(0, global_step - resumed_step)
+                seam_continuation_gradient_loss_weight_value = _resolve_step_value_schedule(
+                    default_value=float(seam_config.get("continuation_gradient_loss_weight", 0.25)),
+                    schedule=seam_config.get("continuation_gradient_loss_weight_schedule", []),
+                    current_step=seam_resume_relative_step,
+                )
                 verification_log_now = verification_config["enabled"] and (
                     step_for_logging == 1
                     or step_for_logging % max(1, int(verification_config["log_every"])) == 0
@@ -3919,6 +4145,68 @@ def train(args: argparse.Namespace) -> None:
                                 )
                             seam_decay_maps = batch["expanded_seam_decay_maps"].to(accelerator.device, dtype=weight_dtype)
                             edge_band_masks = batch["expanded_edge_band_masks"].to(accelerator.device, dtype=weight_dtype)
+                        if terrain_mask_index >= 0:
+                            continuation_valid_mask = _terrain_mask_to_occupancy(
+                                conditioning_images[:, terrain_mask_index : terrain_mask_index + 1],
+                                bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+                            )
+                            continuation_valid_mask = (continuation_valid_mask >= float(alpha_config.get("binary_threshold", 0.5))).to(dtype=weight_dtype)
+                        elif alpha_target is not None:
+                            continuation_valid_mask = (alpha_target >= float(alpha_config.get("binary_threshold", 0.5))).to(dtype=weight_dtype)
+                        else:
+                            continuation_valid_mask = torch.ones_like(trusted_mask.float())
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
+                            continuation_valid_mask = _center_embed_spatial_tensor(
+                                continuation_valid_mask,
+                                int(training_expanded_halo_px),
+                                fill_value=0.0,
+                            )
+                        seam_supervision_mask_pre = _build_seam_supervision_mask(
+                            trusted_mask=trusted_mask.float(),
+                            edge_band_masks=edge_band_masks,
+                            edge_defined_flags=edge_defined,
+                            seam_config=seam_config,
+                        )
+                        seam_maps_candidate = _build_seam_region_maps(
+                            edge_band_masks=edge_band_masks,
+                            seam_decay_maps=seam_decay_maps,
+                            edge_defined_flags=edge_defined,
+                            seam_strip_width_px=seam_strip_width_px,
+                            supervision_mask=seam_supervision_mask_pre,
+                            seam_config=seam_config,
+                            expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            continuation_valid_mask=continuation_valid_mask,
+                        )
+                        seam_edge_qualification = summarize_seam_edge_qualification(
+                            seam_maps=seam_maps_candidate,
+                            edge_defined_flags=edge_defined,
+                            seam_config=seam_config,
+                        )
+                        trainer_qualified_edge_mask = seam_edge_qualification["qualified_edge_mask"].to(
+                            accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        seam_trainer_qualified_edges_count = float(
+                            seam_edge_qualification["valid_edges_for_loss_count"].mean().detach().item()
+                        )
+                        dataset_qualified_edge_mask = None
+                        if batch.get("seam_qualified_edge_mask") is not None:
+                            dataset_qualified_edge_mask = batch["seam_qualified_edge_mask"].to(accelerator.device, dtype=weight_dtype)
+                            seam_dataset_qualified_edges_count = float(
+                                batch["seam_qualified_valid_edges_count"].to(accelerator.device, dtype=weight_dtype).mean().detach().item()
+                            )
+
+                        if bool(seam_config.get("seam_qualified_sampling_enabled", False)):
+                            if dataset_qualified_edge_mask is None or batch.get("seam_qualified_valid_edges_count") is None:
+                                raise RuntimeError("seam-qualified sampling enabled but dataset qualification tensors are missing from the batch")
+                            if not torch.equal(dataset_qualified_edge_mask >= 0.5, trainer_qualified_edge_mask >= 0.5):
+                                raise RuntimeError(
+                                    "dataset/trainer seam qualification mismatch: "
+                                    + f"dataset={dataset_qualified_edge_mask.detach().cpu().tolist()} "
+                                    + f"trainer={trainer_qualified_edge_mask.detach().cpu().tolist()}"
+                                )
+                            edge_defined = edge_defined * trainer_qualified_edge_mask
+
                         seam_supervision_mask = _build_seam_supervision_mask(
                             trusted_mask=trusted_mask.float(),
                             edge_band_masks=edge_band_masks,
@@ -3933,6 +4221,7 @@ def train(args: argparse.Namespace) -> None:
                             supervision_mask=seam_supervision_mask,
                             seam_config=seam_config,
                             expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            continuation_valid_mask=continuation_valid_mask,
                         )
                         seam_maps_raw = _build_seam_region_maps(
                             edge_band_masks=edge_band_masks,
@@ -3942,6 +4231,7 @@ def train(args: argparse.Namespace) -> None:
                             supervision_mask=torch.ones_like(trusted_mask.float()),
                             seam_config=seam_config,
                             expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            continuation_valid_mask=continuation_valid_mask,
                         )
                         seam_margin_inner_coverage_px = float(seam_maps_supervised["margin_inner"].sum().detach().item())
                         seam_margin_inner_raw_px = float(seam_maps_raw["margin_inner"].sum().detach().item())
@@ -3995,6 +4285,7 @@ def train(args: argparse.Namespace) -> None:
                         seam_valid_edges_for_loss_count = _vcnt
                         seam_valid_edge_ratio = _vcnt / max(_total_def, 1.0)
                         halo_without_continuation_count_after_gate = _hno
+                        seam_halo_without_continuation_count = _hno
                         if _hno > 0.0:
                             logger.warning(
                                 "[seam/per_edge_gate] step=%d halo_without_continuation=%.0f valid=%.0f defined=%.0f",
@@ -4014,7 +4305,16 @@ def train(args: argparse.Namespace) -> None:
                         sqrt_alpha_t = alpha_t.sqrt().clamp_min(1e-6)
                         sqrt_one_minus_alpha_t = (1.0 - alpha_t).clamp_min(0.0).sqrt()
                         pred_x0_latents = (noisy_latents - (sqrt_one_minus_alpha_t * noise_pred)) / sqrt_alpha_t
-                        pred_rgb = vae.decode((pred_x0_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample.to(dtype=weight_dtype)
+                        pred_x0_latents_for_decode = (pred_x0_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
+
+                        def _decode_seam_rgb(latents: torch.Tensor) -> torch.Tensor:
+                            return vae.decode(latents).sample
+
+                        pred_rgb = activation_checkpoint(
+                            _decode_seam_rgb,
+                            pred_x0_latents_for_decode,
+                            use_reentrant=False,
+                        ).to(dtype=weight_dtype)
                         target_rgb = batch_images.to(dtype=weight_dtype)
                         expanded_rgb_mask = seam_supervision_mask.expand(-1, pred_rgb.shape[1], -1, -1)
                         assert pred_rgb.shape == target_rgb.shape == expanded_rgb_mask.shape, (
@@ -4047,21 +4347,37 @@ def train(args: argparse.Namespace) -> None:
                         seam_maps = seam_maps_supervised
 
                         region_weights = {
-                            "margin_inner": float(seam_config.get("margin_inner_weight", 1.0)),
-                            "margin_outer": float(seam_config.get("margin_outer_weight", 0.7)),
-                            "interior_inner": float(seam_config.get("interior_band_inner_weight", 0.8)),
-                            "interior_outer": float(seam_config.get("interior_band_outer_weight", 0.5)),
+                            "halo_inner": float(seam_config.get("halo_inner_rgb_weight", 2.0)),
+                            "halo_outer": float(seam_config.get("halo_outer_rgb_weight", 1.5)),
+                            "interior_continuation": float(seam_config.get("continuation_peak_rgb_weight", 2.5)),
+                            "interior_core": float(seam_config.get("interior_core_rgb_weight", 0.10)),
                         }
                         seam_rgb_summary = _summarize_weighted_seam_regions(
                             error_map=rgb_l1_map,
                             seam_maps=seam_maps,
                             region_weights=region_weights,
-                            normalize_region_losses=bool(seam_config.get("normalize_region_losses", True)),
+                            normalize_region_losses=False,
+                            continuation_weighted_mask=seam_maps["continuation_distance_weighted"],
                         )
                         seam_rgb_region_losses = seam_rgb_summary["region_losses"]
+                        seam_continuation_distance_band_px_count_value = float(
+                            (seam_maps["continuation_distance_weighted"] > 0.0).float().sum().detach().item()
+                        )
+
+                        seam_gradient_summary = _compute_continuation_gradient_loss(
+                            pred_rgb=pred_rgb.float(),
+                            target_rgb=target_rgb.float(),
+                            continuation_distance_weighted_mask=seam_maps["continuation_distance_weighted"].float(),
+                            sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
+                        )
+                        seam_continuation_gradient_loss_value = float(seam_gradient_summary["weighted_loss"].detach().item())
+                        seam_continuation_gradient_loss_raw_value = float(seam_gradient_summary["raw_loss"].detach().item())
 
                         if seam_rgb_region_losses:
-                            seam_rgb_total_loss = seam_rgb_summary["total_loss"]
+                            seam_rgb_total_loss = seam_rgb_summary["total_loss"] + (
+                                seam_continuation_gradient_loss_weight_value
+                                * seam_gradient_summary["weighted_loss"]
+                            )
                             loss = loss + (float(seam_config.get("rgb_recon_loss_weight", 0.0)) * seam_rgb_total_loss)
                             seam_rgb_total_loss_value = float(seam_rgb_total_loss.detach().item())
                             seam_rgb_halo_loss_raw_value = float(seam_rgb_summary["halo_loss_raw"].detach().item())
@@ -4070,6 +4386,9 @@ def train(args: argparse.Namespace) -> None:
                             seam_rgb_interior_loss_weighted_value = float(seam_rgb_summary["interior_loss_weighted"].detach().item())
                             seam_halo_supervised_px_value = float(seam_rgb_summary["halo_supervised_px"].detach().item())
                             seam_interior_supervised_px_value = float(seam_rgb_summary["interior_supervised_px"].detach().item())
+                            seam_rgb_continuation_weighted_loss_value = float(seam_rgb_summary["continuation_loss_weighted"].detach().item())
+                            seam_continuation_rgb_loss_raw_value = float(seam_rgb_summary["continuation_loss_raw"].detach().item())
+                            seam_continuation_weight_sum_value = float(seam_rgb_summary["continuation_weight_sum"].detach().item())
                             seam_halo_to_interior_px_ratio_value = seam_halo_supervised_px_value / max(seam_interior_supervised_px_value, 1e-6)
                             halo_area = halo_mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
                             halo_target_energy = ((target_rgb.float().abs().mean(dim=1, keepdim=True) * halo_mask).sum(dim=(1, 2, 3)) / halo_area).mean()
@@ -4108,6 +4427,16 @@ def train(args: argparse.Namespace) -> None:
                         seam_rgb_interior_outer_loss_value = float(
                             seam_rgb_region_losses.get("interior_outer", torch.tensor(0.0, device=accelerator.device)).detach().item()
                         )
+                        seam_rgb_halo_inner_loss_value = float(
+                            seam_rgb_region_losses.get("halo_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_rgb_halo_outer_loss_value = float(
+                            seam_rgb_region_losses.get("halo_outer", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_rgb_interior_core_loss_value = float(
+                            seam_rgb_region_losses.get("interior_core", torch.tensor(0.0, device=accelerator.device)).detach().item()
+                        )
+                        seam_continuation_loss_value = seam_rgb_continuation_weighted_loss_value
                         seam_edge_recon_score = 0.5 * (seam_rgb_margin_inner_loss_value + seam_rgb_margin_outer_loss_value)
                         prompt_conflict_score = seam_rgb_total_loss_value / max(seam_margin_inner_coverage_ratio, 1e-3)
 
@@ -4437,13 +4766,8 @@ def train(args: argparse.Namespace) -> None:
                     else:
                         diffusion_loss_value = float(diffusion_loss.detach().item())
 
-                    halo_loss_contribution = (
-                        float(seam_config.get("rgb_recon_loss_weight", 0.0)) * seam_rgb_halo_loss_weighted_value
-                        + float(seam_config.get("alpha_local_loss_weight", 0.0)) * seam_alpha_halo_loss_weighted_value
-                    )
-
-                    rgb_region_contrib = seam_rgb_summary["region_weighted_contributions"] if "seam_rgb_summary" in locals() else {}
-                    alpha_region_contrib = seam_alpha_summary["region_weighted_contributions"] if "seam_alpha_summary" in locals() else {}
+                    rgb_region_contrib = seam_rgb_summary.get("region_weighted_contributions", {}) if isinstance(seam_rgb_summary, dict) else {}
+                    alpha_region_contrib = seam_alpha_summary.get("region_weighted_contributions", {}) if isinstance(seam_alpha_summary, dict) else {}
                     rgb_scale = float(seam_config.get("rgb_recon_loss_weight", 0.0))
                     alpha_scale = float(seam_config.get("alpha_local_loss_weight", 0.0))
 
@@ -4453,28 +4777,40 @@ def train(args: argparse.Namespace) -> None:
                         return float(source[key].detach().item())
 
                     halo_inner_weighted_contribution = (
-                        (rgb_scale * _region_term_value(rgb_region_contrib, "margin_inner"))
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "halo_inner"))
                         + (alpha_scale * _region_term_value(alpha_region_contrib, "margin_inner"))
                     )
                     halo_outer_weighted_contribution = (
-                        (rgb_scale * _region_term_value(rgb_region_contrib, "margin_outer"))
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "halo_outer"))
                         + (alpha_scale * _region_term_value(alpha_region_contrib, "margin_outer"))
                     )
                     interior_continuation_weighted_contribution = (
-                        (rgb_scale * _region_term_value(rgb_region_contrib, "interior_inner"))
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "continuation_distance_weighted"))
                         + (alpha_scale * _region_term_value(alpha_region_contrib, "interior_inner"))
                     )
                     interior_core_weighted_contribution = (
-                        (rgb_scale * _region_term_value(rgb_region_contrib, "interior_outer"))
+                        (rgb_scale * _region_term_value(rgb_region_contrib, "interior_core"))
                         + (alpha_scale * _region_term_value(alpha_region_contrib, "interior_outer"))
                     )
+                    continuation_gradient_weighted_contribution = (
+                        rgb_scale
+                        * seam_continuation_gradient_loss_weight_value
+                        * seam_continuation_gradient_loss_value
+                    )
 
-                    seam_loss_contribution_ratio_value = halo_loss_contribution / max(float(loss.detach().item()), 1e-6)
+                    seam_total_contribution = (
+                        halo_inner_weighted_contribution
+                        + halo_outer_weighted_contribution
+                        + interior_continuation_weighted_contribution
+                        + interior_core_weighted_contribution
+                        + continuation_gradient_weighted_contribution
+                    )
+                    seam_loss_contribution_ratio_value = seam_total_contribution / max(float(loss.detach().item()), 1e-6)
                     if verification_config.get("enable_seam_diagnostic_guards", False) and step_for_logging == 1:
                         min_ratio = float(verification_config.get("seam_loss_contribution_ratio_min", 0.05))
                         if seam_loss_contribution_ratio_value <= min_ratio:
                             raise RuntimeError(
-                                "seam halo loss contribution is too small on the first batch: "
+                                "seam loss contribution is too small on the first batch: "
                                 + f"ratio={seam_loss_contribution_ratio_value:.6f} threshold={min_ratio:.6f}"
                             )
 
@@ -4501,12 +4837,13 @@ def train(args: argparse.Namespace) -> None:
                             seam_loss_contribution_ratio_value,
                         )
                         logger.info(
-                            "[verify/seam_region_contrib] step=%d halo_inner_weighted_contribution=%.6f halo_outer_weighted_contribution=%.6f interior_continuation_weighted_contribution=%.6f interior_core_weighted_contribution=%.6f",
+                            "[verify/seam_region_contrib] step=%d halo_inner_weighted_contribution=%.6f halo_outer_weighted_contribution=%.6f interior_continuation_weighted_contribution=%.6f interior_core_weighted_contribution=%.6f continuation_gradient_weighted_contribution=%.6f",
                             step_for_logging,
                             halo_inner_weighted_contribution,
                             halo_outer_weighted_contribution,
                             interior_continuation_weighted_contribution,
                             interior_core_weighted_contribution,
+                            continuation_gradient_weighted_contribution,
                         )
 
                     if diffusion_loss_value > 0.0:
@@ -4562,8 +4899,7 @@ def train(args: argparse.Namespace) -> None:
                             terrain_curriculum_factor,
                             alpha_config["dominance_warn_ratio"],
                         )
-                    loss_trace.append(
-                        {
+                    loss_trace_row = {
                             "step": float(global_step),
                             "loss": loss_value,
                             "diffusion_loss": diffusion_loss_value,
@@ -4581,6 +4917,19 @@ def train(args: argparse.Namespace) -> None:
                             "seam_rgb_margin_outer_loss": seam_rgb_margin_outer_loss_value,
                             "seam_rgb_interior_inner_loss": seam_rgb_interior_inner_loss_value,
                             "seam_rgb_interior_outer_loss": seam_rgb_interior_outer_loss_value,
+                            "seam_rgb_halo_inner_loss": seam_rgb_halo_inner_loss_value,
+                            "seam_rgb_halo_outer_loss": seam_rgb_halo_outer_loss_value,
+                            "seam_rgb_interior_core_loss": seam_rgb_interior_core_loss_value,
+                            "seam_rgb_continuation_weighted_loss": seam_rgb_continuation_weighted_loss_value,
+                            "seam_continuation_rgb_loss_raw": seam_continuation_rgb_loss_raw_value,
+                            "seam_continuation_gradient_loss": seam_continuation_gradient_loss_value,
+                            "seam_continuation_gradient_loss_raw": seam_continuation_gradient_loss_raw_value,
+                            "seam_continuation_width_px": seam_continuation_width_px_value,
+                            "seam_continuation_peak_weight": seam_continuation_peak_weight_value,
+                            "seam_continuation_falloff_power": seam_continuation_falloff_power_value,
+                            "seam_continuation_gradient_loss_weight": seam_continuation_gradient_loss_weight_value,
+                            "seam_continuation_weight_sum": seam_continuation_weight_sum_value,
+                            "seam_continuation_distance_band_px_count": seam_continuation_distance_band_px_count_value,
                             "seam_rgb_total_loss": seam_rgb_total_loss_value,
                             "seam_edge_recon_score": seam_edge_recon_score,
                             "seam_margin_inner_coverage_ratio": seam_margin_inner_coverage_ratio,
@@ -4613,6 +4962,7 @@ def train(args: argparse.Namespace) -> None:
                             "halo_outer_weighted_contribution": halo_outer_weighted_contribution,
                             "interior_continuation_weighted_contribution": interior_continuation_weighted_contribution,
                             "interior_core_weighted_contribution": interior_core_weighted_contribution,
+                            "continuation_gradient_weighted_contribution": continuation_gradient_weighted_contribution,
                             "train_prediction_h": train_prediction_h,
                             "train_prediction_w": train_prediction_w,
                             "train_alpha_target_h": train_alpha_target_h,
@@ -4650,6 +5000,9 @@ def train(args: argparse.Namespace) -> None:
                             "seam_total_edges_defined": seam_total_edges_defined,
                             "seam_valid_edges_for_loss_count": seam_valid_edges_for_loss_count,
                             "seam_valid_edge_ratio": seam_valid_edge_ratio,
+                            "seam_dataset_qualified_edges_count": seam_dataset_qualified_edges_count,
+                            "seam_trainer_qualified_edges_count": seam_trainer_qualified_edges_count,
+                            "seam_halo_without_continuation_count": seam_halo_without_continuation_count,
                             "halo_without_continuation_count_after_gate": halo_without_continuation_count_after_gate,
                             "seam_edge_north_valid_for_seam_supervision": seam_edge_north_valid_for_seam_supervision,
                             "seam_edge_south_valid_for_seam_supervision": seam_edge_south_valid_for_seam_supervision,
@@ -4713,7 +5066,8 @@ def train(args: argparse.Namespace) -> None:
                             "train_prompt": train_prompt,
                             "train_prompt2": train_prompt2,
                         }
-                    )
+                    formatted_loss_trace_row = _format_loss_trace_row(loss_trace_row, loss_trace_mode)
+                    loss_trace.append(formatted_loss_trace_row)
                     if loss_trace:
                         _append_loss_trace_row_live(loss_trace[-1])
 
@@ -4767,14 +5121,15 @@ def train(args: argparse.Namespace) -> None:
                 if should_save_checkpoint(args, global_step, resumed_step):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        save_controlnet_checkpoint(
-                            accelerator,
-                            control_net,
-                            args.output_dir,
-                            args.output_name,
-                            global_step,
-                            save_dtype,
-                        )
+                        if not args.skip_step_checkpoint_weights:
+                            save_controlnet_checkpoint(
+                                accelerator,
+                                control_net,
+                                args.output_dir,
+                                args.output_name,
+                                global_step,
+                                save_dtype,
+                            )
                         if args.save_state:
                             save_extended_training_state(args, accelerator, global_step, ema_state, on_train_end=False)
                         if loss_trace:
@@ -4915,272 +5270,10 @@ def train(args: argparse.Namespace) -> None:
             os.makedirs(sanity_dir, exist_ok=True)
             loss_trace_path = os.path.join(sanity_dir, "loss_trace.csv")
             with open(loss_trace_path, "w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(
-                    [
-                        "step",
-                        "loss",
-                        "diffusion_loss",
-                        "alpha_bce_loss",
-                        "alpha_edge_loss",
-                        "alpha_terrain_bce_loss",
-                        "alpha_terrain_iou_loss",
-                        "seam_alpha_local_loss",
-                        "seam_margin_inner_loss",
-                        "seam_margin_outer_loss",
-                        "seam_interior_inner_loss",
-                        "seam_interior_outer_loss",
-                        "seam_continuation_loss",
-                        "seam_rgb_margin_inner_loss",
-                        "seam_rgb_margin_outer_loss",
-                        "seam_rgb_interior_inner_loss",
-                        "seam_rgb_interior_outer_loss",
-                        "seam_rgb_total_loss",
-                        "seam_edge_recon_score",
-                        "seam_margin_inner_coverage_ratio",
-                        "seam_margin_inner_coverage_px",
-                        "seam_margin_inner_raw_px",
-                        "seam_active_edges_count",
-                        "prompt_conflict_score",
-                        "prompt_conflict_score_norm",
-                        "alpha_total_loss",
-                        "seam_defined_ratio",
-                        "seam_pre_gate_l2",
-                        "seam_post_gate_l2",
-                        "seam_undefined_edges_count",
-                        "seam_undefined_pre_gate_l2",
-                        "seam_undefined_post_gate_l2",
-                        "seam_halo_supervised_px",
-                        "seam_interior_supervised_px",
-                        "seam_halo_to_interior_px_ratio",
-                        "seam_rgb_halo_loss_raw",
-                        "seam_rgb_interior_loss_raw",
-                        "seam_rgb_halo_loss_weighted",
-                        "seam_rgb_interior_loss_weighted",
-                        "seam_alpha_halo_loss_raw",
-                        "seam_alpha_interior_loss_raw",
-                        "seam_alpha_halo_loss_weighted",
-                        "seam_alpha_interior_loss_weighted",
-                        "seam_halo_target_energy",
-                        "seam_loss_contribution_ratio",
-                        "halo_inner_weighted_contribution",
-                        "halo_outer_weighted_contribution",
-                        "interior_continuation_weighted_contribution",
-                        "interior_core_weighted_contribution",
-                        "train_prediction_h",
-                        "train_prediction_w",
-                        "train_alpha_target_h",
-                        "train_alpha_target_w",
-                        "train_supervision_mask_h",
-                        "train_supervision_mask_w",
-                        "train_target_min_x",
-                        "train_target_max_x",
-                        "train_target_min_y",
-                        "train_target_max_y",
-                        "train_halo_min_x",
-                        "train_halo_max_x",
-                        "train_halo_min_y",
-                        "train_halo_max_y",
-                        "training_expanded_supervision_enabled",
-                        "eval_expanded_prediction_enabled",
-                        "eval_expanded_halo_px",
-                        "train_geometry_mode",
-                        "seam_edge_north_defined",
-                        "seam_edge_south_defined",
-                        "seam_edge_east_defined",
-                        "seam_edge_west_defined",
-                        "seam_edge_north_pre_gate_l2",
-                        "seam_edge_south_pre_gate_l2",
-                        "seam_edge_east_pre_gate_l2",
-                        "seam_edge_west_pre_gate_l2",
-                        "seam_edge_north_post_gate_l2",
-                        "seam_edge_south_post_gate_l2",
-                        "seam_edge_east_post_gate_l2",
-                        "seam_edge_west_post_gate_l2",
-                        "seam_edge_north_visible_l2",
-                        "seam_edge_south_visible_l2",
-                        "seam_edge_east_visible_l2",
-                        "seam_edge_west_visible_l2",
-                        "terrain_curriculum_factor",
-                        "alpha_temperature",
-                        "alpha_prior_weight",
-                        "grad_l2_alpha_heads",
-                        "grad_l2_control_residual_blocks",
-                        "grad_l2_control_mid_block",
-                        "param_delta_alpha_heads",
-                        "param_delta_control_residual_blocks",
-                        "param_delta_control_mid_block",
-                        "bind_active_count",
-                        "precondition_c_true_count",
-                        "candidate_c_count",
-                        "eligible_c_count",
-                        "requested_c_count",
-                        "realized_c_count",
-                        "fallback_from_c_count",
-                        "rejected_c_count_total",
-                        "rejected_c_count_precondition",
-                        "retry_count_for_c",
-                        "delta_c_mean",
-                        "delta_c_min",
-                        "delta_c_max",
-                        "drop_stage_for_c",
-                        "bind_negative_mode_requested",
-                        "bind_negative_mode_realized",
-                        "bind_negative_delta_retry_count",
-                        "bind_negative_fallback_triggered",
-                        "bind_negative_fallback_reason",
-                        "bind_negative_delta_mean",
-                        "bind_active_batch",
-                        "bind_negative_mode",
-                        "bind_schedule_name",
-                        "bind_effective_weight_a",
-                        "bind_effective_weight_b",
-                        "bind_effective_weight_c",
-                        "bind_pos_denoise_loss",
-                        "bind_neg_denoise_loss",
-                        "bind_ranking_gap",
-                        "bind_loss",
-                        "bind_margin_loss",
-                        "bind_win_rate",
-                        "train_prompt_name",
-                        "train_prompt_mode",
-                        "train_prompt",
-                        "train_prompt2",
-                    ]
-                )
-                for row in loss_trace:
-                    writer.writerow(
-                        [
-                            int(row["step"]),
-                            row["loss"],
-                            row["diffusion_loss"],
-                            row["alpha_bce_loss"],
-                            row["alpha_edge_loss"],
-                            row["alpha_terrain_bce_loss"],
-                            row["alpha_terrain_iou_loss"],
-                            row.get("seam_alpha_local_loss", 0.0),
-                            row.get("seam_margin_inner_loss", 0.0),
-                            row.get("seam_margin_outer_loss", 0.0),
-                            row.get("seam_interior_inner_loss", 0.0),
-                            row.get("seam_interior_outer_loss", 0.0),
-                            row.get("seam_continuation_loss", 0.0),
-                            row.get("seam_rgb_margin_inner_loss", 0.0),
-                            row.get("seam_rgb_margin_outer_loss", 0.0),
-                            row.get("seam_rgb_interior_inner_loss", 0.0),
-                            row.get("seam_rgb_interior_outer_loss", 0.0),
-                            row.get("seam_rgb_total_loss", 0.0),
-                            row.get("seam_edge_recon_score", 0.0),
-                            row.get("seam_margin_inner_coverage_ratio", 0.0),
-                            row.get("seam_margin_inner_coverage_px", 0.0),
-                            row.get("seam_margin_inner_raw_px", 0.0),
-                            row.get("seam_active_edges_count", 0.0),
-                            row.get("prompt_conflict_score", 0.0),
-                            row.get("prompt_conflict_score_norm", 0.0),
-                            row["alpha_total_loss"],
-                            row.get("seam_defined_ratio", 0.0),
-                            row.get("seam_pre_gate_l2", 0.0),
-                            row.get("seam_post_gate_l2", 0.0),
-                            row.get("seam_undefined_edges_count", 0.0),
-                            row.get("seam_undefined_pre_gate_l2", 0.0),
-                            row.get("seam_undefined_post_gate_l2", 0.0),
-                            row.get("seam_halo_supervised_px", 0.0),
-                            row.get("seam_interior_supervised_px", 0.0),
-                            row.get("seam_halo_to_interior_px_ratio", 0.0),
-                            row.get("seam_rgb_halo_loss_raw", 0.0),
-                            row.get("seam_rgb_interior_loss_raw", 0.0),
-                            row.get("seam_rgb_halo_loss_weighted", 0.0),
-                            row.get("seam_rgb_interior_loss_weighted", 0.0),
-                            row.get("seam_alpha_halo_loss_raw", 0.0),
-                            row.get("seam_alpha_interior_loss_raw", 0.0),
-                            row.get("seam_alpha_halo_loss_weighted", 0.0),
-                            row.get("seam_alpha_interior_loss_weighted", 0.0),
-                            row.get("seam_halo_target_energy", 0.0),
-                            row.get("seam_loss_contribution_ratio", 0.0),
-                            row.get("halo_inner_weighted_contribution", 0.0),
-                            row.get("halo_outer_weighted_contribution", 0.0),
-                            row.get("interior_continuation_weighted_contribution", 0.0),
-                            row.get("interior_core_weighted_contribution", 0.0),
-                            row.get("train_prediction_h", 0.0),
-                            row.get("train_prediction_w", 0.0),
-                            row.get("train_alpha_target_h", 0.0),
-                            row.get("train_alpha_target_w", 0.0),
-                            row.get("train_supervision_mask_h", 0.0),
-                            row.get("train_supervision_mask_w", 0.0),
-                            row.get("train_target_min_x", 0.0),
-                            row.get("train_target_max_x", 0.0),
-                            row.get("train_target_min_y", 0.0),
-                            row.get("train_target_max_y", 0.0),
-                            row.get("train_halo_min_x", 0.0),
-                            row.get("train_halo_max_x", 0.0),
-                            row.get("train_halo_min_y", 0.0),
-                            row.get("train_halo_max_y", 0.0),
-                            row.get("training_expanded_supervision_enabled", 0.0),
-                            row.get("eval_expanded_prediction_enabled", 0.0),
-                            row.get("eval_expanded_halo_px", 0.0),
-                            row.get("train_geometry_mode", "interior_only"),
-                            row.get("seam_edge_north_defined", 0.0),
-                            row.get("seam_edge_south_defined", 0.0),
-                            row.get("seam_edge_east_defined", 0.0),
-                            row.get("seam_edge_west_defined", 0.0),
-                            row.get("seam_edge_north_pre_gate_l2", 0.0),
-                            row.get("seam_edge_south_pre_gate_l2", 0.0),
-                            row.get("seam_edge_east_pre_gate_l2", 0.0),
-                            row.get("seam_edge_west_pre_gate_l2", 0.0),
-                            row.get("seam_edge_north_post_gate_l2", 0.0),
-                            row.get("seam_edge_south_post_gate_l2", 0.0),
-                            row.get("seam_edge_east_post_gate_l2", 0.0),
-                            row.get("seam_edge_west_post_gate_l2", 0.0),
-                            row.get("seam_edge_north_visible_l2", 0.0),
-                            row.get("seam_edge_south_visible_l2", 0.0),
-                            row.get("seam_edge_east_visible_l2", 0.0),
-                            row.get("seam_edge_west_visible_l2", 0.0),
-                            row["terrain_curriculum_factor"],
-                            row["alpha_temperature"],
-                            row["alpha_prior_weight"],
-                            row.get("grad_l2_alpha_heads", 0.0),
-                            row.get("grad_l2_control_residual_blocks", 0.0),
-                            row.get("grad_l2_control_mid_block", 0.0),
-                            row.get("param_delta_alpha_heads", 0.0),
-                            row.get("param_delta_control_residual_blocks", 0.0),
-                            row.get("param_delta_control_mid_block", 0.0),
-                            row.get("bind_active_count", 0.0),
-                            row.get("precondition_c_true_count", 0.0),
-                            row.get("candidate_c_count", 0.0),
-                            row.get("eligible_c_count", 0.0),
-                            row.get("requested_c_count", 0.0),
-                            row.get("realized_c_count", 0.0),
-                            row.get("fallback_from_c_count", 0.0),
-                            row.get("rejected_c_count_total", 0.0),
-                            row.get("rejected_c_count_precondition", 0.0),
-                            row.get("retry_count_for_c", 0.0),
-                            row.get("delta_c_mean", 0.0),
-                            row.get("delta_c_min", 0.0),
-                            row.get("delta_c_max", 0.0),
-                            row.get("drop_stage_for_c", "none"),
-                            row.get("bind_negative_mode_requested", "none"),
-                            row.get("bind_negative_mode_realized", "none"),
-                            row.get("bind_negative_delta_retry_count", 0.0),
-                            row.get("bind_negative_fallback_triggered", 0.0),
-                            row.get("bind_negative_fallback_reason", "none"),
-                            row.get("bind_negative_delta_mean", 0.0),
-                            row.get("bind_active_batch", 0.0),
-                            row.get("bind_negative_mode", "none"),
-                            row.get("bind_schedule_name", "none"),
-                            row.get("bind_effective_weight_a", 0.0),
-                            row.get("bind_effective_weight_b", 0.0),
-                            row.get("bind_effective_weight_c", 0.0),
-                            row.get("bind_pos_denoise_loss", 0.0),
-                            row.get("bind_neg_denoise_loss", 0.0),
-                            row.get("bind_ranking_gap", 0.0),
-                            row.get("bind_loss", 0.0),
-                            row.get("bind_margin_loss", 0.0),
-                            row.get("bind_win_rate", 0.0),
-                            row.get("train_prompt_name", "default"),
-                            row.get("train_prompt_mode", "default"),
-                            row.get("train_prompt", dataset.prompt),
-                            row.get("train_prompt2", dataset.prompt2),
-                        ]
-                    )
+                fieldnames = list(loss_trace[0].keys())
+                writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(loss_trace)
             logger.info(f"[sanity/loss] wrote trace to {loss_trace_path} ({len(loss_trace)} rows)")
 
         save_controlnet_checkpoint(
