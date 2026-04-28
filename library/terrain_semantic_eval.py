@@ -430,30 +430,77 @@ def _build_expanded_edge_masks(height: int, width: int, halo_px: int, band_px: i
     def z() -> np.ndarray:
         return np.zeros((h, w), dtype=np.float32)
 
-    top_halo = z()
-    top_halo[max(0, halo - band):halo, :] = 1.0
-    top_interior = z()
-    top_interior[halo : min(h, halo + band), :] = 1.0
+    yy = np.arange(h, dtype=np.float32).reshape(h, 1)
+    xx = np.arange(w, dtype=np.float32).reshape(1, w)
+    interior_min_y = float(halo)
+    interior_max_y = float(h - 1 - halo)
+    interior_min_x = float(halo)
+    interior_max_x = float(w - 1 - halo)
 
-    bottom_halo = z()
-    bottom_halo[h - halo : min(h, h - halo + band), :] = 1.0
-    bottom_interior = z()
-    bottom_interior[max(0, h - halo - band) : h - halo, :] = 1.0
+    north_dist_outside = np.clip(interior_min_y - yy, 0.0, None)
+    south_dist_outside = np.clip(yy - interior_max_y, 0.0, None)
+    east_dist_outside = np.clip(xx - interior_max_x, 0.0, None)
+    west_dist_outside = np.clip(interior_min_x - xx, 0.0, None)
 
-    right_halo = z()
-    right_halo[:, w - halo : min(w, w - halo + band)] = 1.0
-    right_interior = z()
-    right_interior[:, max(0, w - halo - band) : w - halo] = 1.0
+    north_active = north_dist_outside > 0.0
+    south_active = south_dist_outside > 0.0
+    east_active = east_dist_outside > 0.0
+    west_active = west_dist_outside > 0.0
+    corner_excluded = ((north_active.astype(np.int32) + south_active.astype(np.int32) + east_active.astype(np.int32) + west_active.astype(np.int32)) > 1)
+    outside_single_side = (north_active | south_active | east_active | west_active) & (~corner_excluded)
 
-    left_halo = z()
-    left_halo[:, max(0, halo - band):halo] = 1.0
-    left_interior = z()
-    left_interior[:, halo : min(w, halo + band)] = 1.0
+    inf = np.full((h, w), np.inf, dtype=np.float32)
+    owner_stack = np.stack(
+        [
+            np.where(north_active, north_dist_outside, inf),
+            np.where(south_active, south_dist_outside, inf),
+            np.where(east_active, east_dist_outside, inf),
+            np.where(west_active, west_dist_outside, inf),
+        ],
+        axis=0,
+    )
+    owner_idx = np.argmin(owner_stack, axis=0)
 
-    masks["top"] = {"halo_inner": top_halo, "interior_outer": top_interior}
-    masks["bottom"] = {"halo_inner": bottom_halo, "interior_outer": bottom_interior}
-    masks["right"] = {"halo_inner": right_halo, "interior_outer": right_interior}
-    masks["left"] = {"halo_inner": left_halo, "interior_outer": left_interior}
+    north_owner = outside_single_side & (owner_idx == 0)
+    south_owner = outside_single_side & (owner_idx == 1)
+    east_owner = outside_single_side & (owner_idx == 2)
+    west_owner = outside_single_side & (owner_idx == 3)
+
+    def _edge_payload(owner_mask: np.ndarray, distance_map: np.ndarray, side: str) -> Dict[str, np.ndarray]:
+        halo_all = owner_mask.astype(np.float32)
+        halo_inner = (owner_mask & (distance_map <= float(band))).astype(np.float32)
+        halo_outer = (owner_mask & (distance_map > float(band))).astype(np.float32)
+        ring_1 = (owner_mask & (distance_map > 0.0) & (distance_map <= 1.0)).astype(np.float32)
+        ring_4 = (owner_mask & (distance_map > 0.0) & (distance_map <= 4.0)).astype(np.float32)
+        ring_8 = (owner_mask & (distance_map > 0.0) & (distance_map <= 8.0)).astype(np.float32)
+        ring_16 = (owner_mask & (distance_map > 0.0) & (distance_map <= 16.0)).astype(np.float32)
+
+        interior_outer = z()
+        if side == "top":
+            interior_outer[halo : min(h, halo + band), :] = 1.0
+        elif side == "bottom":
+            interior_outer[max(0, h - halo - band) : h - halo, :] = 1.0
+        elif side == "right":
+            interior_outer[:, max(0, w - halo - band) : w - halo] = 1.0
+        else:
+            interior_outer[:, halo : min(w, halo + band)] = 1.0
+
+        return {
+            "halo_all": halo_all,
+            "halo_inner": halo_inner,
+            "halo_outer": halo_outer,
+            "halo_inner_edge_1px": ring_1,
+            "halo_inner_edge_4px": ring_4,
+            "halo_inner_8px": ring_8,
+            "halo_inner_16px": ring_16,
+            "interior_outer": interior_outer,
+            "corner_excluded": corner_excluded.astype(np.float32),
+        }
+
+    masks["top"] = _edge_payload(north_owner, north_dist_outside, "top")
+    masks["bottom"] = _edge_payload(south_owner, south_dist_outside, "bottom")
+    masks["right"] = _edge_payload(east_owner, east_dist_outside, "right")
+    masks["left"] = _edge_payload(west_owner, west_dist_outside, "left")
     return masks
 
 
@@ -827,11 +874,17 @@ def run_eval_step(
 
         halo_inner_recon_l1 = 0.0
         halo_outer_recon_l1 = 0.0
+        halo_inner_edge_1px_rgb_loss = 0.0
+        halo_inner_edge_4px_rgb_loss = 0.0
+        halo_inner_8px_rgb_loss = 0.0
+        halo_inner_16px_rgb_loss = 0.0
         interior_continuation_l1 = 0.0
         halo_to_interior_alignment = 0.0
         halo_effect_strength = 0.0
         expanded_vs_direct_rgb_l1 = 0.0
         expanded_vs_direct_alpha_l1 = 0.0
+        expanded_halo_copy_diff_mean = 0.0
+        expanded_halo_copy_diff_max = 0.0
         use_expanded = bool(eval_config.get("expanded_prediction_enabled", False)) and int(eval_config.get("expanded_halo_px", 0)) > 0
         if use_expanded:
             halo_px = int(eval_config.get("expanded_halo_px", 0))
@@ -851,7 +904,8 @@ def run_eval_step(
                 halo_px=halo_px,
             )
             if expected_rgba_exp is not None and expected_rgba_exp.shape[0] == exp_h and expected_rgba_exp.shape[1] == exp_w:
-                band = max(1, min(int(sample.get("seam_strip_width_px", torch.tensor(float(halo_px))).item()), halo_px))
+                band = max(1, min(int(eval_config.get("halo_inner_eval_px", 32)), halo_px))
+                continuation_band = max(1, min(int(sample.get("seam_strip_width_px", torch.tensor(float(halo_px))).item()), halo_px))
                 masks = _build_expanded_edge_masks(exp_h, exp_w, halo_px=halo_px, band_px=band)
                 edge_flags = sample.get("edge_defined_flags")
                 if isinstance(edge_flags, torch.Tensor):
@@ -861,14 +915,30 @@ def run_eval_step(
                 sides = ["top", "bottom", "right", "left"]
 
                 halo_vals: List[float] = []
+                halo_outer_vals: List[float] = []
+                halo_edge_1_vals: List[float] = []
+                halo_edge_4_vals: List[float] = []
+                halo_edge_8_vals: List[float] = []
+                halo_edge_16_vals: List[float] = []
                 interior_vals: List[float] = []
                 align_vals: List[float] = []
+                copy_diff_sums: List[float] = []
+                copy_diff_counts: List[float] = []
+                copy_diff_max_values: List[float] = []
+                per_pixel_rgba_diff = np.mean(np.abs(pred_rgba_exp - expected_rgba_exp), axis=2)
                 for side_idx, side in enumerate(sides):
                     if side_idx < len(ef) and ef[side_idx] < 0.5:
                         continue
                     m_h = masks[side]["halo_inner"]
-                    m_i = masks[side]["interior_outer"]
+                    m_ho = masks[side]["halo_outer"]
+                    m_i = _build_expanded_edge_masks(exp_h, exp_w, halo_px=halo_px, band_px=continuation_band)[side]["interior_outer"]
+                    m_all = masks[side]["halo_all"]
                     halo_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_h))
+                    halo_outer_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_ho))
+                    halo_edge_1_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_edge_1px"]))
+                    halo_edge_4_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_edge_4px"]))
+                    halo_edge_8_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_8px"]))
+                    halo_edge_16_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_16px"]))
                     interior_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_i))
                     align_vals.append(
                         _mean_gradient_cosine(
@@ -877,14 +947,31 @@ def run_eval_step(
                             m_i,
                         )
                     )
+                    copy_diff_sums.append(float(np.sum(per_pixel_rgba_diff * m_all)))
+                    copy_diff_counts.append(float(np.sum(m_all)))
+                    if float(np.sum(m_all)) > 0.0:
+                        copy_diff_max_values.append(float(np.max(per_pixel_rgba_diff[m_all > 0.0])))
 
                 if halo_vals:
                     halo_inner_recon_l1 = float(np.mean(halo_vals))
-                    halo_outer_recon_l1 = halo_inner_recon_l1
+                if halo_outer_vals:
+                    halo_outer_recon_l1 = float(np.mean(halo_outer_vals))
+                if halo_edge_1_vals:
+                    halo_inner_edge_1px_rgb_loss = float(np.mean(halo_edge_1_vals))
+                if halo_edge_4_vals:
+                    halo_inner_edge_4px_rgb_loss = float(np.mean(halo_edge_4_vals))
+                if halo_edge_8_vals:
+                    halo_inner_8px_rgb_loss = float(np.mean(halo_edge_8_vals))
+                if halo_edge_16_vals:
+                    halo_inner_16px_rgb_loss = float(np.mean(halo_edge_16_vals))
                 if interior_vals:
                     interior_continuation_l1 = float(np.mean(interior_vals))
                 if align_vals:
                     halo_to_interior_alignment = float(np.mean(align_vals))
+                if copy_diff_counts and sum(copy_diff_counts) > 0.0:
+                    expanded_halo_copy_diff_mean = float(sum(copy_diff_sums) / max(sum(copy_diff_counts), 1e-8))
+                if copy_diff_max_values:
+                    expanded_halo_copy_diff_max = float(max(copy_diff_max_values))
 
                 try:
                     full_cond = _compose_model_visible_conditioning(sample, sample["conditioning_images"])
@@ -1013,11 +1100,17 @@ def run_eval_step(
                 "seed_edge_map_var": edge_map_var,
                 "halo_inner_recon_l1": halo_inner_recon_l1,
                 "halo_outer_recon_l1": halo_outer_recon_l1,
+                "halo_inner_edge_1px_rgb_loss": halo_inner_edge_1px_rgb_loss,
+                "halo_inner_edge_4px_rgb_loss": halo_inner_edge_4px_rgb_loss,
+                "halo_inner_8px_rgb_loss": halo_inner_8px_rgb_loss,
+                "halo_inner_16px_rgb_loss": halo_inner_16px_rgb_loss,
                 "interior_continuation_l1": interior_continuation_l1,
                 "halo_to_interior_alignment": halo_to_interior_alignment,
                 "halo_effect_strength": halo_effect_strength,
                 "expanded_vs_direct_rgb_l1": expanded_vs_direct_rgb_l1,
                 "expanded_vs_direct_alpha_l1": expanded_vs_direct_alpha_l1,
+                "expanded_halo_copy_diff_mean": expanded_halo_copy_diff_mean,
+                "expanded_halo_copy_diff_max": expanded_halo_copy_diff_max,
             }
         )
 
@@ -1129,11 +1222,17 @@ def run_eval_step(
             "seed_edge_map_var",
             "halo_inner_recon_l1",
             "halo_outer_recon_l1",
+            "halo_inner_edge_1px_rgb_loss",
+            "halo_inner_edge_4px_rgb_loss",
+            "halo_inner_8px_rgb_loss",
+            "halo_inner_16px_rgb_loss",
             "interior_continuation_l1",
             "halo_to_interior_alignment",
             "halo_effect_strength",
             "expanded_vs_direct_rgb_l1",
             "expanded_vs_direct_alpha_l1",
+            "expanded_halo_copy_diff_mean",
+            "expanded_halo_copy_diff_max",
         ],
     )
 
@@ -1209,11 +1308,17 @@ def run_eval_step(
         "seed_edge_map_var": float(np.mean([row["seed_edge_map_var"] for row in metrics_rows])),
         "halo_inner_recon_l1": float(np.mean([row.get("halo_inner_recon_l1", 0.0) for row in metrics_rows])),
         "halo_outer_recon_l1": float(np.mean([row.get("halo_outer_recon_l1", 0.0) for row in metrics_rows])),
+        "halo_inner_edge_1px_rgb_loss": float(np.mean([row.get("halo_inner_edge_1px_rgb_loss", 0.0) for row in metrics_rows])),
+        "halo_inner_edge_4px_rgb_loss": float(np.mean([row.get("halo_inner_edge_4px_rgb_loss", 0.0) for row in metrics_rows])),
+        "halo_inner_8px_rgb_loss": float(np.mean([row.get("halo_inner_8px_rgb_loss", 0.0) for row in metrics_rows])),
+        "halo_inner_16px_rgb_loss": float(np.mean([row.get("halo_inner_16px_rgb_loss", 0.0) for row in metrics_rows])),
         "interior_continuation_l1": float(np.mean([row.get("interior_continuation_l1", 0.0) for row in metrics_rows])),
         "halo_to_interior_alignment": float(np.mean([row.get("halo_to_interior_alignment", 0.0) for row in metrics_rows])),
         "halo_effect_strength": float(np.mean([row.get("halo_effect_strength", 0.0) for row in metrics_rows])),
         "expanded_vs_direct_rgb_l1": float(np.mean([row.get("expanded_vs_direct_rgb_l1", 0.0) for row in metrics_rows])),
         "expanded_vs_direct_alpha_l1": float(np.mean([row.get("expanded_vs_direct_alpha_l1", 0.0) for row in metrics_rows])),
+        "expanded_halo_copy_diff_mean": float(np.mean([row.get("expanded_halo_copy_diff_mean", 0.0) for row in metrics_rows])),
+        "expanded_halo_copy_diff_max": float(np.mean([row.get("expanded_halo_copy_diff_max", 0.0) for row in metrics_rows])),
         "seam_margin_inner_recon_l1": float(np.mean([row.get("halo_inner_recon_l1", 0.0) for row in metrics_rows])),
         "seam_margin_outer_recon_l1": float(np.mean([row.get("halo_outer_recon_l1", 0.0) for row in metrics_rows])),
         "seam_interior_continuation_l1": float(np.mean([row.get("interior_continuation_l1", 0.0) for row in metrics_rows])),

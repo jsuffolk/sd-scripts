@@ -219,6 +219,8 @@ def build_seam_region_maps(
         east_active = east_dist_outside > 0.0
         west_active = west_dist_outside > 0.0
         outside_any = north_active | south_active | east_active | west_active
+        corner_excluded_mask = ((north_active.to(torch.int32) + south_active.to(torch.int32) + east_active.to(torch.int32) + west_active.to(torch.int32)) > 1)
+        outside_single_side = outside_any & (~corner_excluded_mask)
 
         inf = torch.full_like(north_dist_outside, float("inf"))
         side_dist_stack = torch.cat(
@@ -232,10 +234,10 @@ def build_seam_region_maps(
         )
         side_owner_idx = side_dist_stack.argmin(dim=1, keepdim=True)
 
-        north_owner = outside_any & (side_owner_idx == 0)
-        south_owner = outside_any & (side_owner_idx == 1)
-        east_owner = outside_any & (side_owner_idx == 2)
-        west_owner = outside_any & (side_owner_idx == 3)
+        north_owner = outside_single_side & (side_owner_idx == 0)
+        south_owner = outside_single_side & (side_owner_idx == 1)
+        east_owner = outside_single_side & (side_owner_idx == 2)
+        west_owner = outside_single_side & (side_owner_idx == 3)
 
         north_inner = (north_owner & (north_dist_outside <= margin_inner_limit)).to(dtype=dtype)
         south_inner = (south_owner & (south_dist_outside <= margin_inner_limit)).to(dtype=dtype)
@@ -248,6 +250,7 @@ def build_seam_region_maps(
 
         margin_inner_per_edge = torch.cat([north_inner, south_inner, east_inner, west_inner], dim=1)
         margin_outer_per_edge = torch.cat([north_outer, south_outer, east_outer, west_outer], dim=1)
+        halo_corner_excluded_map = corner_excluded_mask.to(dtype=dtype)
     else:
         north_inner = (dist_top < margin_inner_limit).to(dtype=dtype)
         south_inner = (dist_bottom < margin_inner_limit).to(dtype=dtype)
@@ -255,6 +258,7 @@ def build_seam_region_maps(
         west_inner = (dist_left < margin_inner_limit).to(dtype=dtype)
         margin_inner_per_edge = torch.cat([north_inner, south_inner, east_inner, west_inner], dim=1) * edge_band_masks
         margin_outer_per_edge = (edge_band_masks - margin_inner_per_edge).clamp(0.0, 1.0)
+        halo_corner_excluded_map = torch.zeros((batch_size, 1, height, width), device=device, dtype=dtype)
 
     if int(expanded_halo_px) > 0:
         boundary_offset = torch.full_like(strip_width, float(int(expanded_halo_px)))
@@ -266,10 +270,14 @@ def build_seam_region_maps(
     east_dist_interior = (((float(width - 1) - boundary_offset) - xx)).clamp(min=0.0)
     west_dist_interior = (xx - boundary_offset).clamp(min=0.0)
 
-    continuation_norm_north = (1.0 - (north_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0).pow(continuation_falloff_power)
-    continuation_norm_south = (1.0 - (south_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0).pow(continuation_falloff_power)
-    continuation_norm_east = (1.0 - (east_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0).pow(continuation_falloff_power)
-    continuation_norm_west = (1.0 - (west_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0).pow(continuation_falloff_power)
+    continuation_linear_north = (1.0 - (north_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0)
+    continuation_linear_south = (1.0 - (south_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0)
+    continuation_linear_east = (1.0 - (east_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0)
+    continuation_linear_west = (1.0 - (west_dist_interior / float(continuation_width_px))).clamp(0.0, 1.0)
+    continuation_norm_north = continuation_linear_north.pow(continuation_falloff_power)
+    continuation_norm_south = continuation_linear_south.pow(continuation_falloff_power)
+    continuation_norm_east = continuation_linear_east.pow(continuation_falloff_power)
+    continuation_norm_west = continuation_linear_west.pow(continuation_falloff_power)
 
     continuation_binary_per_edge = torch.cat(
         [
@@ -289,16 +297,38 @@ def build_seam_region_maps(
         ],
         dim=1,
     )
+    continuation_linear_weight_per_edge = torch.cat(
+        [
+            continuation_linear_north * (seam_decay_maps[:, 0:1] > 0.0).to(dtype=dtype),
+            continuation_linear_south * (seam_decay_maps[:, 1:2] > 0.0).to(dtype=dtype),
+            continuation_linear_east * (seam_decay_maps[:, 2:3] > 0.0).to(dtype=dtype),
+            continuation_linear_west * (seam_decay_maps[:, 3:4] > 0.0).to(dtype=dtype),
+        ],
+        dim=1,
+    )
+    continuation_distance_px_per_edge = torch.cat(
+        [
+            north_dist_interior * (seam_decay_maps[:, 0:1] > 0.0).to(dtype=dtype),
+            south_dist_interior * (seam_decay_maps[:, 1:2] > 0.0).to(dtype=dtype),
+            east_dist_interior * (seam_decay_maps[:, 2:3] > 0.0).to(dtype=dtype),
+            west_dist_interior * (seam_decay_maps[:, 3:4] > 0.0).to(dtype=dtype),
+        ],
+        dim=1,
+    )
     interior_core_per_edge = (seam_decay_maps > 0.0).to(dtype=dtype)
     interior_outer_per_edge = (interior_core_per_edge - continuation_binary_per_edge).clamp(0.0, 1.0)
     interior_inner_per_edge = continuation_binary_per_edge
 
     edge_defined = edge_defined_flags.to(device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
-    continuation_valid_per_edge = continuation_valid_mask.expand(-1, 4, -1, -1)
+    # Continuation and interior losses must never activate on any halo/edge-band pixel.
+    interior_region_valid_mask = continuation_valid_mask * (1.0 - edge_band_masks.sum(dim=1, keepdim=True).clamp(0.0, 1.0))
+    continuation_valid_per_edge = interior_region_valid_mask.expand(-1, 4, -1, -1)
     interior_inner_per_edge = interior_inner_per_edge * edge_defined * continuation_valid_per_edge
     interior_outer_per_edge = interior_outer_per_edge * edge_defined * continuation_valid_per_edge
     interior_core_per_edge = interior_core_per_edge * edge_defined * continuation_valid_per_edge
     continuation_weighted_per_edge = continuation_weighted_per_edge * edge_defined * continuation_valid_per_edge
+    continuation_linear_weight_per_edge = continuation_linear_weight_per_edge * edge_defined * continuation_valid_per_edge
+    continuation_distance_px_per_edge = continuation_distance_px_per_edge * edge_defined * continuation_valid_per_edge
     continuation_active_per_edge = (interior_inner_per_edge.sum(dim=(-2, -1), keepdim=True) > 0.0).to(dtype=dtype)
 
     if bool(seam_config.get("require_defined_for_margin_and_band", True)):
@@ -310,10 +340,20 @@ def build_seam_region_maps(
 
     margin_inner_map = margin_inner_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0) * supervision_mask
     margin_outer_map = margin_outer_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0) * supervision_mask
+    halo_corner_excluded_map = halo_corner_excluded_map * supervision_mask
     interior_inner_map = interior_inner_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
     interior_outer_map = interior_outer_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
     interior_core_map = interior_core_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
     continuation_weighted_map = continuation_weighted_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+    continuation_linear_weight_map = continuation_linear_weight_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+
+    inf_distance = torch.full_like(continuation_distance_px_per_edge, float("inf"))
+    continuation_distance_px_map = torch.where(interior_inner_per_edge > 0.0, continuation_distance_px_per_edge, inf_distance).min(dim=1, keepdim=True).values
+    continuation_distance_px_map = torch.where(
+        torch.isinf(continuation_distance_px_map),
+        torch.zeros_like(continuation_distance_px_map),
+        continuation_distance_px_map,
+    )
 
     return {
         "margin_inner": margin_inner_map,
@@ -322,9 +362,12 @@ def build_seam_region_maps(
         "interior_outer": interior_outer_map,
         "halo_inner": margin_inner_map,
         "halo_outer": margin_outer_map,
+        "halo_corner_excluded": halo_corner_excluded_map,
         "interior_continuation": interior_inner_map,
         "interior_core": interior_core_map,
         "continuation_distance_weighted": continuation_weighted_map,
+        "continuation_linear_weight": continuation_linear_weight_map,
+        "continuation_distance_px": continuation_distance_px_map,
         "margin_inner_per_edge": margin_inner_per_edge,
         "margin_outer_per_edge": margin_outer_per_edge,
         "interior_inner_per_edge": interior_inner_per_edge,
@@ -332,6 +375,8 @@ def build_seam_region_maps(
         "interior_continuation_per_edge": interior_inner_per_edge,
         "interior_core_per_edge": interior_core_per_edge,
         "continuation_distance_weighted_per_edge": continuation_weighted_per_edge,
+        "continuation_linear_weight_per_edge": continuation_linear_weight_per_edge,
+        "continuation_distance_px_per_edge": continuation_distance_px_per_edge,
     }
 
 
@@ -675,15 +720,28 @@ class TerrainSemanticManifestDataset(Dataset):
                     "image_name": row["image_name"],
                     "image_path": str(image_path),
                     "has_native_alpha": has_native_alpha,
+                    "image_size": (image_width, image_height),
                     "base_atlas_path": str(base_atlas_path),
                     "edge_atlas_path": str(edge_atlas_path),
                     "interior_atlas_path": str(interior_atlas_path),
                     "crop_box": (crop_x, crop_y, crop_w, crop_h),
+                    "source_crop_box": (
+                        int(float(row.get("source_crop_box_x") or crop_x)),
+                        int(float(row.get("source_crop_box_y") or crop_y)),
+                        int(float(row.get("source_crop_box_w") or crop_w)),
+                        int(float(row.get("source_crop_box_h") or crop_h)),
+                    ),
                     "trusted_box": (trusted_x, trusted_y, trusted_w, trusted_h),
                     "special_structure_tags": (row.get("special_structure_tags") or "").strip(),
                     "assigned_crop_class": (row.get("assigned_crop_class") or "").strip(),
                     "crop_size_class": row.get("crop_size_class") or "",
                     "generation_strategy": row.get("generation_strategy") or "",
+                    "crop_restatement_action": (row.get("crop_restatement_action") or "passthrough").strip(),
+                    "crop_translation_xy": (
+                        int(float(row.get("crop_translation_x") or 0)),
+                        int(float(row.get("crop_translation_y") or 0)),
+                    ),
+                    "crop_restated_for_halo_px": int(float(row.get("crop_restated_for_halo_px") or 0)),
                     "sampling_weight": sampling_weight,
                     "trusted_ratio": trusted_ratio,
                     "boundary_alignment_error": boundary_alignment_error,
@@ -1123,12 +1181,13 @@ class TerrainSemanticManifestDataset(Dataset):
         self,
         index: int,
         edge_defined_flags: Optional[torch.Tensor] = None,
+        halo_px: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         if self.expanded_target_halo_px <= 0:
             raise ValueError("expanded target requested but expanded_target_halo_px is disabled")
 
         record = self._records[index]
-        halo_px = int(self.expanded_target_halo_px)
+        halo_px = int(self.expanded_target_halo_px if halo_px is None else halo_px)
         image = self._read_image(record["image_path"])
         expanded_source_extent = self._expanded_source_extent(record["crop_box"], halo_px)
         if self.enable_alpha_supervision and self.strict_alpha and not record["has_native_alpha"]:
@@ -1154,8 +1213,9 @@ class TerrainSemanticManifestDataset(Dataset):
         alpha = torch.from_numpy(rgba[:, :, 3]).unsqueeze(0).contiguous().float()
         return torch.cat([rgb, alpha], dim=0)
 
-    def _build_seam_decay_maps(self, height: int, width: int) -> torch.Tensor:
-        band = max(1, min(self.seam_strip_width_px, (min(height, width) - 1) // 2))
+    def _build_seam_decay_maps(self, height: int, width: int, band_px: Optional[int] = None) -> torch.Tensor:
+        raw_band = self.seam_strip_width_px if band_px is None else int(band_px)
+        band = max(1, min(int(raw_band), (min(height, width) - 1) // 2))
         yy = torch.arange(height, dtype=torch.float32).unsqueeze(1).expand(height, width)
         xx = torch.arange(width, dtype=torch.float32).unsqueeze(0).expand(height, width)
 
@@ -1472,8 +1532,12 @@ class TerrainSemanticManifestDataset(Dataset):
             "seam_strip_width_px": torch.tensor(float(band), dtype=torch.float32),
         }
 
-    def _build_expanded_seam_geometry(self, edge_defined_flags: torch.Tensor) -> Dict[str, torch.Tensor]:
-        halo_px = int(self.expanded_target_halo_px)
+    def _build_expanded_seam_geometry(
+        self,
+        edge_defined_flags: torch.Tensor,
+        halo_px: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        halo_px = int(self.expanded_target_halo_px if halo_px is None else halo_px)
         if halo_px <= 0:
             return {}
         expanded_height = int(self.train_size[0] + (2 * halo_px))
@@ -1483,7 +1547,7 @@ class TerrainSemanticManifestDataset(Dataset):
         edge_band_masks[1, expanded_height - halo_px :, :] = 1.0
         edge_band_masks[2, :, expanded_width - halo_px :] = 1.0
         edge_band_masks[3, :, :halo_px] = 1.0
-        seam_decay_maps = self._build_seam_decay_maps(expanded_height, expanded_width)
+        seam_decay_maps = self._build_seam_decay_maps(expanded_height, expanded_width, band_px=halo_px)
         return {
             "expanded_edge_band_masks": edge_band_masks.contiguous(),
             "expanded_seam_decay_maps": seam_decay_maps.contiguous(),
@@ -1706,6 +1770,7 @@ class TerrainSemanticManifestDataset(Dataset):
             "crop_top_lefts": torch.tensor([0, 0], dtype=torch.long),
             "target_sizes_hw": torch.tensor([self.train_size[0], self.train_size[1]], dtype=torch.long),
             "crop_box": torch.tensor([crop_x, crop_y, crop_w, crop_h], dtype=torch.long),
+            "source_crop_box": torch.tensor(record.get("source_crop_box", record["crop_box"]), dtype=torch.long),
             "trusted_box": torch.tensor(record["trusted_box"], dtype=torch.long),
             "trusted_ratio": torch.tensor(record["trusted_ratio"], dtype=torch.float32),
             "sampling_weight": torch.tensor(record["sampling_weight"], dtype=torch.float32),
@@ -1715,6 +1780,9 @@ class TerrainSemanticManifestDataset(Dataset):
             "assigned_crop_class": record.get("assigned_crop_class", ""),
             "crop_size_class": record["crop_size_class"],
             "generation_strategy": record["generation_strategy"],
+            "crop_restatement_action": record.get("crop_restatement_action", "passthrough"),
+            "crop_translation_xy": torch.tensor(record.get("crop_translation_xy", (0, 0)), dtype=torch.long),
+            "crop_restated_for_halo_px": torch.tensor(record.get("crop_restated_for_halo_px", 0), dtype=torch.long),
             "seam_enabled": torch.tensor(1.0 if self.seam_enabled else 0.0, dtype=torch.float32),
             "boundary_alignment_error": torch.tensor(record.get("boundary_alignment_error", 0.0), dtype=torch.float32),
             "boundary_consistency_error": torch.tensor(record.get("boundary_consistency_error", 0.0), dtype=torch.float32),

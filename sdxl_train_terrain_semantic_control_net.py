@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import math
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -25,7 +26,11 @@ from PIL import Image, ImageDraw
 from library import sdxl_model_util, sdxl_train_util, strategy_sdxl
 from library import train_util
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.sdxl_original_control_net import SdxlControlNet, SdxlControlledUNet
+from library.sdxl_original_control_net import (
+    SdxlControlNet,
+    SdxlControlledUNet,
+    build_seam_local_adapter_maps_from_conditioning,
+)
 from library.terrain_semantic_eval import (
     build_progression_boards,
     resolve_eval_samples,
@@ -63,6 +68,7 @@ COMPACT_SEAM_LOSS_TRACE_FIELDS = (
     "diffusion_loss",
     "rgb_total_loss",
     "continuation_weighted_rgb_loss",
+    "continuation_rgb_weight_mode",
     "continuation_gradient_loss",
     "continuation_gradient_weight",
     "halo_inner_rgb_loss",
@@ -71,6 +77,11 @@ COMPACT_SEAM_LOSS_TRACE_FIELDS = (
     "continuation_falloff_power",
     "continuation_peak_weight",
     "continuation_weight_sum",
+    "continuation_effective_weight_mean",
+    "continuation_effective_weight_max",
+    "continuation_weight_fraction_first_8px",
+    "continuation_weight_fraction_first_16px",
+    "continuation_weight_fraction_first_24px",
     "seam_valid_edge_ratio",
     "valid_edges_for_loss",
     "continuation_px",
@@ -78,6 +89,29 @@ COMPACT_SEAM_LOSS_TRACE_FIELDS = (
     "halo_outer_px",
     "halo_without_continuation_count_after_gate",
 )
+
+SEAM_ADAPTER_DIAG_FIELDS = (
+    "step",
+    "edge",
+    "enabled",
+    "scale",
+    "band_px",
+    "input_energy",
+    "sobel_input_energy",
+    "output_energy",
+    "adapter_to_activation_ratio",
+    "active_px",
+    "edge_valid",
+    "edge_valid_count",
+    "undefined_edge_input_energy",
+    "undefined_edge_output_energy",
+    "combined_output_energy",
+    "combined_adapter_to_activation_ratio",
+    "num_active_edges",
+    "corner_active_px",
+)
+
+SEAM_ADAPTER_EDGE_NAMES = ("north", "south", "east", "west")
 
 
 @dataclass(frozen=True)
@@ -376,7 +410,7 @@ def load_extended_training_state(
     logger.info(f"[resume] loading training state from {args.resume}")
     try:
         accelerator.load_state(args.resume)
-    except RuntimeError as resume_error:
+    except (RuntimeError, ValueError) as resume_error:
         logger.warning(f"[resume] accelerator.load_state failed: {resume_error}")
         return _fallback_resume_with_model_only()
 
@@ -416,6 +450,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--train_only_seam_adapter",
+        action="store_true",
+        help="Freeze all ControlNet parameters except controlnet_seam_adapter.* tensors.",
+    )
+    parser.add_argument(
+        "--seam_adapter_lr_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to --learning_rate for controlnet_seam_adapter parameter groups.",
+    )
     parser.add_argument("--max_train_steps", type=int, default=8000)
     parser.add_argument("--save_every_n_steps", type=int, default=500)
     parser.add_argument("--save_warmup_every_n_steps", type=int, default=0)
@@ -549,6 +594,7 @@ def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, objec
         "diffusion_loss": float(row.get("diffusion_loss", 0.0) or 0.0),
         "rgb_total_loss": float(row.get("seam_rgb_total_loss", 0.0) or 0.0),
         "continuation_weighted_rgb_loss": float(row.get("seam_rgb_continuation_weighted_loss", 0.0) or 0.0),
+        "continuation_rgb_weight_mode": str(row.get("seam_continuation_rgb_weight_mode", "falloff") or "falloff"),
         "continuation_gradient_loss": float(row.get("seam_continuation_gradient_loss", 0.0) or 0.0),
         "continuation_gradient_weight": float(row.get("seam_continuation_gradient_loss_weight", 0.0) or 0.0),
         "halo_inner_rgb_loss": float(row.get("seam_rgb_halo_inner_loss", 0.0) or 0.0),
@@ -557,6 +603,11 @@ def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, objec
         "continuation_falloff_power": float(row.get("seam_continuation_falloff_power", 0.0) or 0.0),
         "continuation_peak_weight": float(row.get("seam_continuation_peak_weight", 0.0) or 0.0),
         "continuation_weight_sum": float(row.get("seam_continuation_weight_sum", 0.0) or 0.0),
+        "continuation_effective_weight_mean": float(row.get("seam_continuation_effective_weight_mean", 0.0) or 0.0),
+        "continuation_effective_weight_max": float(row.get("seam_continuation_effective_weight_max", 0.0) or 0.0),
+        "continuation_weight_fraction_first_8px": float(row.get("seam_continuation_weight_fraction_first_8px", 0.0) or 0.0),
+        "continuation_weight_fraction_first_16px": float(row.get("seam_continuation_weight_fraction_first_16px", 0.0) or 0.0),
+        "continuation_weight_fraction_first_24px": float(row.get("seam_continuation_weight_fraction_first_24px", 0.0) or 0.0),
         "seam_valid_edge_ratio": float(row.get("seam_valid_edge_ratio", 0.0) or 0.0),
         "valid_edges_for_loss": float(row.get("seam_valid_edges_for_loss_count", 0.0) or 0.0),
         "continuation_px": float(continuation_px),
@@ -564,7 +615,110 @@ def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, objec
         "halo_outer_px": float(halo_outer_px),
         "halo_without_continuation_count_after_gate": float(row.get("halo_without_continuation_count_after_gate", 0.0) or 0.0),
     }
-    return {field: compact_row[field] for field in COMPACT_SEAM_LOSS_TRACE_FIELDS}
+    return {field: compact_row.get(field, 0.0) for field in COMPACT_SEAM_LOSS_TRACE_FIELDS}
+
+
+def _format_seam_adapter_diag_row(row: Dict[str, object]) -> Dict[str, object]:
+    formatted = {}
+    for field in SEAM_ADAPTER_DIAG_FIELDS:
+        default_value = "" if field == "edge" else 0.0
+        formatted[field] = row.get(field, default_value)
+    return formatted
+
+
+def _tensor_edge_values(value: object) -> List[float]:
+    if value is None:
+        return [0.0, 0.0, 0.0, 0.0]
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().float().cpu()
+        if tensor.ndim == 2:
+            tensor = tensor.mean(dim=0)
+        return [float(v) for v in tensor.flatten().tolist()[: len(SEAM_ADAPTER_EDGE_NAMES)]] + [0.0] * max(0, len(SEAM_ADAPTER_EDGE_NAMES) - int(tensor.numel()))
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in list(value)[: len(SEAM_ADAPTER_EDGE_NAMES)]] + [0.0] * max(0, len(SEAM_ADAPTER_EDGE_NAMES) - len(value))
+    return [float(value)] + [0.0] * (len(SEAM_ADAPTER_EDGE_NAMES) - 1)
+
+
+def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> List[Dict[str, object]]:
+    if not diagnostics:
+        return []
+
+    enabled = 1.0 if diagnostics.get("seam_adapter_enabled", False) else 0.0
+    scale = float(diagnostics.get("seam_adapter_scale", 0.0) or 0.0)
+    band_px = float(diagnostics.get("seam_adapter_band_px", 0.0) or 0.0)
+    input_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_input_energy"))
+    sobel_input_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_sobel_input_energy"))
+    output_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_output_energy"))
+    ratio = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_ratio"))
+    active_px = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_active_px"))
+    edge_valid = _tensor_edge_values(diagnostics.get("seam_adapter_edge_valid_flags"))
+    invalid_input_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_invalid_input_energy"))
+    invalid_output_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_invalid_output_energy"))
+
+    rows = []
+    for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+        rows.append(
+            _format_seam_adapter_diag_row(
+                {
+                    "step": float(step),
+                    "edge": edge_name,
+                    "enabled": enabled,
+                    "scale": scale,
+                    "band_px": band_px,
+                    "input_energy": input_energy[edge_index],
+                    "sobel_input_energy": sobel_input_energy[edge_index],
+                    "output_energy": output_energy[edge_index],
+                    "adapter_to_activation_ratio": ratio[edge_index],
+                    "active_px": active_px[edge_index],
+                    "edge_valid": edge_valid[edge_index],
+                    "edge_valid_count": edge_valid[edge_index],
+                    "undefined_edge_input_energy": invalid_input_energy[edge_index],
+                    "undefined_edge_output_energy": invalid_output_energy[edge_index],
+                }
+            )
+        )
+
+    rows.append(
+        _format_seam_adapter_diag_row(
+            {
+                "step": float(step),
+                "edge": "combined",
+                "enabled": enabled,
+                "scale": scale,
+                "band_px": band_px,
+                "sobel_input_energy": float(diagnostics.get("seam_adapter_sobel_input_energy", 0.0) or 0.0),
+                "output_energy": float(diagnostics.get("seam_adapter_output_energy", 0.0) or 0.0),
+                "adapter_to_activation_ratio": float(diagnostics.get("seam_adapter_to_activation_ratio", 0.0) or 0.0),
+                "active_px": float(diagnostics.get("seam_adapter_combined_active_px", diagnostics.get("seam_adapter_active_px", 0.0)) or 0.0),
+                "edge_valid": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
+                "edge_valid_count": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
+                "undefined_edge_input_energy": float(diagnostics.get("seam_adapter_undefined_edge_input_energy", 0.0) or 0.0),
+                "undefined_edge_output_energy": float(diagnostics.get("seam_adapter_undefined_edge_output_energy", 0.0) or 0.0),
+                "combined_output_energy": float(diagnostics.get("seam_adapter_output_energy", 0.0) or 0.0),
+                "combined_adapter_to_activation_ratio": float(diagnostics.get("seam_adapter_to_activation_ratio", 0.0) or 0.0),
+                "num_active_edges": float(sum(1.0 for value in edge_valid if value > 0.5)),
+                "corner_active_px": float(diagnostics.get("seam_adapter_corner_active_px", 0.0) or 0.0),
+            }
+        )
+    )
+    return rows
+
+
+def _build_seam_local_kwargs_from_payload(payload: Dict[str, torch.Tensor], zero_input: bool = False) -> Dict[str, torch.Tensor]:
+    seam_local_maps = payload["adapter_input"]
+    if zero_input:
+        seam_local_maps = torch.zeros_like(seam_local_maps)
+    kwargs = {
+        "seam_local_maps": seam_local_maps,
+        "seam_local_mask": payload["active_mask"],
+        "seam_local_invalid_mask": payload["invalid_active_mask"],
+        "seam_local_edge_valid_count": payload["edge_valid_count"],
+    }
+    if payload.get("edge_valid_flags") is not None:
+        kwargs["seam_local_edge_valid_flags"] = payload["edge_valid_flags"]
+    if payload.get("combined_active_mask") is not None:
+        kwargs["seam_local_combined_active_mask"] = payload["combined_active_mask"]
+    return kwargs
 
 
 def should_save_checkpoint(args: argparse.Namespace, global_step: int, resumed_step: int) -> bool:
@@ -942,6 +1096,17 @@ def _resolve_step_value_schedule(default_value: float, schedule: object, current
 def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
     seam = config.get("seam", {})
 
+    raw_adapter_inputs = seam.get(
+        "seam_adapter_inputs",
+        ["projected_halo_rgb", "projected_halo_alpha", "edge_valid_map", "distance_to_seam"],
+    )
+    if isinstance(raw_adapter_inputs, str):
+        seam_adapter_inputs = [value.strip() for value in raw_adapter_inputs.split(",") if value.strip()]
+    elif isinstance(raw_adapter_inputs, list):
+        seam_adapter_inputs = [str(value).strip() for value in raw_adapter_inputs if str(value).strip()]
+    else:
+        seam_adapter_inputs = ["projected_halo_rgb", "projected_halo_alpha", "edge_valid_map", "distance_to_seam"]
+
     def _get_float(keys: List[str], default: float) -> float:
         for key in keys:
             if seam.get(key) is not None:
@@ -969,6 +1134,20 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
     )
     continuation_falloff_power = _get_float(["continuation_falloff_power"], 2.0)
     gradient_loss_sobel_radius_px = _get_int(["gradient_loss_sobel_radius_px"], 1)
+    seam_adapter_per_edge = bool(seam.get("seam_adapter_per_edge", False))
+    seam_adapter_extrusion_mode = str(seam.get("seam_adapter_extrusion_mode", "decay") or "decay").strip().lower()
+    continuation_rgb_weight_mode_raw = str(seam.get("continuation_rgb_weight_mode", "") or "").strip().lower()
+    if continuation_rgb_weight_mode_raw:
+        continuation_rgb_weight_mode = continuation_rgb_weight_mode_raw
+    elif seam_adapter_per_edge and seam_adapter_extrusion_mode == "full_strength":
+        continuation_rgb_weight_mode = "uniform"
+    else:
+        continuation_rgb_weight_mode = "falloff"
+    if continuation_rgb_weight_mode not in {"falloff", "uniform", "linear"}:
+        raise ValueError(
+            "seam.continuation_rgb_weight_mode must be one of 'falloff', 'uniform', or 'linear': "
+            + f"got {continuation_rgb_weight_mode!r}"
+        )
 
     return {
         "enabled": bool(seam.get("enabled", False)),
@@ -996,6 +1175,7 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "continuation_gradient_loss_weight": continuation_gradient_loss_weight,
         "continuation_gradient_loss_weight_schedule": continuation_gradient_loss_weight_schedule,
         "continuation_falloff_power": continuation_falloff_power,
+        "continuation_rgb_weight_mode": continuation_rgb_weight_mode,
         "gradient_loss_sobel_radius_px": gradient_loss_sobel_radius_px,
         "rgb_recon_loss_weight": float(seam.get("rgb_recon_loss_weight", 0.0)),
         "normalize_region_losses": bool(seam.get("normalize_region_losses", True)),
@@ -1012,6 +1192,15 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "boundary_consistency_error_max_px": float(seam.get("boundary_consistency_error_max_px", 0.5)),
         "seed": int(seam.get("seed", 1337)),
         "fixed_defined_edge": str(seam.get("fixed_defined_edge", "") or "").strip().lower(),
+        "seam_adapter_enabled": bool(seam.get("seam_adapter_enabled", False)),
+        "seam_adapter_band_px": int(seam.get("seam_adapter_band_px", continuation_width_px)),
+        "seam_adapter_scale": float(seam.get("seam_adapter_scale", 1.0)),
+        "seam_adapter_zero_init": bool(seam.get("seam_adapter_zero_init", True)),
+        "seam_adapter_target": str(seam.get("seam_adapter_target", "first_high_res")).strip().lower(),
+        "seam_adapter_per_edge": seam_adapter_per_edge,
+        "seam_adapter_extrusion_mode": seam_adapter_extrusion_mode,
+        "seam_adapter_inputs": seam_adapter_inputs,
+        "seam_adapter_conditioning_offset": -1,
     }
 
 
@@ -1708,6 +1897,7 @@ def _summarize_weighted_seam_regions(
     region_weights: Dict[str, float],
     normalize_region_losses: bool,
     continuation_weighted_mask: Optional[torch.Tensor] = None,
+    seam_config: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     if continuation_weighted_mask is not None:
         zero = error_map.new_tensor(0.0)
@@ -1731,19 +1921,97 @@ def _summarize_weighted_seam_regions(
                 return zero
             return (error_map * mask).sum() / weight_sum.clamp_min(1e-6)
 
+        def _resolve_continuation_rgb_weight_mask(continuation_binary_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, str]:
+            cfg = seam_config or {}
+            mode = str(cfg.get("continuation_rgb_weight_mode", "falloff") or "falloff").strip().lower()
+            distance_map = seam_maps.get("continuation_distance_px")
+            if not isinstance(distance_map, torch.Tensor):
+                distance_map = torch.zeros_like(continuation_binary_mask, dtype=error_map.dtype)
+            else:
+                distance_map = distance_map.float()
+
+            if mode == "uniform":
+                return continuation_binary_mask.float(), distance_map, mode
+            if mode == "linear":
+                band_px = max(1.0, float(cfg.get("continuation_width_px", 1.0)))
+                linear_mask = (1.0 - (distance_map / band_px)).clamp(0.0, 1.0) * continuation_binary_mask.float()
+                return linear_mask, distance_map, mode
+            return continuation_weighted_mask.float(), distance_map, "falloff"
+
+        def _weight_fraction(mask: torch.Tensor, distance_map: torch.Tensor, upper_px: float) -> torch.Tensor:
+            total_weight = mask.sum()
+            if float(total_weight.detach().item()) <= 0.0:
+                return zero
+            selected = mask * (distance_map < upper_px).to(dtype=mask.dtype)
+            return selected.sum() / total_weight.clamp_min(1e-6)
+
+        def _weight_sum_below(mask: torch.Tensor, distance_map: torch.Tensor, upper_px: float) -> torch.Tensor:
+            return (mask * (distance_map < upper_px).to(dtype=mask.dtype)).sum()
+
+        def _bin_rgb_loss(continuation_binary_mask: torch.Tensor, distance_map: torch.Tensor, start_px: float, end_px: float) -> torch.Tensor:
+            bin_mask = continuation_binary_mask * ((distance_map >= start_px) & (distance_map < end_px)).to(dtype=continuation_binary_mask.dtype)
+            return _masked_mean(bin_mask)
+
+        def _bin_rgb_raw_sum(continuation_binary_mask: torch.Tensor, distance_map: torch.Tensor, start_px: float, end_px: float) -> torch.Tensor:
+            bin_mask = continuation_binary_mask * ((distance_map >= start_px) & (distance_map < end_px)).to(dtype=continuation_binary_mask.dtype)
+            return (error_map * bin_mask).sum()
+
+        def _bin_rgb_area(continuation_binary_mask: torch.Tensor, distance_map: torch.Tensor, start_px: float, end_px: float) -> torch.Tensor:
+            bin_mask = continuation_binary_mask * ((distance_map >= start_px) & (distance_map < end_px)).to(dtype=continuation_binary_mask.dtype)
+            return bin_mask.sum()
+
         halo_inner_mask = _mask_or_zeros("halo_inner", "margin_inner")
         halo_outer_mask = _mask_or_zeros("halo_outer", "margin_outer")
         continuation_binary_mask = _mask_or_zeros("interior_continuation", "interior_inner")
         interior_core_mask = _mask_or_zeros("interior_core")
         interior_union_mask = torch.maximum(interior_core_mask, continuation_binary_mask)
+        continuation_rgb_weight_mask, continuation_distance_px_map, continuation_rgb_weight_mode = _resolve_continuation_rgb_weight_mask(continuation_binary_mask)
 
         halo_inner_loss = _masked_mean(halo_inner_mask)
         halo_outer_loss = _masked_mean(halo_outer_mask)
         continuation_raw_loss = _masked_mean(continuation_binary_mask)
-        continuation_weighted_loss = _weighted_mean(continuation_weighted_mask.float()) * float(
+        continuation_weighted_loss = _weighted_mean(continuation_rgb_weight_mask.float()) * float(
             region_weights.get("interior_continuation", region_weights.get("continuation_distance_weighted", 1.0))
         )
         interior_core_loss = _masked_mean(interior_core_mask)
+
+        continuation_px = continuation_binary_mask.sum()
+        continuation_weight_sum = continuation_rgb_weight_mask.float().sum()
+        if float(continuation_px.detach().item()) > 0.0:
+            continuation_effective_weight_mean = continuation_weight_sum / continuation_px.clamp_min(1e-6)
+        else:
+            continuation_effective_weight_mean = zero
+        continuation_effective_weight_max = continuation_rgb_weight_mask.float().max() if continuation_rgb_weight_mask.numel() > 0 else zero
+        continuation_weight_fraction_first_8px = _weight_fraction(continuation_rgb_weight_mask.float(), continuation_distance_px_map, 8.0)
+        continuation_weight_fraction_first_16px = _weight_fraction(continuation_rgb_weight_mask.float(), continuation_distance_px_map, 16.0)
+        continuation_weight_fraction_first_24px = _weight_fraction(continuation_rgb_weight_mask.float(), continuation_distance_px_map, 24.0)
+        continuation_weight_fraction_full_band = _weight_fraction(
+            continuation_rgb_weight_mask.float(),
+            continuation_distance_px_map,
+            max(1.0, float((seam_config or {}).get("continuation_width_px", 1.0))) + 1e-6,
+        )
+        continuation_rgb_loss_bin_0_8 = _bin_rgb_loss(continuation_binary_mask, continuation_distance_px_map, 0.0, 8.0)
+        continuation_rgb_loss_bin_8_16 = _bin_rgb_loss(continuation_binary_mask, continuation_distance_px_map, 8.0, 16.0)
+        continuation_rgb_loss_bin_16_24 = _bin_rgb_loss(continuation_binary_mask, continuation_distance_px_map, 16.0, 24.0)
+        continuation_rgb_loss_bin_24_32 = _bin_rgb_loss(continuation_binary_mask, continuation_distance_px_map, 24.0, 32.0)
+        continuation_rgb_loss_bin_32_40 = _bin_rgb_loss(continuation_binary_mask, continuation_distance_px_map, 32.0, 40.0)
+        continuation_rgb_loss_bin_40_48 = _bin_rgb_loss(continuation_binary_mask, continuation_distance_px_map, 40.0, 48.0)
+        continuation_weighted_raw_sum = (error_map * continuation_rgb_weight_mask.float()).sum()
+        continuation_weight_sum_first_8px = _weight_sum_below(continuation_rgb_weight_mask.float(), continuation_distance_px_map, 8.0)
+        continuation_weight_sum_first_16px = _weight_sum_below(continuation_rgb_weight_mask.float(), continuation_distance_px_map, 16.0)
+        continuation_weight_sum_first_24px = _weight_sum_below(continuation_rgb_weight_mask.float(), continuation_distance_px_map, 24.0)
+        continuation_rgb_loss_bin_raw_sum_0_8 = _bin_rgb_raw_sum(continuation_binary_mask, continuation_distance_px_map, 0.0, 8.0)
+        continuation_rgb_loss_bin_raw_sum_8_16 = _bin_rgb_raw_sum(continuation_binary_mask, continuation_distance_px_map, 8.0, 16.0)
+        continuation_rgb_loss_bin_raw_sum_16_24 = _bin_rgb_raw_sum(continuation_binary_mask, continuation_distance_px_map, 16.0, 24.0)
+        continuation_rgb_loss_bin_raw_sum_24_32 = _bin_rgb_raw_sum(continuation_binary_mask, continuation_distance_px_map, 24.0, 32.0)
+        continuation_rgb_loss_bin_raw_sum_32_40 = _bin_rgb_raw_sum(continuation_binary_mask, continuation_distance_px_map, 32.0, 40.0)
+        continuation_rgb_loss_bin_raw_sum_40_48 = _bin_rgb_raw_sum(continuation_binary_mask, continuation_distance_px_map, 40.0, 48.0)
+        continuation_rgb_bin_area_0_8 = _bin_rgb_area(continuation_binary_mask, continuation_distance_px_map, 0.0, 8.0)
+        continuation_rgb_bin_area_8_16 = _bin_rgb_area(continuation_binary_mask, continuation_distance_px_map, 8.0, 16.0)
+        continuation_rgb_bin_area_16_24 = _bin_rgb_area(continuation_binary_mask, continuation_distance_px_map, 16.0, 24.0)
+        continuation_rgb_bin_area_24_32 = _bin_rgb_area(continuation_binary_mask, continuation_distance_px_map, 24.0, 32.0)
+        continuation_rgb_bin_area_32_40 = _bin_rgb_area(continuation_binary_mask, continuation_distance_px_map, 32.0, 40.0)
+        continuation_rgb_bin_area_40_48 = _bin_rgb_area(continuation_binary_mask, continuation_distance_px_map, 40.0, 48.0)
 
         halo_inner_contribution = halo_inner_loss * float(region_weights.get("halo_inner", 1.0))
         halo_outer_contribution = halo_outer_loss * float(region_weights.get("halo_outer", 1.0))
@@ -1787,9 +2055,58 @@ def _summarize_weighted_seam_regions(
             "region_weighted_contributions": region_weighted_contributions,
             "continuation_loss_raw": continuation_raw_loss,
             "continuation_loss_weighted": continuation_weighted_loss,
-            "continuation_supervised_px": continuation_binary_mask.sum(),
-            "continuation_weight_sum": continuation_weighted_mask.float().sum(),
+            "continuation_supervised_px": continuation_px,
+            "continuation_weight_sum": continuation_weight_sum,
+            "continuation_effective_weight_mean": continuation_effective_weight_mean,
+            "continuation_effective_weight_max": continuation_effective_weight_max,
+            "continuation_weight_fraction_first_8px": continuation_weight_fraction_first_8px,
+            "continuation_weight_fraction_first_16px": continuation_weight_fraction_first_16px,
+            "continuation_weight_fraction_first_24px": continuation_weight_fraction_first_24px,
+            "continuation_weight_fraction_full_band": continuation_weight_fraction_full_band,
+            "continuation_rgb_weight_mode": continuation_rgb_weight_mode,
+            "continuation_rgb_loss_bin_0_8": continuation_rgb_loss_bin_0_8,
+            "continuation_rgb_loss_bin_8_16": continuation_rgb_loss_bin_8_16,
+            "continuation_rgb_loss_bin_16_24": continuation_rgb_loss_bin_16_24,
+            "continuation_rgb_loss_bin_24_32": continuation_rgb_loss_bin_24_32,
+            "continuation_rgb_loss_bin_32_40": continuation_rgb_loss_bin_32_40,
+            "continuation_rgb_loss_bin_40_48": continuation_rgb_loss_bin_40_48,
             "interior_core_supervised_px": interior_core_mask.sum(),
+            "region_raw_sums": {
+                "halo_inner": (error_map * halo_inner_mask).sum(),
+                "halo_outer": (error_map * halo_outer_mask).sum(),
+                "interior_continuation": (error_map * continuation_binary_mask).sum(),
+                "interior_core": (error_map * interior_core_mask).sum(),
+                "margin_inner": (error_map * halo_inner_mask).sum(),
+                "margin_outer": (error_map * halo_outer_mask).sum(),
+                "interior_inner": (error_map * continuation_binary_mask).sum(),
+                "interior_outer": (error_map * interior_core_mask).sum(),
+            },
+            "region_areas": {
+                "halo_inner": halo_inner_mask.sum(),
+                "halo_outer": halo_outer_mask.sum(),
+                "interior_continuation": continuation_binary_mask.sum(),
+                "interior_core": interior_core_mask.sum(),
+                "margin_inner": halo_inner_mask.sum(),
+                "margin_outer": halo_outer_mask.sum(),
+                "interior_inner": continuation_binary_mask.sum(),
+                "interior_outer": interior_core_mask.sum(),
+            },
+            "continuation_weighted_raw_sum": continuation_weighted_raw_sum,
+            "continuation_weight_sum_first_8px": continuation_weight_sum_first_8px,
+            "continuation_weight_sum_first_16px": continuation_weight_sum_first_16px,
+            "continuation_weight_sum_first_24px": continuation_weight_sum_first_24px,
+            "continuation_rgb_loss_bin_raw_sum_0_8": continuation_rgb_loss_bin_raw_sum_0_8,
+            "continuation_rgb_loss_bin_raw_sum_8_16": continuation_rgb_loss_bin_raw_sum_8_16,
+            "continuation_rgb_loss_bin_raw_sum_16_24": continuation_rgb_loss_bin_raw_sum_16_24,
+            "continuation_rgb_loss_bin_raw_sum_24_32": continuation_rgb_loss_bin_raw_sum_24_32,
+            "continuation_rgb_loss_bin_raw_sum_32_40": continuation_rgb_loss_bin_raw_sum_32_40,
+            "continuation_rgb_loss_bin_raw_sum_40_48": continuation_rgb_loss_bin_raw_sum_40_48,
+            "continuation_rgb_bin_area_0_8": continuation_rgb_bin_area_0_8,
+            "continuation_rgb_bin_area_8_16": continuation_rgb_bin_area_8_16,
+            "continuation_rgb_bin_area_16_24": continuation_rgb_bin_area_16_24,
+            "continuation_rgb_bin_area_24_32": continuation_rgb_bin_area_24_32,
+            "continuation_rgb_bin_area_32_40": continuation_rgb_bin_area_32_40,
+            "continuation_rgb_bin_area_40_48": continuation_rgb_bin_area_40_48,
         }
 
     halo_regions = ("margin_inner", "margin_outer")
@@ -1862,15 +2179,15 @@ _SOBEL_Y_KERNEL = torch.tensor(
 ).view(1, 1, 3, 3)
 
 
-def _compute_continuation_gradient_loss(
+def _compute_masked_rgb_gradient_loss(
     pred_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
-    continuation_distance_weighted_mask: torch.Tensor,
+    weight_mask: torch.Tensor,
     sobel_radius_px: int = 1,
 ) -> Dict[str, torch.Tensor]:
     if pred_rgb.ndim != 4 or target_rgb.ndim != 4 or pred_rgb.shape[1] != 3 or target_rgb.shape[1] != 3:
         raise ValueError(
-            "continuation gradient loss expects RGB tensors with shape [batch, 3, height, width]: "
+            "masked RGB gradient loss expects RGB tensors with shape [batch, 3, height, width]: "
             + f"pred={tuple(pred_rgb.shape)} target={tuple(target_rgb.shape)}"
         )
     if int(sobel_radius_px) != 1:
@@ -1888,21 +2205,147 @@ def _compute_continuation_gradient_loss(
     target_grad_mag = torch.sqrt(target_grad_x.square() + target_grad_y.square() + 1e-6)
     grad_diff = (pred_grad_mag - target_grad_mag).abs().mean(dim=1, keepdim=True)
 
-    active_mask = (continuation_distance_weighted_mask > 0.0).to(dtype=grad_diff.dtype)
+    active_mask = (weight_mask > 0.0).to(dtype=grad_diff.dtype)
     active_px = active_mask.sum()
-    weight_sum = continuation_distance_weighted_mask.sum()
+    weight_sum = weight_mask.sum()
     raw_loss = grad_diff.new_tensor(0.0)
     weighted_loss = grad_diff.new_tensor(0.0)
+    raw_sum = grad_diff.new_tensor(0.0)
+    weighted_raw_sum = grad_diff.new_tensor(0.0)
     if float(active_px.detach().item()) > 0.0:
-        raw_loss = (grad_diff * active_mask).sum() / active_px.clamp_min(1e-6)
+        raw_sum = (grad_diff * active_mask).sum()
+        raw_loss = raw_sum / active_px.clamp_min(1e-6)
     if float(weight_sum.detach().item()) > 0.0:
-        weighted_loss = (grad_diff * continuation_distance_weighted_mask).sum() / weight_sum.clamp_min(1e-6)
+        weighted_raw_sum = (grad_diff * weight_mask).sum()
+        weighted_loss = weighted_raw_sum / weight_sum.clamp_min(1e-6)
 
     return {
         "raw_loss": raw_loss,
         "weighted_loss": weighted_loss,
         "active_px": active_px,
         "weight_sum": weight_sum,
+        "raw_sum": raw_sum,
+        "weighted_raw_sum": weighted_raw_sum,
+    }
+
+
+def _compute_continuation_gradient_loss(
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    continuation_distance_weighted_mask: torch.Tensor,
+    sobel_radius_px: int = 1,
+) -> Dict[str, torch.Tensor]:
+    return _compute_masked_rgb_gradient_loss(
+        pred_rgb=pred_rgb,
+        target_rgb=target_rgb,
+        weight_mask=continuation_distance_weighted_mask,
+        sobel_radius_px=sobel_radius_px,
+    )
+
+
+def _edge_halo_distance_map(
+    edge_name: str,
+    *,
+    height: int,
+    width: int,
+    crop_x0: int,
+    crop_y0: int,
+    full_height: int,
+    full_width: int,
+    expanded_halo_px: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    yy = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1) + float(crop_y0)
+    xx = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width) + float(crop_x0)
+    halo = float(max(0, int(expanded_halo_px)))
+    if edge_name == "north":
+        return (halo - yy).clamp(min=0.0).expand(1, 1, height, width)
+    if edge_name == "south":
+        boundary = float(full_height - 1) - halo
+        return (yy - boundary).clamp(min=0.0).expand(1, 1, height, width)
+    if edge_name == "east":
+        boundary = float(full_width - 1) - halo
+        return (xx - boundary).clamp(min=0.0).expand(1, 1, height, width)
+    if edge_name == "west":
+        return (halo - xx).clamp(min=0.0).expand(1, 1, height, width)
+    raise ValueError(f"unsupported seam edge for halo distance map: {edge_name}")
+
+
+def _masked_map_stats(value_map: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    zero = value_map.new_tensor(0.0)
+    active_mask = (mask > 0.0).to(dtype=value_map.dtype)
+    area = active_mask.sum()
+    raw_sum = (value_map * active_mask).sum()
+    mean = zero
+    max_value = zero
+    if float(area.detach().item()) > 0.0:
+        mean = raw_sum / area.clamp_min(1e-6)
+        max_value = value_map.masked_fill(active_mask <= 0.0, 0.0).max()
+    return {
+        "raw_sum": raw_sum,
+        "area": area,
+        "mean": mean,
+        "max": max_value,
+    }
+
+
+def _compute_edge_halo_copy_metrics(
+    error_map: torch.Tensor,
+    *,
+    edge_name: str,
+    edge_seam_maps: Dict[str, object],
+    crop_x0: int,
+    crop_y0: int,
+    full_height: int,
+    full_width: int,
+    expanded_halo_px: int,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    zero = error_map.new_tensor(0.0)
+    if int(expanded_halo_px) <= 0:
+        return {
+            "halo_copy": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_1px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_4px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_8px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_16px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+        }
+
+    halo_inner = edge_seam_maps.get("margin_inner")
+    halo_outer = edge_seam_maps.get("margin_outer")
+    if not isinstance(halo_inner, torch.Tensor) or not isinstance(halo_outer, torch.Tensor):
+        return {
+            "halo_copy": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_1px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_4px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_8px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+            "halo_inner_16px": {"raw_sum": zero, "area": zero, "mean": zero, "max": zero},
+        }
+
+    distance_map = _edge_halo_distance_map(
+        edge_name,
+        height=int(error_map.shape[-2]),
+        width=int(error_map.shape[-1]),
+        crop_x0=crop_x0,
+        crop_y0=crop_y0,
+        full_height=full_height,
+        full_width=full_width,
+        expanded_halo_px=expanded_halo_px,
+        device=error_map.device,
+        dtype=error_map.dtype,
+    )
+    halo_mask = (halo_inner + halo_outer).clamp(0.0, 1.0)
+
+    def _ring_stats(limit_px: float) -> Dict[str, torch.Tensor]:
+        ring_mask = halo_inner * ((distance_map > 0.0) & (distance_map <= limit_px)).to(dtype=error_map.dtype)
+        return _masked_map_stats(error_map, ring_mask)
+
+    return {
+        "halo_copy": _masked_map_stats(error_map, halo_mask),
+        "halo_inner_1px": _ring_stats(1.0),
+        "halo_inner_4px": _ring_stats(4.0),
+        "halo_inner_8px": _ring_stats(8.0),
+        "halo_inner_16px": _ring_stats(16.0),
     }
 
 
@@ -1962,6 +2405,275 @@ def _mask_bounds(mask: torch.Tensor) -> Tuple[float, float, float, float]:
         float((min_y * has_active.float()).sum().item() / valid.item()),
         float((max_y * has_active.float()).sum().item() / valid.item()),
     )
+
+def _compute_seam_decode_crop(
+    support_mask: torch.Tensor,
+    *,
+    full_height: int,
+    full_width: int,
+    latent_height: int,
+    latent_width: int,
+    context_px: int = 64,
+) -> Dict[str, int]:
+    min_x, max_x, min_y, max_y = _mask_bounds(support_mask)
+    if max_x < 0.0 or max_y < 0.0:
+        return {
+            "pixel_x0": 0,
+            "pixel_x1": full_width,
+            "pixel_y0": 0,
+            "pixel_y1": full_height,
+            "latent_x0": 0,
+            "latent_x1": latent_width,
+            "latent_y0": 0,
+            "latent_y1": latent_height,
+        }
+
+    latent_scale_x = max(1, full_width // max(1, latent_width))
+    latent_scale_y = max(1, full_height // max(1, latent_height))
+    pad_x = max(0, int(context_px))
+    pad_y = max(0, int(context_px))
+
+    pixel_x0 = max(0, int(math.floor(min_x)) - pad_x)
+    pixel_x1 = min(full_width, int(math.ceil(max_x + 1.0)) + pad_x)
+    pixel_y0 = max(0, int(math.floor(min_y)) - pad_y)
+    pixel_y1 = min(full_height, int(math.ceil(max_y + 1.0)) + pad_y)
+
+    latent_x0 = max(0, pixel_x0 // latent_scale_x)
+    latent_x1 = min(latent_width, int(math.ceil(pixel_x1 / float(latent_scale_x))))
+    latent_y0 = max(0, pixel_y0 // latent_scale_y)
+    latent_y1 = min(latent_height, int(math.ceil(pixel_y1 / float(latent_scale_y))))
+
+    pixel_x0 = latent_x0 * latent_scale_x
+    pixel_x1 = min(full_width, latent_x1 * latent_scale_x)
+    pixel_y0 = latent_y0 * latent_scale_y
+    pixel_y1 = min(full_height, latent_y1 * latent_scale_y)
+
+    return {
+        "pixel_x0": pixel_x0,
+        "pixel_x1": pixel_x1,
+        "pixel_y0": pixel_y0,
+        "pixel_y1": pixel_y1,
+        "latent_x0": latent_x0,
+        "latent_x1": latent_x1,
+        "latent_y0": latent_y0,
+        "latent_y1": latent_y1,
+    }
+
+def _crop_spatial_tensor(tensor: torch.Tensor, *, x0: int, x1: int, y0: int, y1: int) -> torch.Tensor:
+    return tensor[..., y0:y1, x0:x1]
+
+def _crop_seam_maps(
+    seam_maps: Dict[str, object],
+    *,
+    x0: int,
+    x1: int,
+    y0: int,
+    y1: int,
+    full_height: int,
+    full_width: int,
+) -> Dict[str, object]:
+    cropped: Dict[str, object] = {}
+    for key, value in seam_maps.items():
+        if isinstance(value, torch.Tensor) and value.ndim >= 4 and tuple(value.shape[-2:]) == (full_height, full_width):
+            cropped[key] = value[..., y0:y1, x0:x1]
+        else:
+            cropped[key] = value
+    return cropped
+
+
+def _select_seam_maps_for_edge(seam_maps: Dict[str, object], edge_index: int) -> Dict[str, object]:
+    selected = dict(seam_maps)
+    per_edge_key_map = {
+        "margin_inner": "margin_inner_per_edge",
+        "margin_outer": "margin_outer_per_edge",
+        "interior_inner": "interior_inner_per_edge",
+        "interior_outer": "interior_outer_per_edge",
+        "interior_continuation": "interior_continuation_per_edge",
+        "interior_core": "interior_core_per_edge",
+        "continuation_distance_weighted": "continuation_distance_weighted_per_edge",
+        "continuation_linear_weight": "continuation_linear_weight_per_edge",
+        "continuation_distance_px": "continuation_distance_px_per_edge",
+    }
+    for base_key, per_edge_key in per_edge_key_map.items():
+        value = seam_maps.get(per_edge_key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 4 and value.shape[1] > edge_index:
+            selected[base_key] = value[:, edge_index : edge_index + 1]
+    return selected
+
+
+def _aggregate_weighted_seam_summaries(
+    edge_summaries: List[Dict[str, object]],
+    *,
+    reference_tensor: torch.Tensor,
+    region_weights: Dict[str, float],
+    continuation_width_px: float,
+) -> Dict[str, object]:
+    zero = reference_tensor.new_tensor(0.0)
+    if not edge_summaries:
+        return {
+            "region_losses": {},
+            "halo_loss_raw": zero,
+            "interior_loss_raw": zero,
+            "halo_supervised_px": zero,
+            "interior_supervised_px": zero,
+            "halo_loss_weighted": zero,
+            "interior_loss_weighted": zero,
+            "total_loss": zero,
+            "region_weighted_contributions": {},
+            "continuation_loss_raw": zero,
+            "continuation_loss_weighted": zero,
+            "continuation_supervised_px": zero,
+            "continuation_weight_sum": zero,
+            "continuation_effective_weight_mean": zero,
+            "continuation_effective_weight_max": zero,
+            "continuation_weight_fraction_first_8px": zero,
+            "continuation_weight_fraction_first_16px": zero,
+            "continuation_weight_fraction_first_24px": zero,
+            "continuation_weight_fraction_full_band": zero,
+            "continuation_rgb_weight_mode": "falloff",
+            "continuation_rgb_loss_bin_0_8": zero,
+            "continuation_rgb_loss_bin_8_16": zero,
+            "continuation_rgb_loss_bin_16_24": zero,
+            "continuation_rgb_loss_bin_24_32": zero,
+            "continuation_rgb_loss_bin_32_40": zero,
+            "continuation_rgb_loss_bin_40_48": zero,
+            "interior_core_supervised_px": zero,
+        }
+
+    def _sum_summary_tensor(field_name: str) -> torch.Tensor:
+        values = [value for value in (summary.get(field_name) for summary in edge_summaries) if isinstance(value, torch.Tensor)]
+        if not values:
+            return zero
+        return torch.stack(values).sum()
+
+    def _sum_summary_region(field_name: str, region_name: str) -> torch.Tensor:
+        values = []
+        for summary in edge_summaries:
+            field = summary.get(field_name)
+            if isinstance(field, dict):
+                value = field.get(region_name)
+                if isinstance(value, torch.Tensor):
+                    values.append(value)
+        if not values:
+            return zero
+        return torch.stack(values).sum()
+
+    def _max_summary_tensor(field_name: str) -> torch.Tensor:
+        values = [value for value in (summary.get(field_name) for summary in edge_summaries) if isinstance(value, torch.Tensor)]
+        if not values:
+            return zero
+        return torch.stack(values).max()
+
+    def _safe_mean(raw_sum: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
+        if float(denom.detach().item()) <= 0.0:
+            return zero
+        return raw_sum / denom.clamp_min(1e-6)
+
+    def _fraction(numer: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
+        if float(denom.detach().item()) <= 0.0:
+            return zero
+        return numer / denom.clamp_min(1e-6)
+
+    region_raw_sums = {
+        "halo_inner": _sum_summary_region("region_raw_sums", "halo_inner"),
+        "halo_outer": _sum_summary_region("region_raw_sums", "halo_outer"),
+        "interior_continuation": _sum_summary_region("region_raw_sums", "interior_continuation"),
+        "interior_core": _sum_summary_region("region_raw_sums", "interior_core"),
+    }
+    region_areas = {
+        "halo_inner": _sum_summary_region("region_areas", "halo_inner"),
+        "halo_outer": _sum_summary_region("region_areas", "halo_outer"),
+        "interior_continuation": _sum_summary_region("region_areas", "interior_continuation"),
+        "interior_core": _sum_summary_region("region_areas", "interior_core"),
+    }
+
+    halo_inner_loss = _safe_mean(region_raw_sums["halo_inner"], region_areas["halo_inner"])
+    halo_outer_loss = _safe_mean(region_raw_sums["halo_outer"], region_areas["halo_outer"])
+    continuation_raw_loss = _safe_mean(region_raw_sums["interior_continuation"], region_areas["interior_continuation"])
+    interior_core_loss = _safe_mean(region_raw_sums["interior_core"], region_areas["interior_core"])
+
+    continuation_weighted_raw_sum = _sum_summary_tensor("continuation_weighted_raw_sum")
+    continuation_weight_sum = _sum_summary_tensor("continuation_weight_sum")
+    continuation_supervised_px = _sum_summary_tensor("continuation_supervised_px")
+    continuation_weight_sum_first_8px = _sum_summary_tensor("continuation_weight_sum_first_8px")
+    continuation_weight_sum_first_16px = _sum_summary_tensor("continuation_weight_sum_first_16px")
+    continuation_weight_sum_first_24px = _sum_summary_tensor("continuation_weight_sum_first_24px")
+    continuation_effective_weight_max = _max_summary_tensor("continuation_effective_weight_max")
+    continuation_weighted_mean = _safe_mean(continuation_weighted_raw_sum, continuation_weight_sum)
+    continuation_weighted_loss = continuation_weighted_mean * float(
+        region_weights.get("interior_continuation", region_weights.get("continuation_distance_weighted", 1.0))
+    )
+
+    continuation_rgb_bin_raw_sum_0_8 = _sum_summary_tensor("continuation_rgb_loss_bin_raw_sum_0_8")
+    continuation_rgb_bin_raw_sum_8_16 = _sum_summary_tensor("continuation_rgb_loss_bin_raw_sum_8_16")
+    continuation_rgb_bin_raw_sum_16_24 = _sum_summary_tensor("continuation_rgb_loss_bin_raw_sum_16_24")
+    continuation_rgb_bin_raw_sum_24_32 = _sum_summary_tensor("continuation_rgb_loss_bin_raw_sum_24_32")
+    continuation_rgb_bin_raw_sum_32_40 = _sum_summary_tensor("continuation_rgb_loss_bin_raw_sum_32_40")
+    continuation_rgb_bin_raw_sum_40_48 = _sum_summary_tensor("continuation_rgb_loss_bin_raw_sum_40_48")
+    continuation_rgb_bin_area_0_8 = _sum_summary_tensor("continuation_rgb_bin_area_0_8")
+    continuation_rgb_bin_area_8_16 = _sum_summary_tensor("continuation_rgb_bin_area_8_16")
+    continuation_rgb_bin_area_16_24 = _sum_summary_tensor("continuation_rgb_bin_area_16_24")
+    continuation_rgb_bin_area_24_32 = _sum_summary_tensor("continuation_rgb_bin_area_24_32")
+    continuation_rgb_bin_area_32_40 = _sum_summary_tensor("continuation_rgb_bin_area_32_40")
+    continuation_rgb_bin_area_40_48 = _sum_summary_tensor("continuation_rgb_bin_area_40_48")
+
+    halo_inner_contribution = halo_inner_loss * float(region_weights.get("halo_inner", 1.0))
+    halo_outer_contribution = halo_outer_loss * float(region_weights.get("halo_outer", 1.0))
+    interior_core_contribution = interior_core_loss * float(region_weights.get("interior_core", 1.0))
+
+    region_losses = {
+        "halo_inner": halo_inner_loss,
+        "halo_outer": halo_outer_loss,
+        "interior_continuation": continuation_raw_loss,
+        "interior_core": interior_core_loss,
+        "margin_inner": halo_inner_loss,
+        "margin_outer": halo_outer_loss,
+        "interior_inner": continuation_raw_loss,
+        "interior_outer": interior_core_loss,
+    }
+    region_weighted_contributions = {
+        "halo_inner": halo_inner_contribution,
+        "halo_outer": halo_outer_contribution,
+        "interior_continuation": continuation_weighted_loss,
+        "continuation_distance_weighted": continuation_weighted_loss,
+        "interior_core": interior_core_contribution,
+        "margin_inner": halo_inner_contribution,
+        "margin_outer": halo_outer_contribution,
+        "interior_inner": continuation_weighted_loss,
+        "interior_outer": interior_core_contribution,
+    }
+
+    return {
+        "region_losses": region_losses,
+        "halo_loss_raw": region_raw_sums["halo_inner"] + region_raw_sums["halo_outer"],
+        "interior_loss_raw": region_raw_sums["interior_continuation"] + region_raw_sums["interior_core"],
+        "halo_supervised_px": region_areas["halo_inner"] + region_areas["halo_outer"],
+        "interior_supervised_px": region_areas["interior_continuation"] + region_areas["interior_core"],
+        "halo_loss_weighted": halo_inner_contribution + halo_outer_contribution,
+        "interior_loss_weighted": continuation_weighted_loss + interior_core_contribution,
+        "total_loss": halo_inner_contribution + halo_outer_contribution + continuation_weighted_loss + interior_core_contribution,
+        "region_weighted_contributions": region_weighted_contributions,
+        "region_raw_sums": region_raw_sums,
+        "region_areas": region_areas,
+        "continuation_loss_raw": continuation_raw_loss,
+        "continuation_loss_weighted": continuation_weighted_loss,
+        "continuation_supervised_px": continuation_supervised_px,
+        "continuation_weight_sum": continuation_weight_sum,
+        "continuation_effective_weight_mean": _safe_mean(continuation_weight_sum, continuation_supervised_px),
+        "continuation_effective_weight_max": continuation_effective_weight_max,
+        "continuation_weight_fraction_first_8px": _fraction(continuation_weight_sum_first_8px, continuation_weight_sum),
+        "continuation_weight_fraction_first_16px": _fraction(continuation_weight_sum_first_16px, continuation_weight_sum),
+        "continuation_weight_fraction_first_24px": _fraction(continuation_weight_sum_first_24px, continuation_weight_sum),
+        "continuation_weight_fraction_full_band": _fraction(continuation_weight_sum, continuation_weight_sum),
+        "continuation_rgb_weight_mode": str(edge_summaries[0].get("continuation_rgb_weight_mode", "falloff")),
+        "continuation_rgb_loss_bin_0_8": _safe_mean(continuation_rgb_bin_raw_sum_0_8, continuation_rgb_bin_area_0_8),
+        "continuation_rgb_loss_bin_8_16": _safe_mean(continuation_rgb_bin_raw_sum_8_16, continuation_rgb_bin_area_8_16),
+        "continuation_rgb_loss_bin_16_24": _safe_mean(continuation_rgb_bin_raw_sum_16_24, continuation_rgb_bin_area_16_24),
+        "continuation_rgb_loss_bin_24_32": _safe_mean(continuation_rgb_bin_raw_sum_24_32, continuation_rgb_bin_area_24_32),
+        "continuation_rgb_loss_bin_32_40": _safe_mean(continuation_rgb_bin_raw_sum_32_40, continuation_rgb_bin_area_32_40),
+        "continuation_rgb_loss_bin_40_48": _safe_mean(continuation_rgb_bin_raw_sum_40_48, continuation_rgb_bin_area_40_48),
+        "interior_core_supervised_px": region_areas["interior_core"],
+    }
 
 
 def _save_seam_visual_debug(
@@ -2402,15 +3114,41 @@ def run_controlnet_influence_sanity_check(
     vae_original_dtype = next(vae.parameters()).dtype
     vae.to(device=device, dtype=dtype)
 
+    original_model_modes = {
+        "unet": unet.training,
+        "control_net": control_net.training,
+        "material_lora_unet": material_lora_unet.training,
+        "material_lora_control": material_lora_control.training,
+    }
+    unet.eval()
+    control_net.eval()
+    material_lora_unet.eval()
+    material_lora_control.eval()
+
     def predict_x0(
         control_multiplier: float,
         cond_tensor: torch.Tensor,
         collect_alpha_logits: bool = False,
+        seam_local_zero_input: bool = False,
+        disable_seam_adapter: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         material_lora_unet.set_multiplier(args.material_lora_multiplier)
         material_lora_control.set_multiplier(args.material_lora_multiplier)
         control_net.multiplier = control_multiplier
         last_alpha_logits: Optional[torch.Tensor] = None
+        original_seam_adapter_scale = getattr(control_net, "seam_adapter_scale", None)
+        seam_local_kwargs: Dict[str, torch.Tensor] = {}
+        if seam_local_zero_input:
+            seam_payload = build_seam_local_adapter_maps_from_conditioning(
+                cond_tensor,
+                seam_conditioning_offset=int(seam_config.get("seam_adapter_conditioning_offset", -1)),
+                band_px=int(seam_config.get("seam_adapter_band_px", 0)),
+                seam_adapter_per_edge=bool(seam_config.get("seam_adapter_per_edge", False)),
+                seam_adapter_extrusion_mode=str(seam_config.get("seam_adapter_extrusion_mode", "decay")),
+            )
+            seam_local_kwargs = _build_seam_local_kwargs_from_payload(seam_payload, zero_input=True)
+        if disable_seam_adapter and original_seam_adapter_scale is not None:
+            control_net.seam_adapter_scale = 0.0
         with torch.no_grad():
             inference_steps = max(2, int(verification_config["controlnet_sanity_steps"]))
             noise_scheduler.set_timesteps(inference_steps, device=device)
@@ -2430,13 +3168,21 @@ def run_controlnet_influence_sanity_check(
                         cond_control,
                         return_alpha=True,
                         alpha_target_size=tuple(sample["target_sizes_hw"].tolist()),
+                        **seam_local_kwargs,
                     )
                     if alpha_outputs is not None:
                         candidate_logits = alpha_outputs.get("fused_logits")
                         if candidate_logits is not None:
                             last_alpha_logits = candidate_logits.detach().float()
                 else:
-                    input_resi_add, mid_add = control_net(noisy_control, t, text_control, vector_control, cond_control)
+                    input_resi_add, mid_add = control_net(
+                        noisy_control,
+                        t,
+                        text_control,
+                        vector_control,
+                        cond_control,
+                        **seam_local_kwargs,
+                    )
 
                 noisy_unet = noisy.to(dtype=unet_dtype)
                 text_unet = text_embedding.to(dtype=unet_dtype)
@@ -2449,7 +3195,62 @@ def run_controlnet_influence_sanity_check(
             alpha_t = noise_scheduler.alphas_cumprod[noise_scheduler.timesteps[-1]].to(device=device, dtype=torch.float32)
             alpha_t = alpha_t.view(1, 1, 1, 1)
             pred_x0 = noisy / alpha_t.sqrt()
+        if disable_seam_adapter and original_seam_adapter_scale is not None:
+            control_net.seam_adapter_scale = original_seam_adapter_scale
         return pred_x0, last_alpha_logits
+
+    def measure_controlnet_zero_input_equivalence(cond_tensor: torch.Tensor) -> tuple[float, float]:
+        original_seam_adapter_scale = getattr(control_net, "seam_adapter_scale", None)
+        seam_payload = build_seam_local_adapter_maps_from_conditioning(
+            cond_tensor,
+            seam_conditioning_offset=int(seam_config.get("seam_adapter_conditioning_offset", -1)),
+            band_px=int(seam_config.get("seam_adapter_band_px", 0)),
+            seam_adapter_per_edge=bool(seam_config.get("seam_adapter_per_edge", False)),
+            seam_adapter_extrusion_mode=str(seam_config.get("seam_adapter_extrusion_mode", "decay")),
+        )
+        seam_local_kwargs = _build_seam_local_kwargs_from_payload(seam_payload, zero_input=True)
+        direct_timestep = torch.full((1,), noise_scheduler.config.num_train_timesteps // 2, device=device, dtype=torch.long)
+        noisy_control = latents.to(dtype=control_dtype)
+        cond_control = cond_tensor.to(dtype=control_dtype)
+        text_control = text_embedding.to(dtype=control_dtype)
+        vector_control = vector_embedding.to(dtype=control_dtype)
+        with torch.no_grad():
+            if original_seam_adapter_scale is not None:
+                control_net.seam_adapter_scale = 0.0
+            disabled_input_resi_add, disabled_mid_add = control_net(
+                noisy_control,
+                direct_timestep,
+                text_control,
+                vector_control,
+                cond_control,
+            )
+            if original_seam_adapter_scale is not None:
+                control_net.seam_adapter_scale = original_seam_adapter_scale
+            zero_input_resi_add, zero_input_mid_add = control_net(
+                noisy_control,
+                direct_timestep,
+                text_control,
+                vector_control,
+                cond_control,
+                **seam_local_kwargs,
+            )
+        if original_seam_adapter_scale is not None:
+            control_net.seam_adapter_scale = original_seam_adapter_scale
+
+        residual_mse_terms = [
+            F.mse_loss(disabled.float(), zero.float())
+            for disabled, zero in zip(disabled_input_resi_add, zero_input_resi_add)
+        ]
+        residual_mse_terms.append(F.mse_loss(disabled_mid_add.float(), zero_input_mid_add.float()))
+        mean_residual_mse = float(torch.stack(residual_mse_terms).mean().item())
+
+        max_abs_terms = [
+            (disabled.float() - zero.float()).abs().max()
+            for disabled, zero in zip(disabled_input_resi_add, zero_input_resi_add)
+        ]
+        max_abs_terms.append((disabled_mid_add.float() - zero_input_mid_add.float()).abs().max())
+        max_abs_diff = float(torch.stack(max_abs_terms).max().item())
+        return mean_residual_mse, max_abs_diff
 
     def _decode_preview(pred_latents: torch.Tensor) -> Image.Image:
         vae_dtype = next(vae.parameters()).dtype
@@ -2528,9 +3329,36 @@ def run_controlnet_influence_sanity_check(
                     if alpha_wall_img is not None:
                         alpha_wall_img.save(os.path.join(sanity_dir, f"controlnet_alpha_wall_m{suffix}.png"))
 
+    if seam_config.get("enabled") and seam_config.get("seam_adapter_enabled"):
+        zero_input_control_mse, zero_input_control_max_abs = measure_controlnet_zero_input_equivalence(conditioning)
+        logger.info(
+            "[verify/seam_adapter] zero_input_vs_disabled_control_residual_mse=%.10f max_abs=%.10f",
+            zero_input_control_mse,
+            zero_input_control_max_abs,
+        )
+        if zero_input_control_max_abs > 1e-7:
+            raise RuntimeError(
+                "Seam adapter zero-input ablation failed at the ControlNet residual level: zero seam-local inputs should "
+                f"match disabled adapter. mse={zero_input_control_mse:.10f} max_abs={zero_input_control_max_abs:.10f}"
+            )
+        pred_adapter_disabled, _ = predict_x0(1.0, conditioning, disable_seam_adapter=True)
+        pred_adapter_zero_input, _ = predict_x0(1.0, conditioning, seam_local_zero_input=True)
+        seam_zero_input_mse = float(F.mse_loss(pred_adapter_disabled.float(), pred_adapter_zero_input.float()).item())
+        logger.info("[verify/seam_adapter] zero_input_vs_disabled_pred_x0_mse=%.8f", seam_zero_input_mse)
+        if seam_zero_input_mse > 1e-7:
+            logger.warning(
+                "[verify/seam_adapter] pred_x0 zero-input vs disabled mismatch did not fail startup because "
+                "ControlNet residual-level equivalence passed. pred_x0_mse=%.8f",
+                seam_zero_input_mse,
+            )
+
     control_net.multiplier = original_multiplier
 
     vae.to(device=vae_original_device, dtype=vae_original_dtype)
+    unet.train(original_model_modes["unet"])
+    control_net.train(original_model_modes["control_net"])
+    material_lora_unet.train(original_model_modes["material_lora_unet"])
+    material_lora_control.train(original_model_modes["material_lora_control"])
 
 
 
@@ -2701,6 +3529,7 @@ def assert_trainable_policy(
     control_net: torch.nn.Module,
     material_lora_unet: torch.nn.Module,
     material_lora_control: torch.nn.Module,
+    train_only_seam_adapter: bool = False,
 ) -> None:
     assert not any(parameter.requires_grad for parameter in unet.parameters()), "UNet must be frozen"
     assert not any(parameter.requires_grad for parameter in text_encoder1.parameters()), "Text encoder 1 must be frozen"
@@ -2713,6 +3542,18 @@ def assert_trainable_policy(
     assert trainable_names, "No trainable ControlNet parameters found"
     bad_trainable = [name for name in trainable_names if not name.startswith("controlnet_")]
     assert not bad_trainable, f"Unexpected non-controlnet trainable params: {bad_trainable[:5]}"
+
+    if train_only_seam_adapter:
+        seam_only_bad = [name for name in trainable_names if not name.startswith("controlnet_seam_adapter")]
+        assert not seam_only_bad, f"Unexpected non-seam-adapter trainable params: {seam_only_bad[:5]}"
+        seam_adapter_trainable_count = sum(
+            parameter.numel()
+            for name, parameter in control_net.named_parameters()
+            if parameter.requires_grad and name.startswith("controlnet_seam_adapter")
+        )
+        assert seam_adapter_trainable_count > 0, "No trainable seam adapter parameters found"
+        logger.info(f"[sanity/params] seam_adapter_trainable_params={seam_adapter_trainable_count:,}")
+        return
 
     stem_trainable_count = sum(
         parameter.numel()
@@ -2786,6 +3627,115 @@ def _mask_to_image(mask: torch.Tensor) -> Image.Image:
         raise ValueError(f"expected 2D mask, got {array.shape}")
     array = np.clip(array, 0.0, 1.0)
     return Image.fromarray((array * 255.0).astype(np.uint8), mode="L")
+
+
+def _save_seam_adapter_debug_board(
+    output_dir: str,
+    cond_image: torch.Tensor,
+    seam_config: Dict[str, object],
+    controlnet_diagnostics: Optional[Dict[str, object]] = None,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    payload = build_seam_local_adapter_maps_from_conditioning(
+        cond_image.unsqueeze(0),
+        seam_conditioning_offset=int(seam_config.get("seam_adapter_conditioning_offset", -1)),
+        band_px=int(seam_config.get("seam_adapter_band_px", 0)),
+        seam_adapter_per_edge=bool(seam_config.get("seam_adapter_per_edge", False)),
+        seam_adapter_extrusion_mode=str(seam_config.get("seam_adapter_extrusion_mode", "decay")),
+    )
+    adapter_input = payload["adapter_input"][0].detach().float()
+    if adapter_input.ndim == 4:
+        active_mask = payload["active_mask"][0, 0].detach().float()
+        invalid_mask = payload["invalid_active_mask"][0, 0].detach().float()
+        projected_rgb = _tensor_to_image(adapter_input[:3])
+        projected_alpha = _mask_to_image(adapter_input[3])
+        distance_map = _mask_to_image(adapter_input[5])
+        active_overlay = _mask_overlay(projected_rgb.copy(), active_mask, color=(96, 224, 255), alpha=0.40)
+        invalid_overlay = _mask_overlay(projected_rgb.copy(), invalid_mask, color=(255, 96, 96), alpha=0.45)
+
+        tiles = [
+            ("projected_rgb", projected_rgb.convert("RGB")),
+            ("projected_alpha", projected_alpha.convert("RGB")),
+            ("distance_to_seam", distance_map.convert("RGB")),
+            ("active_band", active_overlay.convert("RGB")),
+            ("undefined_edges", invalid_overlay.convert("RGB")),
+        ]
+        tile_size = 256
+        cols = len(tiles)
+        canvas = Image.new("RGB", (cols * tile_size, tile_size), (18, 18, 18))
+        draw = ImageDraw.Draw(canvas)
+        for index, (label, tile) in enumerate(tiles):
+            x = index * tile_size
+            tile = tile.resize((tile_size, tile_size), Image.Resampling.NEAREST)
+            canvas.paste(tile, (x, 0))
+            draw.rectangle((x, 0, x + tile_size - 1, 24), fill=(0, 0, 0))
+            draw.text((x + 6, 5), label, fill=(255, 255, 255))
+        canvas.save(os.path.join(output_dir, "seam_adapter_input_legacy.png"))
+        return
+
+    per_edge_mask = payload["active_mask"][0].detach().float()
+    invalid_mask = payload["invalid_active_mask"][0].detach().float()
+    combined_active_mask = payload["combined_active_mask"][0, 0].detach().float()
+    residual_energy_map = None
+    if controlnet_diagnostics is not None and controlnet_diagnostics.get("seam_adapter_residual_energy_map") is not None:
+        residual_energy_map = controlnet_diagnostics["seam_adapter_residual_energy_map"][0, 0].detach().float()
+
+    tile_size = 256
+    for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+        edge_input = adapter_input[edge_index]
+        projected_rgb = _tensor_to_image(edge_input[:3])
+        projected_alpha = _mask_to_image(edge_input[3])
+        sobel_x_map = _mask_to_image(((edge_input[4] + 1.0) * 0.5).clamp(0.0, 1.0))
+        sobel_y_map = _mask_to_image(((edge_input[5] + 1.0) * 0.5).clamp(0.0, 1.0))
+        distance_map = _mask_to_image(edge_input[6])
+        edge_valid = _mask_to_image(edge_input[7])
+        active_band = _mask_to_image(edge_input[8])
+        undefined_overlay = _mask_overlay(projected_rgb.copy(), invalid_mask[edge_index, 0], color=(255, 96, 96), alpha=0.45)
+
+        tiles = [
+            ("projected_rgb", projected_rgb.convert("RGB")),
+            ("projected_alpha", projected_alpha.convert("RGB")),
+            ("projected_sobel_x", sobel_x_map.convert("RGB")),
+            ("projected_sobel_y", sobel_y_map.convert("RGB")),
+            ("distance_to_seam", distance_map.convert("RGB")),
+            ("active_band_mask", active_band.convert("RGB")),
+            ("edge_valid", edge_valid.convert("RGB")),
+            ("undefined_edge_mask", undefined_overlay.convert("RGB")),
+        ]
+        canvas = Image.new("RGB", (len(tiles) * tile_size, tile_size), (18, 18, 18))
+        draw = ImageDraw.Draw(canvas)
+        for tile_index, (label, tile) in enumerate(tiles):
+            x = tile_index * tile_size
+            tile = tile.resize((tile_size, tile_size), Image.Resampling.NEAREST)
+            canvas.paste(tile, (x, 0))
+            draw.rectangle((x, 0, x + tile_size - 1, 24), fill=(0, 0, 0))
+            draw.text((x + 6, 5), label, fill=(255, 255, 255))
+        canvas.save(os.path.join(output_dir, f"seam_adapter_input_{edge_name}.png"))
+
+    summary_tiles = [
+        ("north_mask", _mask_to_image(per_edge_mask[0, 0]).convert("RGB")),
+        ("south_mask", _mask_to_image(per_edge_mask[1, 0]).convert("RGB")),
+        ("east_mask", _mask_to_image(per_edge_mask[2, 0]).convert("RGB")),
+        ("west_mask", _mask_to_image(per_edge_mask[3, 0]).convert("RGB")),
+        ("combined_active_mask", _mask_to_image(combined_active_mask).convert("RGB")),
+        (
+            "residual_energy_map",
+            _mask_to_image(
+                (residual_energy_map / max(float(residual_energy_map.max().item()), 1e-6)).clamp(0.0, 1.0)
+                if residual_energy_map is not None
+                else torch.zeros_like(combined_active_mask)
+            ).convert("RGB"),
+        ),
+    ]
+    summary = Image.new("RGB", (len(summary_tiles) * tile_size, tile_size), (18, 18, 18))
+    draw = ImageDraw.Draw(summary)
+    for tile_index, (label, tile) in enumerate(summary_tiles):
+        x = tile_index * tile_size
+        tile = tile.resize((tile_size, tile_size), Image.Resampling.NEAREST)
+        summary.paste(tile, (x, 0))
+        draw.rectangle((x, 0, x + tile_size - 1, 24), fill=(0, 0, 0))
+        draw.text((x + 6, 5), label, fill=(255, 255, 255))
+    summary.save(os.path.join(output_dir, "seam_adapter_residual_summary.png"))
 
 
 def _select_debug_sample_indices(sample_count: int, dataset: TerrainSemanticManifestDataset) -> List[int]:
@@ -3311,12 +4261,21 @@ def train(args: argparse.Namespace) -> None:
         else []
     )
     terrain_mask_index_for_baseline = _find_channel_index(dataset.channel_names, "terrain_mask") if alpha_config["enabled"] else 3
+    seam_config["seam_adapter_conditioning_offset"] = len(dataset.channel_names) if seam_config["enabled"] else -1
     control_net = SdxlControlNet(
         conditioning_channels=dataset.full_conditioning_channels if seam_config["enabled"] else len(dataset.channel_names),
         conditioning_pre_embed_channels=[32, 32],
         alpha_head_indices=selected_alpha_head_indices,
         alpha_baseline_mode=alpha_config["baseline_mode"] if alpha_config["enabled"] else "none",
         alpha_baseline_terrain_channel_index=terrain_mask_index_for_baseline,
+        seam_adapter_enabled=seam_config["enabled"] and bool(seam_config.get("seam_adapter_enabled", False)),
+        seam_adapter_band_px=int(seam_config.get("seam_adapter_band_px", 64)),
+        seam_adapter_scale=float(seam_config.get("seam_adapter_scale", 1.0)),
+        seam_adapter_zero_init=bool(seam_config.get("seam_adapter_zero_init", True)),
+        seam_adapter_target=str(seam_config.get("seam_adapter_target", "first_high_res")),
+        seam_adapter_conditioning_offset=int(seam_config.get("seam_adapter_conditioning_offset", -1)),
+        seam_adapter_per_edge=bool(seam_config.get("seam_adapter_per_edge", False)),
+        seam_adapter_extrusion_mode=str(seam_config.get("seam_adapter_extrusion_mode", "decay")),
     )
     if args.controlnet_multiplier is not None:
         control_net.multiplier = float(args.controlnet_multiplier)
@@ -3363,17 +4322,25 @@ def train(args: argparse.Namespace) -> None:
                 + (" ..." if len(skipped_shape_keys) > 8 else "")
             )
 
-        strict_load = not alpha_config["enabled"]
+        strict_load = not alpha_config["enabled"] and not (
+            seam_config["enabled"]
+            and bool(seam_config.get("seam_adapter_enabled", False))
+            and bool(seam_config.get("seam_adapter_per_edge", False))
+        )
         info = control_net.load_state_dict(filtered_state_dict, strict=strict_load)
-        if alpha_config["enabled"]:
-            allowed_prefixes = ("controlnet_alpha_heads", "controlnet_alpha_baseline_heads")
-            if seam_config["enabled"]:
+        if alpha_config["enabled"] or not strict_load:
+            allowed_prefixes: Tuple[str, ...] = tuple()
+            if alpha_config["enabled"]:
+                allowed_prefixes = allowed_prefixes + ("controlnet_alpha_heads", "controlnet_alpha_baseline_heads")
+            if seam_config["enabled"] and alpha_config["enabled"]:
                 allowed_prefixes = allowed_prefixes + ("controlnet_cond_embedding",)
+            if seam_config["enabled"] and seam_config.get("seam_adapter_enabled", False):
+                allowed_prefixes = allowed_prefixes + ("controlnet_seam_adapter",)
             unexpected = [key for key in info.unexpected_keys if not key.startswith(allowed_prefixes)]
             missing = [key for key in info.missing_keys if not key.startswith(allowed_prefixes)]
             if unexpected or missing:
                 raise RuntimeError(
-                    f"unexpected checkpoint mismatch with alpha-enabled ControlNet: missing={missing[:5]} unexpected={unexpected[:5]}"
+                    f"unexpected checkpoint mismatch with ControlNet init: missing={missing[:5]} unexpected={unexpected[:5]}"
                 )
     else:
         control_net.init_from_unet(unet)
@@ -3396,18 +4363,26 @@ def train(args: argparse.Namespace) -> None:
     material_lora_control.requires_grad_(False)
 
     trainable_params = []
+    trainable_prefix = "controlnet_seam_adapter" if args.train_only_seam_adapter else "controlnet_"
     for name, parameter in control_net.named_parameters():
-        if name.startswith("controlnet_"):
+        if name.startswith(trainable_prefix):
             parameter.requires_grad = True
             trainable_params.append(parameter)
-        cond_embedding_params = [
-            parameter for name, parameter in control_net.named_parameters()
-            if parameter.requires_grad and "controlnet_cond_embedding" in name
-        ]
-        other_trainable_params = [
-            parameter for name, parameter in control_net.named_parameters()
-            if parameter.requires_grad and "controlnet_cond_embedding" not in name
-        ]
+
+    cond_embedding_params = [
+        parameter for name, parameter in control_net.named_parameters()
+        if parameter.requires_grad and "controlnet_cond_embedding" in name
+    ]
+    seam_adapter_params = [
+        parameter for name, parameter in control_net.named_parameters()
+        if parameter.requires_grad and "controlnet_seam_adapter" in name
+    ]
+    other_trainable_params = [
+        parameter for name, parameter in control_net.named_parameters()
+        if parameter.requires_grad
+        and "controlnet_cond_embedding" not in name
+        and "controlnet_seam_adapter" not in name
+    ]
 
     assert_trainable_policy(
         unet,
@@ -3417,6 +4392,7 @@ def train(args: argparse.Namespace) -> None:
         control_net,
         material_lora_unet,
         material_lora_control,
+        train_only_seam_adapter=args.train_only_seam_adapter,
     )
     log_trainable_parameter_summary(
         unet,
@@ -3429,17 +4405,22 @@ def train(args: argparse.Namespace) -> None:
     )
 
     cond_lr = args.learning_rate * conditioning_config["cond_embedding_lr_multiplier"]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": cond_embedding_params, "lr": cond_lr},
-            {"params": other_trainable_params, "lr": args.learning_rate},
-        ],
-        betas=(0.9, 0.999),
-        weight_decay=1e-2,
-    )
+    seam_adapter_lr = args.learning_rate * args.seam_adapter_lr_multiplier
+    optimizer_param_groups = []
+    if cond_embedding_params:
+        optimizer_param_groups.append({"params": cond_embedding_params, "lr": cond_lr})
+    if seam_adapter_params:
+        optimizer_param_groups.append({"params": seam_adapter_params, "lr": seam_adapter_lr})
+    if other_trainable_params:
+        optimizer_param_groups.append({"params": other_trainable_params, "lr": args.learning_rate})
+
+    optimizer = torch.optim.AdamW(optimizer_param_groups, betas=(0.9, 0.999), weight_decay=1e-2)
     logger.info(
         f"[optimizer] cond_embedding_lr={cond_lr:.2e} (×{conditioning_config['cond_embedding_lr_multiplier']}) "
-        f"other_lr={args.learning_rate:.2e} cond_params={len(cond_embedding_params)} other_params={len(other_trainable_params)}"
+        f"seam_adapter_lr={seam_adapter_lr:.2e} (×{args.seam_adapter_lr_multiplier}) "
+        f"other_lr={args.learning_rate:.2e} cond_params={len(cond_embedding_params)} "
+        f"seam_adapter_params={len(seam_adapter_params)} other_params={len(other_trainable_params)} "
+        f"train_only_seam_adapter={args.train_only_seam_adapter}"
     )
     verify_optimizer_parameter_membership(optimizer, control_net)
 
@@ -3765,9 +4746,14 @@ def train(args: argparse.Namespace) -> None:
     loss_trace: List[Dict[str, float]] = []
     loss_trace_mode = _normalize_loss_trace_mode(verification_config.get("loss_trace_mode", "full"))
     loss_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
+    seam_adapter_diag_trace: List[Dict[str, float]] = []
+    seam_adapter_diag_path = os.path.join(args.output_dir, "sanity", "seam_adapter_diag.csv")
     if resumed_step > 0 and os.path.exists(loss_trace_path):
         with open(loss_trace_path, "r", newline="", encoding="utf-8") as handle:
             loss_trace = list(csv.DictReader(handle))
+    if resumed_step > 0 and os.path.exists(seam_adapter_diag_path):
+        with open(seam_adapter_diag_path, "r", newline="", encoding="utf-8") as handle:
+            seam_adapter_diag_trace = list(csv.DictReader(handle))
 
     def _append_loss_trace_row_live(row: Dict[str, object]) -> None:
         if not accelerator.is_main_process:
@@ -3783,11 +4769,28 @@ def train(args: argparse.Namespace) -> None:
                 _writer.writerow(row)
         except Exception as _e:
             logger.warning("[sanity/loss] live append failed: %s", _e)
+
+    def _append_seam_adapter_diag_row_live(row: Dict[str, object]) -> None:
+        if not accelerator.is_main_process:
+            return
+        try:
+            sanity_dir = os.path.join(args.output_dir, "sanity")
+            os.makedirs(sanity_dir, exist_ok=True)
+            write_header = (not os.path.exists(seam_adapter_diag_path)) or os.path.getsize(seam_adapter_diag_path) == 0
+            with open(seam_adapter_diag_path, "a", newline="", encoding="utf-8") as _fh:
+                _writer = csv.DictWriter(_fh, fieldnames=list(SEAM_ADAPTER_DIAG_FIELDS), extrasaction="ignore")
+                if write_header:
+                    _writer.writeheader()
+                _writer.writerow(_format_seam_adapter_diag_row(row))
+        except Exception as _e:
+            logger.warning("[sanity/seam_adapter] live append failed: %s", _e)
+
     tiny_overfit_run = bool(
         verification_config["always_log_during_tiny_overfit"]
         and args.max_train_steps <= int(verification_config["tiny_overfit_max_steps"])
     )
     warned_expanded_latent_cache_bypass = False
+    seam_adapter_debug_saved = False
     progress_bar = tqdm(total=args.max_train_steps, initial=global_step, disable=not accelerator.is_local_main_process, desc="steps")
     while global_step < args.max_train_steps:
         for batch in dataloader:
@@ -3907,8 +4910,21 @@ def train(args: argparse.Namespace) -> None:
                 seam_continuation_width_px_value = float(seam_config.get("continuation_width_px", 0.0))
                 seam_continuation_peak_weight_value = float(seam_config.get("continuation_peak_rgb_weight", 0.0))
                 seam_continuation_falloff_power_value = float(seam_config.get("continuation_falloff_power", 2.0))
+                seam_continuation_rgb_weight_mode_value = str(seam_config.get("continuation_rgb_weight_mode", "falloff"))
                 seam_continuation_gradient_loss_weight_value = 0.0
                 seam_continuation_weight_sum_value = 0.0
+                seam_continuation_effective_weight_mean_value = 0.0
+                seam_continuation_effective_weight_max_value = 0.0
+                seam_continuation_weight_fraction_first_8px_value = 0.0
+                seam_continuation_weight_fraction_first_16px_value = 0.0
+                seam_continuation_weight_fraction_first_24px_value = 0.0
+                seam_continuation_weight_fraction_full_band_value = 0.0
+                seam_continuation_rgb_loss_bin_0_8_value = 0.0
+                seam_continuation_rgb_loss_bin_8_16_value = 0.0
+                seam_continuation_rgb_loss_bin_16_24_value = 0.0
+                seam_continuation_rgb_loss_bin_24_32_value = 0.0
+                seam_continuation_rgb_loss_bin_32_40_value = 0.0
+                seam_continuation_rgb_loss_bin_40_48_value = 0.0
                 seam_rgb_margin_inner_loss_value = 0.0
                 seam_rgb_margin_outer_loss_value = 0.0
                 seam_rgb_interior_inner_loss_value = 0.0
@@ -3922,9 +4938,20 @@ def train(args: argparse.Namespace) -> None:
                 seam_rgb_interior_loss_raw_value = 0.0
                 seam_rgb_halo_loss_weighted_value = 0.0
                 seam_rgb_interior_loss_weighted_value = 0.0
+                seam_rgb_halo_inner_loss_raw_value = 0.0
+                seam_rgb_halo_outer_loss_raw_value = 0.0
+                seam_rgb_halo_inner_loss_weighted_value = 0.0
+                seam_rgb_halo_outer_loss_weighted_value = 0.0
                 seam_halo_supervised_px_value = 0.0
                 seam_interior_supervised_px_value = 0.0
                 seam_halo_to_interior_px_ratio_value = 0.0
+                halo_inner_edge_1px_rgb_loss_value = 0.0
+                halo_inner_edge_4px_rgb_loss_value = 0.0
+                halo_inner_8px_rgb_loss_value = 0.0
+                halo_inner_16px_rgb_loss_value = 0.0
+                expanded_halo_copy_diff_mean_value = 0.0
+                expanded_halo_copy_diff_max_value = 0.0
+                seam_halo_gradient_loss_value = 0.0
                 seam_margin_inner_coverage_ratio = 0.0
                 seam_margin_inner_coverage_px = 0.0
                 seam_margin_inner_raw_px = 0.0
@@ -4011,11 +5038,22 @@ def train(args: argparse.Namespace) -> None:
                     schedule=seam_config.get("continuation_gradient_loss_weight_schedule", []),
                     current_step=seam_resume_relative_step,
                 )
+                seam_adapter_log_now = bool(
+                    seam_config["enabled"]
+                    and seam_config.get("seam_adapter_enabled", False)
+                    and (
+                        step_for_logging == 1
+                        or step_for_logging % max(1, args.loss_trace_every) == 0
+                        or step_for_logging == args.max_train_steps
+                        or tiny_overfit_run
+                    )
+                )
                 verification_log_now = verification_config["enabled"] and (
                     step_for_logging == 1
                     or step_for_logging % max(1, int(verification_config["log_every"])) == 0
                     or tiny_overfit_run
                 )
+                request_controlnet_diagnostics = verification_log_now or seam_adapter_log_now
                 if verification_log_now:
                     logger.info(
                         "[train/prompt] step=%d prompt_name=%s prompt='%s' prompt2='%s'",
@@ -4069,12 +5107,12 @@ def train(args: argparse.Namespace) -> None:
                             vector_embedding,
                             model_conditioning_images,
                             return_alpha=True,
-                            return_diagnostics=verification_log_now,
+                            return_diagnostics=request_controlnet_diagnostics,
                             alpha_target_size=tuple(batch_images.shape[-2:]),
                         )
                         controlnet_diagnostics = alpha_outputs.get("diagnostics") if alpha_outputs is not None else None
                     else:
-                        if verification_log_now:
+                        if request_controlnet_diagnostics:
                             input_resi_add, mid_add, controlnet_diagnostics = control_net(
                                 noisy_latents,
                                 timesteps,
@@ -4092,6 +5130,19 @@ def train(args: argparse.Namespace) -> None:
                                 model_conditioning_images,
                             )
                         alpha_outputs = None
+                    if seam_adapter_log_now and not seam_adapter_debug_saved and accelerator.is_main_process:
+                        try:
+                            sanity_dir = os.path.join(args.output_dir, "sanity")
+                            os.makedirs(sanity_dir, exist_ok=True)
+                            _save_seam_adapter_debug_board(
+                                os.path.join(sanity_dir, "seam_adapter_debug"),
+                                model_conditioning_images[0].detach().float(),
+                                seam_config,
+                                controlnet_diagnostics,
+                            )
+                            seam_adapter_debug_saved = True
+                        except Exception as _e:
+                            logger.warning("[sanity/seam_adapter] debug board generation failed: %s", _e)
                     noise_pred = unet(
                         noisy_latents,
                         timesteps,
@@ -4307,69 +5358,192 @@ def train(args: argparse.Namespace) -> None:
                         pred_x0_latents = (noisy_latents - (sqrt_one_minus_alpha_t * noise_pred)) / sqrt_alpha_t
                         pred_x0_latents_for_decode = (pred_x0_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
 
-                        def _decode_seam_rgb(latents: torch.Tensor) -> torch.Tensor:
-                            return vae.decode(latents).sample
-
-                        pred_rgb = activation_checkpoint(
-                            _decode_seam_rgb,
-                            pred_x0_latents_for_decode,
-                            use_reentrant=False,
-                        ).to(dtype=weight_dtype)
-                        target_rgb = batch_images.to(dtype=weight_dtype)
-                        expanded_rgb_mask = seam_supervision_mask.expand(-1, pred_rgb.shape[1], -1, -1)
-                        assert pred_rgb.shape == target_rgb.shape == expanded_rgb_mask.shape, (
-                            f"seam RGB geometry mismatch pred={tuple(pred_rgb.shape)} target={tuple(target_rgb.shape)} mask={tuple(expanded_rgb_mask.shape)}"
-                        )
-                        train_prediction_h = float(pred_rgb.shape[-2])
-                        train_prediction_w = float(pred_rgb.shape[-1])
-                        train_alpha_target_h = float(target_rgb.shape[-2])
-                        train_alpha_target_w = float(target_rgb.shape[-1])
-                        train_supervision_mask_h = float(expanded_rgb_mask.shape[-2])
-                        train_supervision_mask_w = float(expanded_rgb_mask.shape[-1])
-                        train_target_min_x = 0.0
-                        train_target_max_x = float(target_rgb.shape[-1] - 1)
-                        train_target_min_y = 0.0
-                        train_target_max_y = float(target_rgb.shape[-2] - 1)
-                        halo_mask = (seam_maps_supervised["margin_inner"] + seam_maps_supervised["margin_outer"]).clamp(0.0, 1.0)
-                        train_halo_min_x, train_halo_max_x, train_halo_min_y, train_halo_max_y = _mask_bounds(halo_mask)
-                        halo_supervised_px_now = float(halo_mask.sum().detach().item())
-                        if halo_supervised_px_now > 0.0:
-                            if train_halo_min_x < 0.0 or train_halo_max_x > train_target_max_x or train_halo_min_y < 0.0 or train_halo_max_y > train_target_max_y:
-                                raise RuntimeError(
-                                    "seam halo bounds fall outside supervised RGB tensor: "
-                                    + f"target_x=[{train_target_min_x:.1f},{train_target_max_x:.1f}] "
-                                    + f"target_y=[{train_target_min_y:.1f},{train_target_max_y:.1f}] "
-                                    + f"halo_bounds=[x:{train_halo_min_x:.1f}-{train_halo_max_x:.1f},y:{train_halo_min_y:.1f}-{train_halo_max_y:.1f}]"
-                                )
-                        train_geometry_mode = "expanded" if training_expanded_supervision_enabled else "interior"
-                        rgb_l1_map = (pred_rgb.float() - target_rgb.float()).abs().mean(dim=1, keepdim=True)
-
-                        seam_maps = seam_maps_supervised
-
                         region_weights = {
                             "halo_inner": float(seam_config.get("halo_inner_rgb_weight", 2.0)),
                             "halo_outer": float(seam_config.get("halo_outer_rgb_weight", 1.5)),
                             "interior_continuation": float(seam_config.get("continuation_peak_rgb_weight", 2.5)),
                             "interior_core": float(seam_config.get("interior_core_rgb_weight", 0.10)),
                         }
-                        seam_rgb_summary = _summarize_weighted_seam_regions(
-                            error_map=rgb_l1_map,
-                            seam_maps=seam_maps,
+                        def _decode_seam_rgb(latents: torch.Tensor) -> torch.Tensor:
+                            return vae.decode(latents).sample
+
+                        seam_rgb_edge_summaries: List[Dict[str, object]] = []
+                        seam_gradient_raw_sum = noisy_latents.new_tensor(0.0)
+                        seam_gradient_active_px = noisy_latents.new_tensor(0.0)
+                        seam_gradient_weighted_raw_sum = noisy_latents.new_tensor(0.0)
+                        seam_gradient_weight_sum = noisy_latents.new_tensor(0.0)
+                        halo_copy_raw_sum = noisy_latents.new_tensor(0.0)
+                        halo_copy_area = noisy_latents.new_tensor(0.0)
+                        halo_copy_max = noisy_latents.new_tensor(0.0)
+                        halo_inner_1px_raw_sum = noisy_latents.new_tensor(0.0)
+                        halo_inner_1px_area = noisy_latents.new_tensor(0.0)
+                        halo_inner_4px_raw_sum = noisy_latents.new_tensor(0.0)
+                        halo_inner_4px_area = noisy_latents.new_tensor(0.0)
+                        halo_inner_8px_raw_sum = noisy_latents.new_tensor(0.0)
+                        halo_inner_8px_area = noisy_latents.new_tensor(0.0)
+                        halo_inner_16px_raw_sum = noisy_latents.new_tensor(0.0)
+                        halo_inner_16px_area = noisy_latents.new_tensor(0.0)
+                        seam_halo_gradient_raw_sum = noisy_latents.new_tensor(0.0)
+                        seam_halo_gradient_active_px = noisy_latents.new_tensor(0.0)
+                        pred_rgb = None
+                        target_rgb = None
+                        seam_supervision_mask_rgb = None
+                        seam_maps_rgb = None
+                        for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+                            edge_seam_maps = _select_seam_maps_for_edge(seam_maps_supervised, edge_index)
+                            seam_loss_support_terms = []
+                            if region_weights["halo_inner"] > 0.0:
+                                seam_loss_support_terms.append(edge_seam_maps["margin_inner"])
+                            if region_weights["halo_outer"] > 0.0:
+                                seam_loss_support_terms.append(edge_seam_maps["margin_outer"])
+                            if region_weights["interior_continuation"] > 0.0:
+                                seam_loss_support_terms.append(edge_seam_maps["interior_inner"])
+                            if region_weights["interior_core"] > 0.0:
+                                seam_loss_support_terms.append(edge_seam_maps["interior_core"])
+                            if seam_loss_support_terms:
+                                seam_loss_support_mask = torch.stack(seam_loss_support_terms, dim=0).sum(dim=0).clamp(0.0, 1.0)
+                            else:
+                                seam_loss_support_mask = torch.zeros_like(edge_seam_maps["margin_inner"])
+                            if float(seam_loss_support_mask.sum().detach().item()) <= 0.0:
+                                seam_loss_support_mask = (
+                                    edge_seam_maps["margin_inner"]
+                                    + edge_seam_maps["margin_outer"]
+                                    + edge_seam_maps["interior_inner"]
+                                ).clamp(0.0, 1.0)
+                            if float(seam_loss_support_mask.sum().detach().item()) <= 0.0:
+                                continue
+
+                            decode_crop = _compute_seam_decode_crop(
+                                seam_loss_support_mask,
+                                full_height=int(batch_images.shape[-2]),
+                                full_width=int(batch_images.shape[-1]),
+                                latent_height=int(pred_x0_latents_for_decode.shape[-2]),
+                                latent_width=int(pred_x0_latents_for_decode.shape[-1]),
+                                context_px=int(seam_config.get("rgb_decode_context_px", 64)),
+                            )
+                            edge_pred_x0_latents_for_decode = _crop_spatial_tensor(
+                                pred_x0_latents_for_decode,
+                                x0=decode_crop["pixel_x0"] // max(1, int(batch_images.shape[-1] // pred_x0_latents_for_decode.shape[-1])),
+                                x1=decode_crop["pixel_x1"] // max(1, int(batch_images.shape[-1] // pred_x0_latents_for_decode.shape[-1])),
+                                y0=decode_crop["pixel_y0"] // max(1, int(batch_images.shape[-2] // pred_x0_latents_for_decode.shape[-2])),
+                                y1=decode_crop["pixel_y1"] // max(1, int(batch_images.shape[-2] // pred_x0_latents_for_decode.shape[-2])),
+                            )
+                            edge_target_rgb = _crop_spatial_tensor(
+                                batch_images,
+                                x0=decode_crop["pixel_x0"],
+                                x1=decode_crop["pixel_x1"],
+                                y0=decode_crop["pixel_y0"],
+                                y1=decode_crop["pixel_y1"],
+                            ).to(dtype=weight_dtype)
+                            edge_seam_supervision_mask = _crop_spatial_tensor(
+                                seam_supervision_mask,
+                                x0=decode_crop["pixel_x0"],
+                                x1=decode_crop["pixel_x1"],
+                                y0=decode_crop["pixel_y0"],
+                                y1=decode_crop["pixel_y1"],
+                            )
+                            edge_seam_maps = _crop_seam_maps(
+                                edge_seam_maps,
+                                x0=decode_crop["pixel_x0"],
+                                x1=decode_crop["pixel_x1"],
+                                y0=decode_crop["pixel_y0"],
+                                y1=decode_crop["pixel_y1"],
+                                full_height=int(batch_images.shape[-2]),
+                                full_width=int(batch_images.shape[-1]),
+                            )
+
+                            edge_pred_rgb = activation_checkpoint(
+                                _decode_seam_rgb,
+                                edge_pred_x0_latents_for_decode,
+                                use_reentrant=False,
+                            ).to(dtype=weight_dtype)
+                            expanded_rgb_mask = edge_seam_supervision_mask.expand(-1, edge_pred_rgb.shape[1], -1, -1)
+                            assert edge_pred_rgb.shape == edge_target_rgb.shape == expanded_rgb_mask.shape, (
+                                f"seam RGB geometry mismatch edge={edge_name} pred={tuple(edge_pred_rgb.shape)} target={tuple(edge_target_rgb.shape)} mask={tuple(expanded_rgb_mask.shape)}"
+                            )
+                            if pred_rgb is None:
+                                pred_rgb = edge_pred_rgb
+                                target_rgb = edge_target_rgb
+                                seam_supervision_mask_rgb = edge_seam_supervision_mask
+                                seam_maps_rgb = edge_seam_maps
+                                train_prediction_h = float(edge_pred_rgb.shape[-2])
+                                train_prediction_w = float(edge_pred_rgb.shape[-1])
+                                train_alpha_target_h = float(edge_target_rgb.shape[-2])
+                                train_alpha_target_w = float(edge_target_rgb.shape[-1])
+                                train_supervision_mask_h = float(expanded_rgb_mask.shape[-2])
+                                train_supervision_mask_w = float(expanded_rgb_mask.shape[-1])
+
+                            edge_rgb_l1_map = (edge_pred_rgb.float() - edge_target_rgb.float()).abs().mean(dim=1, keepdim=True)
+                            edge_summary = _summarize_weighted_seam_regions(
+                                error_map=edge_rgb_l1_map,
+                                seam_maps=edge_seam_maps,
+                                region_weights=region_weights,
+                                normalize_region_losses=False,
+                                continuation_weighted_mask=edge_seam_maps["continuation_distance_weighted"],
+                                seam_config=seam_config,
+                            )
+                            if edge_summary["region_losses"]:
+                                seam_rgb_edge_summaries.append(edge_summary)
+                                edge_halo_metrics = _compute_edge_halo_copy_metrics(
+                                    edge_rgb_l1_map,
+                                    edge_name=edge_name,
+                                    edge_seam_maps=edge_seam_maps,
+                                    crop_x0=int(decode_crop["pixel_x0"]),
+                                    crop_y0=int(decode_crop["pixel_y0"]),
+                                    full_height=int(batch_images.shape[-2]),
+                                    full_width=int(batch_images.shape[-1]),
+                                    expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                                )
+                                halo_copy_raw_sum = halo_copy_raw_sum + edge_halo_metrics["halo_copy"]["raw_sum"]
+                                halo_copy_area = halo_copy_area + edge_halo_metrics["halo_copy"]["area"]
+                                halo_copy_max = torch.maximum(halo_copy_max, edge_halo_metrics["halo_copy"]["max"])
+                                halo_inner_1px_raw_sum = halo_inner_1px_raw_sum + edge_halo_metrics["halo_inner_1px"]["raw_sum"]
+                                halo_inner_1px_area = halo_inner_1px_area + edge_halo_metrics["halo_inner_1px"]["area"]
+                                halo_inner_4px_raw_sum = halo_inner_4px_raw_sum + edge_halo_metrics["halo_inner_4px"]["raw_sum"]
+                                halo_inner_4px_area = halo_inner_4px_area + edge_halo_metrics["halo_inner_4px"]["area"]
+                                halo_inner_8px_raw_sum = halo_inner_8px_raw_sum + edge_halo_metrics["halo_inner_8px"]["raw_sum"]
+                                halo_inner_8px_area = halo_inner_8px_area + edge_halo_metrics["halo_inner_8px"]["area"]
+                                halo_inner_16px_raw_sum = halo_inner_16px_raw_sum + edge_halo_metrics["halo_inner_16px"]["raw_sum"]
+                                halo_inner_16px_area = halo_inner_16px_area + edge_halo_metrics["halo_inner_16px"]["area"]
+                                edge_gradient_summary = _compute_continuation_gradient_loss(
+                                    pred_rgb=edge_pred_rgb.float(),
+                                    target_rgb=edge_target_rgb.float(),
+                                    continuation_distance_weighted_mask=edge_seam_maps["continuation_distance_weighted"].float(),
+                                    sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
+                                )
+                                seam_gradient_raw_sum = seam_gradient_raw_sum + edge_gradient_summary["raw_sum"]
+                                seam_gradient_active_px = seam_gradient_active_px + edge_gradient_summary["active_px"]
+                                seam_gradient_weighted_raw_sum = seam_gradient_weighted_raw_sum + edge_gradient_summary["weighted_raw_sum"]
+                                seam_gradient_weight_sum = seam_gradient_weight_sum + edge_gradient_summary["weight_sum"]
+                                edge_halo_gradient_summary = _compute_masked_rgb_gradient_loss(
+                                    pred_rgb=edge_pred_rgb.float(),
+                                    target_rgb=edge_target_rgb.float(),
+                                    weight_mask=(edge_seam_maps["margin_inner"] + edge_seam_maps["margin_outer"]).clamp(0.0, 1.0).float(),
+                                    sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
+                                )
+                                seam_halo_gradient_raw_sum = seam_halo_gradient_raw_sum + edge_halo_gradient_summary["raw_sum"]
+                                seam_halo_gradient_active_px = seam_halo_gradient_active_px + edge_halo_gradient_summary["active_px"]
+
+                        halo_mask = (seam_maps_supervised["margin_inner"] + seam_maps_supervised["margin_outer"]).clamp(0.0, 1.0)
+                        train_geometry_mode = "expanded" if training_expanded_supervision_enabled else "interior"
+                        seam_rgb_summary = _aggregate_weighted_seam_summaries(
+                            seam_rgb_edge_summaries,
+                            reference_tensor=noisy_latents,
                             region_weights=region_weights,
-                            normalize_region_losses=False,
-                            continuation_weighted_mask=seam_maps["continuation_distance_weighted"],
+                            continuation_width_px=float(seam_config.get("continuation_width_px", 1.0)),
                         )
                         seam_rgb_region_losses = seam_rgb_summary["region_losses"]
-                        seam_continuation_distance_band_px_count_value = float(
-                            (seam_maps["continuation_distance_weighted"] > 0.0).float().sum().detach().item()
-                        )
-
-                        seam_gradient_summary = _compute_continuation_gradient_loss(
-                            pred_rgb=pred_rgb.float(),
-                            target_rgb=target_rgb.float(),
-                            continuation_distance_weighted_mask=seam_maps["continuation_distance_weighted"].float(),
-                            sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
-                        )
+                        seam_continuation_distance_band_px_count_value = float(seam_rgb_summary["continuation_supervised_px"].detach().item())
+                        seam_gradient_summary = {
+                            "raw_loss": seam_gradient_raw_sum / seam_gradient_active_px.clamp_min(1e-6)
+                            if float(seam_gradient_active_px.detach().item()) > 0.0
+                            else noisy_latents.new_tensor(0.0),
+                            "weighted_loss": seam_gradient_weighted_raw_sum / seam_gradient_weight_sum.clamp_min(1e-6)
+                            if float(seam_gradient_weight_sum.detach().item()) > 0.0
+                            else noisy_latents.new_tensor(0.0),
+                            "active_px": seam_gradient_active_px,
+                            "weight_sum": seam_gradient_weight_sum,
+                        }
                         seam_continuation_gradient_loss_value = float(seam_gradient_summary["weighted_loss"].detach().item())
                         seam_continuation_gradient_loss_raw_value = float(seam_gradient_summary["raw_loss"].detach().item())
 
@@ -4384,14 +5558,58 @@ def train(args: argparse.Namespace) -> None:
                             seam_rgb_interior_loss_raw_value = float(seam_rgb_summary["interior_loss_raw"].detach().item())
                             seam_rgb_halo_loss_weighted_value = float(seam_rgb_summary["halo_loss_weighted"].detach().item())
                             seam_rgb_interior_loss_weighted_value = float(seam_rgb_summary["interior_loss_weighted"].detach().item())
+                            seam_rgb_halo_inner_loss_raw_value = float(
+                                seam_rgb_summary["region_raw_sums"]["halo_inner"].detach().item()
+                            )
+                            seam_rgb_halo_outer_loss_raw_value = float(
+                                seam_rgb_summary["region_raw_sums"]["halo_outer"].detach().item()
+                            )
+                            seam_rgb_halo_inner_loss_weighted_value = float(
+                                seam_rgb_summary["region_weighted_contributions"]["halo_inner"].detach().item()
+                            )
+                            seam_rgb_halo_outer_loss_weighted_value = float(
+                                seam_rgb_summary["region_weighted_contributions"]["halo_outer"].detach().item()
+                            )
                             seam_halo_supervised_px_value = float(seam_rgb_summary["halo_supervised_px"].detach().item())
                             seam_interior_supervised_px_value = float(seam_rgb_summary["interior_supervised_px"].detach().item())
                             seam_rgb_continuation_weighted_loss_value = float(seam_rgb_summary["continuation_loss_weighted"].detach().item())
                             seam_continuation_rgb_loss_raw_value = float(seam_rgb_summary["continuation_loss_raw"].detach().item())
                             seam_continuation_weight_sum_value = float(seam_rgb_summary["continuation_weight_sum"].detach().item())
+                            seam_continuation_rgb_weight_mode_value = str(seam_rgb_summary.get("continuation_rgb_weight_mode", seam_continuation_rgb_weight_mode_value))
+                            seam_continuation_effective_weight_mean_value = float(seam_rgb_summary["continuation_effective_weight_mean"].detach().item())
+                            seam_continuation_effective_weight_max_value = float(seam_rgb_summary["continuation_effective_weight_max"].detach().item())
+                            seam_continuation_weight_fraction_first_8px_value = float(seam_rgb_summary["continuation_weight_fraction_first_8px"].detach().item())
+                            seam_continuation_weight_fraction_first_16px_value = float(seam_rgb_summary["continuation_weight_fraction_first_16px"].detach().item())
+                            seam_continuation_weight_fraction_first_24px_value = float(seam_rgb_summary["continuation_weight_fraction_first_24px"].detach().item())
+                            seam_continuation_weight_fraction_full_band_value = float(seam_rgb_summary["continuation_weight_fraction_full_band"].detach().item())
+                            seam_continuation_rgb_loss_bin_0_8_value = float(seam_rgb_summary["continuation_rgb_loss_bin_0_8"].detach().item())
+                            seam_continuation_rgb_loss_bin_8_16_value = float(seam_rgb_summary["continuation_rgb_loss_bin_8_16"].detach().item())
+                            seam_continuation_rgb_loss_bin_16_24_value = float(seam_rgb_summary["continuation_rgb_loss_bin_16_24"].detach().item())
+                            seam_continuation_rgb_loss_bin_24_32_value = float(seam_rgb_summary["continuation_rgb_loss_bin_24_32"].detach().item())
+                            seam_continuation_rgb_loss_bin_32_40_value = float(seam_rgb_summary["continuation_rgb_loss_bin_32_40"].detach().item())
+                            seam_continuation_rgb_loss_bin_40_48_value = float(seam_rgb_summary["continuation_rgb_loss_bin_40_48"].detach().item())
+                            expanded_halo_copy_diff_mean_value = float(
+                                (halo_copy_raw_sum / halo_copy_area.clamp_min(1e-6)).detach().item()
+                            ) if float(halo_copy_area.detach().item()) > 0.0 else 0.0
+                            expanded_halo_copy_diff_max_value = float(halo_copy_max.detach().item())
+                            halo_inner_edge_1px_rgb_loss_value = float(
+                                (halo_inner_1px_raw_sum / halo_inner_1px_area.clamp_min(1e-6)).detach().item()
+                            ) if float(halo_inner_1px_area.detach().item()) > 0.0 else 0.0
+                            halo_inner_edge_4px_rgb_loss_value = float(
+                                (halo_inner_4px_raw_sum / halo_inner_4px_area.clamp_min(1e-6)).detach().item()
+                            ) if float(halo_inner_4px_area.detach().item()) > 0.0 else 0.0
+                            halo_inner_8px_rgb_loss_value = float(
+                                (halo_inner_8px_raw_sum / halo_inner_8px_area.clamp_min(1e-6)).detach().item()
+                            ) if float(halo_inner_8px_area.detach().item()) > 0.0 else 0.0
+                            halo_inner_16px_rgb_loss_value = float(
+                                (halo_inner_16px_raw_sum / halo_inner_16px_area.clamp_min(1e-6)).detach().item()
+                            ) if float(halo_inner_16px_area.detach().item()) > 0.0 else 0.0
+                            seam_halo_gradient_loss_value = float(
+                                (seam_halo_gradient_raw_sum / seam_halo_gradient_active_px.clamp_min(1e-6)).detach().item()
+                            ) if float(seam_halo_gradient_active_px.detach().item()) > 0.0 else 0.0
                             seam_halo_to_interior_px_ratio_value = seam_halo_supervised_px_value / max(seam_interior_supervised_px_value, 1e-6)
                             halo_area = halo_mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
-                            halo_target_energy = ((target_rgb.float().abs().mean(dim=1, keepdim=True) * halo_mask).sum(dim=(1, 2, 3)) / halo_area).mean()
+                            halo_target_energy = ((batch_images.float().abs().mean(dim=1, keepdim=True) * halo_mask).sum(dim=(1, 2, 3)) / halo_area).mean()
                             seam_halo_target_energy_value = float(halo_target_energy.detach().item())
                             if verification_config.get("enable_seam_diagnostic_guards", False):
                                 min_halo_energy = float(verification_config.get("seam_halo_target_energy_min", 1e-3))
@@ -4411,8 +5629,8 @@ def train(args: argparse.Namespace) -> None:
                                     step=step_for_logging,
                                     pred_rgb=pred_rgb,
                                     target_rgb=target_rgb,
-                                    supervision_mask=seam_supervision_mask,
-                                    seam_maps=seam_maps_supervised,
+                                    supervision_mask=seam_supervision_mask_rgb,
+                                    seam_maps=seam_maps_rgb,
                                 )
 
                         seam_rgb_margin_inner_loss_value = float(
@@ -4919,16 +6137,40 @@ def train(args: argparse.Namespace) -> None:
                             "seam_rgb_interior_outer_loss": seam_rgb_interior_outer_loss_value,
                             "seam_rgb_halo_inner_loss": seam_rgb_halo_inner_loss_value,
                             "seam_rgb_halo_outer_loss": seam_rgb_halo_outer_loss_value,
+                            "seam_rgb_halo_inner_loss_raw": seam_rgb_halo_inner_loss_raw_value,
+                            "seam_rgb_halo_outer_loss_raw": seam_rgb_halo_outer_loss_raw_value,
+                            "seam_rgb_halo_inner_loss_weighted": seam_rgb_halo_inner_loss_weighted_value,
+                            "seam_rgb_halo_outer_loss_weighted": seam_rgb_halo_outer_loss_weighted_value,
                             "seam_rgb_interior_core_loss": seam_rgb_interior_core_loss_value,
                             "seam_rgb_continuation_weighted_loss": seam_rgb_continuation_weighted_loss_value,
+                            "seam_halo_gradient_loss": seam_halo_gradient_loss_value,
+                            "expanded_halo_copy_diff_mean": expanded_halo_copy_diff_mean_value,
+                            "expanded_halo_copy_diff_max": expanded_halo_copy_diff_max_value,
+                            "halo_inner_edge_1px_rgb_loss": halo_inner_edge_1px_rgb_loss_value,
+                            "halo_inner_edge_4px_rgb_loss": halo_inner_edge_4px_rgb_loss_value,
+                            "halo_inner_8px_rgb_loss": halo_inner_8px_rgb_loss_value,
+                            "halo_inner_16px_rgb_loss": halo_inner_16px_rgb_loss_value,
                             "seam_continuation_rgb_loss_raw": seam_continuation_rgb_loss_raw_value,
                             "seam_continuation_gradient_loss": seam_continuation_gradient_loss_value,
                             "seam_continuation_gradient_loss_raw": seam_continuation_gradient_loss_raw_value,
                             "seam_continuation_width_px": seam_continuation_width_px_value,
                             "seam_continuation_peak_weight": seam_continuation_peak_weight_value,
                             "seam_continuation_falloff_power": seam_continuation_falloff_power_value,
+                            "seam_continuation_rgb_weight_mode": seam_continuation_rgb_weight_mode_value,
                             "seam_continuation_gradient_loss_weight": seam_continuation_gradient_loss_weight_value,
                             "seam_continuation_weight_sum": seam_continuation_weight_sum_value,
+                            "seam_continuation_effective_weight_mean": seam_continuation_effective_weight_mean_value,
+                            "seam_continuation_effective_weight_max": seam_continuation_effective_weight_max_value,
+                            "seam_continuation_weight_fraction_first_8px": seam_continuation_weight_fraction_first_8px_value,
+                            "seam_continuation_weight_fraction_first_16px": seam_continuation_weight_fraction_first_16px_value,
+                            "seam_continuation_weight_fraction_first_24px": seam_continuation_weight_fraction_first_24px_value,
+                            "seam_continuation_weight_fraction_full_band": seam_continuation_weight_fraction_full_band_value,
+                            "seam_continuation_rgb_loss_bin_0_8": seam_continuation_rgb_loss_bin_0_8_value,
+                            "seam_continuation_rgb_loss_bin_8_16": seam_continuation_rgb_loss_bin_8_16_value,
+                            "seam_continuation_rgb_loss_bin_16_24": seam_continuation_rgb_loss_bin_16_24_value,
+                            "seam_continuation_rgb_loss_bin_24_32": seam_continuation_rgb_loss_bin_24_32_value,
+                            "seam_continuation_rgb_loss_bin_32_40": seam_continuation_rgb_loss_bin_32_40_value,
+                            "seam_continuation_rgb_loss_bin_40_48": seam_continuation_rgb_loss_bin_40_48_value,
                             "seam_continuation_distance_band_px_count": seam_continuation_distance_band_px_count_value,
                             "seam_rgb_total_loss": seam_rgb_total_loss_value,
                             "seam_edge_recon_score": seam_edge_recon_score,
@@ -5070,6 +6312,11 @@ def train(args: argparse.Namespace) -> None:
                     loss_trace.append(formatted_loss_trace_row)
                     if loss_trace:
                         _append_loss_trace_row_live(loss_trace[-1])
+                    if seam_adapter_log_now and controlnet_diagnostics is not None:
+                        seam_adapter_diag_rows = _build_seam_adapter_diag_rows(global_step, controlnet_diagnostics)
+                        seam_adapter_diag_trace.extend(seam_adapter_diag_rows)
+                        for seam_adapter_diag_row in seam_adapter_diag_rows:
+                            _append_seam_adapter_diag_row_live(seam_adapter_diag_row)
 
                 if verification_log_now:
                     _log_controlnet_diagnostics(global_step, controlnet_diagnostics)
@@ -5144,6 +6391,21 @@ def train(args: argparse.Namespace) -> None:
                                 logger.info("[sanity/loss] checkpoint trace written to %s (%d rows)", _ckpt_trace_path, len(loss_trace))
                             except Exception as _e:
                                 logger.warning("[sanity/loss] failed to write checkpoint trace: %s", _e)
+                        if seam_adapter_diag_trace:
+                            _ckpt_adapter_diag_path = os.path.join(args.output_dir, "sanity", "seam_adapter_diag.csv")
+                            try:
+                                os.makedirs(os.path.join(args.output_dir, "sanity"), exist_ok=True)
+                                with open(_ckpt_adapter_diag_path, "w", newline="", encoding="utf-8") as _fh:
+                                    _w = csv.DictWriter(_fh, fieldnames=list(SEAM_ADAPTER_DIAG_FIELDS), extrasaction="ignore")
+                                    _w.writeheader()
+                                    _w.writerows(seam_adapter_diag_trace)
+                                logger.info(
+                                    "[sanity/seam_adapter] checkpoint trace written to %s (%d rows)",
+                                    _ckpt_adapter_diag_path,
+                                    len(seam_adapter_diag_trace),
+                                )
+                            except Exception as _e:
+                                logger.warning("[sanity/seam_adapter] failed to write checkpoint trace: %s", _e)
 
                 if evaluation_config["enabled"] and global_step in evaluation_config["eval_steps"]:
                     step_label = f"step_{global_step:04d}"
@@ -5275,6 +6537,17 @@ def train(args: argparse.Namespace) -> None:
                 writer.writeheader()
                 writer.writerows(loss_trace)
             logger.info(f"[sanity/loss] wrote trace to {loss_trace_path} ({len(loss_trace)} rows)")
+        if seam_adapter_diag_trace:
+            sanity_dir = os.path.join(args.output_dir, "sanity")
+            os.makedirs(sanity_dir, exist_ok=True)
+            seam_adapter_diag_path = os.path.join(sanity_dir, "seam_adapter_diag.csv")
+            with open(seam_adapter_diag_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(SEAM_ADAPTER_DIAG_FIELDS), extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(seam_adapter_diag_trace)
+            logger.info(
+                f"[sanity/seam_adapter] wrote trace to {seam_adapter_diag_path} ({len(seam_adapter_diag_trace)} rows)"
+            )
 
         save_controlnet_checkpoint(
             accelerator,
