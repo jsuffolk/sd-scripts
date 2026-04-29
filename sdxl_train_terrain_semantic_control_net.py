@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import json
 import os
@@ -92,6 +93,7 @@ COMPACT_SEAM_LOSS_TRACE_FIELDS = (
 
 SEAM_ADAPTER_DIAG_FIELDS = (
     "step",
+    "block_id",
     "edge",
     "enabled",
     "scale",
@@ -107,6 +109,11 @@ SEAM_ADAPTER_DIAG_FIELDS = (
     "undefined_edge_output_energy",
     "combined_output_energy",
     "combined_adapter_to_activation_ratio",
+    "combined_adapter_to_activation_ratio_block0",
+    "combined_adapter_to_activation_ratio_block1",
+    "total_multi_inject_ratio",
+    "residual_energy_block0",
+    "residual_energy_block1",
     "num_active_edges",
     "corner_active_px",
 )
@@ -269,7 +276,15 @@ def load_extended_training_state(
     accelerator: Accelerator,
     ema_decay_enabled: bool,
     control_net_model: Optional[torch.nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> tuple[int, Optional[Dict[str, torch.Tensor]]]:
+    fresh_optimizer_state = copy.deepcopy(optimizer.state_dict()) if optimizer is not None else None
+
+    def _restore_fresh_optimizer_state() -> None:
+        if optimizer is None or fresh_optimizer_state is None:
+            return
+        optimizer.load_state_dict(fresh_optimizer_state)
+
     def _load_checkpoint_state_dict(path: str) -> Dict[str, torch.Tensor]:
         ext = os.path.splitext(path)[1].lower()
         if ext == ".safetensors":
@@ -333,6 +348,8 @@ def load_extended_training_state(
     def _fallback_resume_with_model_only() -> tuple[int, Optional[Dict[str, torch.Tensor]]]:
         if control_net_model is None:
             raise RuntimeError("resume fallback requires control_net_model")
+
+        _restore_fresh_optimizer_state()
 
         model_state_path = _resolve_model_state_path(args.resume)
         if model_state_path is None:
@@ -410,6 +427,8 @@ def load_extended_training_state(
     logger.info(f"[resume] loading training state from {args.resume}")
     try:
         accelerator.load_state(args.resume)
+        if optimizer is not None and control_net_model is not None:
+            verify_optimizer_parameter_membership(optimizer, control_net_model)
     except (RuntimeError, ValueError) as resume_error:
         logger.warning(f"[resume] accelerator.load_state failed: {resume_error}")
         return _fallback_resume_with_model_only()
@@ -621,7 +640,7 @@ def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, objec
 def _format_seam_adapter_diag_row(row: Dict[str, object]) -> Dict[str, object]:
     formatted = {}
     for field in SEAM_ADAPTER_DIAG_FIELDS:
-        default_value = "" if field == "edge" else 0.0
+        default_value = "" if field in {"block_id", "edge"} else 0.0
         formatted[field] = row.get(field, default_value)
     return formatted
 
@@ -646,34 +665,95 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
     enabled = 1.0 if diagnostics.get("seam_adapter_enabled", False) else 0.0
     scale = float(diagnostics.get("seam_adapter_scale", 0.0) or 0.0)
     band_px = float(diagnostics.get("seam_adapter_band_px", 0.0) or 0.0)
-    input_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_input_energy"))
-    sobel_input_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_sobel_input_energy"))
-    output_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_output_energy"))
-    ratio = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_ratio"))
-    active_px = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_active_px"))
     edge_valid = _tensor_edge_values(diagnostics.get("seam_adapter_edge_valid_flags"))
-    invalid_input_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_invalid_input_energy"))
-    invalid_output_energy = _tensor_edge_values(diagnostics.get("seam_adapter_per_edge_invalid_output_energy"))
-
     rows = []
-    for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+    block_diagnostics = diagnostics.get("seam_adapter_block_diagnostics") or {}
+    block_order = diagnostics.get("seam_adapter_injection_block_ids") or list(block_diagnostics.keys())
+
+    if not block_order:
+        block_order = ["block0"]
+        block_diagnostics = {
+            "block0": {
+                "scale": scale,
+                "input_energy": float(diagnostics.get("seam_adapter_input_energy", 0.0) or 0.0),
+                "sobel_input_energy": float(diagnostics.get("seam_adapter_sobel_input_energy", 0.0) or 0.0),
+                "output_energy": float(diagnostics.get("seam_adapter_output_energy", 0.0) or 0.0),
+                "adapter_to_activation_ratio": float(diagnostics.get("seam_adapter_to_activation_ratio", 0.0) or 0.0),
+                "active_px": float(diagnostics.get("seam_adapter_combined_active_px", diagnostics.get("seam_adapter_active_px", 0.0)) or 0.0),
+                "undefined_edge_input_energy": float(diagnostics.get("seam_adapter_undefined_edge_input_energy", 0.0) or 0.0),
+                "undefined_edge_output_energy": float(diagnostics.get("seam_adapter_undefined_edge_output_energy", 0.0) or 0.0),
+                "per_edge_input_energy": diagnostics.get("seam_adapter_per_edge_input_energy"),
+                "per_edge_sobel_input_energy": diagnostics.get("seam_adapter_per_edge_sobel_input_energy"),
+                "per_edge_output_energy": diagnostics.get("seam_adapter_per_edge_output_energy"),
+                "per_edge_ratio": diagnostics.get("seam_adapter_per_edge_ratio"),
+                "per_edge_active_px": diagnostics.get("seam_adapter_per_edge_active_px"),
+                "per_edge_invalid_input_energy": diagnostics.get("seam_adapter_per_edge_invalid_input_energy"),
+                "per_edge_invalid_output_energy": diagnostics.get("seam_adapter_per_edge_invalid_output_energy"),
+            }
+        }
+
+    for block_id in block_order:
+        block_diag = block_diagnostics.get(block_id, {})
+        block_scale = float(block_diag.get("scale", scale) or 0.0)
+        input_energy = _tensor_edge_values(block_diag.get("per_edge_input_energy", diagnostics.get("seam_adapter_per_edge_input_energy")))
+        sobel_input_energy = _tensor_edge_values(
+            block_diag.get("per_edge_sobel_input_energy", diagnostics.get("seam_adapter_per_edge_sobel_input_energy"))
+        )
+        output_energy = _tensor_edge_values(block_diag.get("per_edge_output_energy"))
+        ratio = _tensor_edge_values(block_diag.get("per_edge_ratio"))
+        active_px = _tensor_edge_values(block_diag.get("per_edge_active_px"))
+        invalid_input_energy = _tensor_edge_values(
+            block_diag.get("per_edge_invalid_input_energy", diagnostics.get("seam_adapter_per_edge_invalid_input_energy"))
+        )
+        invalid_output_energy = _tensor_edge_values(block_diag.get("per_edge_invalid_output_energy"))
+
+        for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+            rows.append(
+                _format_seam_adapter_diag_row(
+                    {
+                        "step": float(step),
+                        "block_id": block_id,
+                        "edge": edge_name,
+                        "enabled": enabled,
+                        "scale": block_scale,
+                        "band_px": band_px,
+                        "input_energy": input_energy[edge_index],
+                        "sobel_input_energy": sobel_input_energy[edge_index],
+                        "output_energy": output_energy[edge_index],
+                        "adapter_to_activation_ratio": ratio[edge_index],
+                        "active_px": active_px[edge_index],
+                        "edge_valid": edge_valid[edge_index],
+                        "edge_valid_count": edge_valid[edge_index],
+                        "undefined_edge_input_energy": invalid_input_energy[edge_index],
+                        "undefined_edge_output_energy": invalid_output_energy[edge_index],
+                    }
+                )
+            )
+
         rows.append(
             _format_seam_adapter_diag_row(
                 {
                     "step": float(step),
-                    "edge": edge_name,
+                    "block_id": block_id,
+                    "edge": "combined",
                     "enabled": enabled,
-                    "scale": scale,
+                    "scale": block_scale,
                     "band_px": band_px,
-                    "input_energy": input_energy[edge_index],
-                    "sobel_input_energy": sobel_input_energy[edge_index],
-                    "output_energy": output_energy[edge_index],
-                    "adapter_to_activation_ratio": ratio[edge_index],
-                    "active_px": active_px[edge_index],
-                    "edge_valid": edge_valid[edge_index],
-                    "edge_valid_count": edge_valid[edge_index],
-                    "undefined_edge_input_energy": invalid_input_energy[edge_index],
-                    "undefined_edge_output_energy": invalid_output_energy[edge_index],
+                    "input_energy": float(block_diag.get("input_energy", diagnostics.get("seam_adapter_input_energy", 0.0)) or 0.0),
+                    "sobel_input_energy": float(block_diag.get("sobel_input_energy", diagnostics.get("seam_adapter_sobel_input_energy", 0.0)) or 0.0),
+                    "output_energy": float(block_diag.get("output_energy", 0.0) or 0.0),
+                    "adapter_to_activation_ratio": float(block_diag.get("adapter_to_activation_ratio", 0.0) or 0.0),
+                    "active_px": float(block_diag.get("active_px", 0.0) or 0.0),
+                    "edge_valid": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
+                    "edge_valid_count": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
+                    "undefined_edge_input_energy": float(
+                        block_diag.get("undefined_edge_input_energy", diagnostics.get("seam_adapter_undefined_edge_input_energy", 0.0)) or 0.0
+                    ),
+                    "undefined_edge_output_energy": float(block_diag.get("undefined_edge_output_energy", 0.0) or 0.0),
+                    "combined_output_energy": float(block_diag.get("output_energy", 0.0) or 0.0),
+                    "combined_adapter_to_activation_ratio": float(block_diag.get("adapter_to_activation_ratio", 0.0) or 0.0),
+                    "num_active_edges": float(sum(1.0 for value in edge_valid if value > 0.5)),
+                    "corner_active_px": float(diagnostics.get("seam_adapter_corner_active_px", 0.0) or 0.0),
                 }
             )
         )
@@ -682,20 +762,27 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
         _format_seam_adapter_diag_row(
             {
                 "step": float(step),
+                "block_id": "overall",
                 "edge": "combined",
                 "enabled": enabled,
                 "scale": scale,
                 "band_px": band_px,
+                "input_energy": float(diagnostics.get("seam_adapter_input_energy", 0.0) or 0.0),
                 "sobel_input_energy": float(diagnostics.get("seam_adapter_sobel_input_energy", 0.0) or 0.0),
-                "output_energy": float(diagnostics.get("seam_adapter_output_energy", 0.0) or 0.0),
-                "adapter_to_activation_ratio": float(diagnostics.get("seam_adapter_to_activation_ratio", 0.0) or 0.0),
+                "output_energy": float(sum(float(block_diagnostics.get(block_id, {}).get("output_energy", 0.0) or 0.0) for block_id in block_order)),
+                "adapter_to_activation_ratio": float(diagnostics.get("total_multi_inject_ratio", diagnostics.get("seam_adapter_to_activation_ratio", 0.0)) or 0.0),
                 "active_px": float(diagnostics.get("seam_adapter_combined_active_px", diagnostics.get("seam_adapter_active_px", 0.0)) or 0.0),
                 "edge_valid": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
                 "edge_valid_count": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
                 "undefined_edge_input_energy": float(diagnostics.get("seam_adapter_undefined_edge_input_energy", 0.0) or 0.0),
                 "undefined_edge_output_energy": float(diagnostics.get("seam_adapter_undefined_edge_output_energy", 0.0) or 0.0),
-                "combined_output_energy": float(diagnostics.get("seam_adapter_output_energy", 0.0) or 0.0),
-                "combined_adapter_to_activation_ratio": float(diagnostics.get("seam_adapter_to_activation_ratio", 0.0) or 0.0),
+                "combined_output_energy": float(sum(float(block_diagnostics.get(block_id, {}).get("output_energy", 0.0) or 0.0) for block_id in block_order)),
+                "combined_adapter_to_activation_ratio": float(diagnostics.get("total_multi_inject_ratio", diagnostics.get("seam_adapter_to_activation_ratio", 0.0)) or 0.0),
+                "combined_adapter_to_activation_ratio_block0": float(diagnostics.get("combined_adapter_to_activation_ratio_block0", 0.0) or 0.0),
+                "combined_adapter_to_activation_ratio_block1": float(diagnostics.get("combined_adapter_to_activation_ratio_block1", 0.0) or 0.0),
+                "total_multi_inject_ratio": float(diagnostics.get("total_multi_inject_ratio", diagnostics.get("seam_adapter_to_activation_ratio", 0.0)) or 0.0),
+                "residual_energy_block0": float(diagnostics.get("residual_energy_block0", diagnostics.get("seam_adapter_output_energy", 0.0)) or 0.0),
+                "residual_energy_block1": float(diagnostics.get("residual_energy_block1", 0.0) or 0.0),
                 "num_active_edges": float(sum(1.0 for value in edge_valid if value > 0.5)),
                 "corner_active_px": float(diagnostics.get("seam_adapter_corner_active_px", 0.0) or 0.0),
             }
@@ -1136,6 +1223,39 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
     gradient_loss_sobel_radius_px = _get_int(["gradient_loss_sobel_radius_px"], 1)
     seam_adapter_per_edge = bool(seam.get("seam_adapter_per_edge", False))
     seam_adapter_extrusion_mode = str(seam.get("seam_adapter_extrusion_mode", "decay") or "decay").strip().lower()
+    seam_adapter_target = str(seam.get("seam_adapter_target", "first_high_res") or "first_high_res").strip().lower()
+    seam_adapter_multi_inject = bool(seam.get("seam_adapter_multi_inject", False))
+    raw_injection_blocks = seam.get("seam_adapter_injection_blocks", ["first_high_res"])
+    if isinstance(raw_injection_blocks, str):
+        seam_adapter_injection_blocks = [raw_injection_blocks.strip().lower()] if raw_injection_blocks.strip() else []
+    elif isinstance(raw_injection_blocks, (list, tuple)):
+        seam_adapter_injection_blocks = [str(block).strip().lower() for block in raw_injection_blocks if str(block).strip()]
+    else:
+        raise ValueError("seam_adapter_injection_blocks must be a string or list of strings")
+
+    seam_adapter_multi_inject_mode = str(
+        seam.get("seam_adapter_multi_inject_mode", "shared_trunk_per_block_heads") or "shared_trunk_per_block_heads"
+    ).strip().lower()
+    if seam_adapter_multi_inject_mode not in {"shared_residual", "shared_trunk_per_block_heads"}:
+        raise ValueError(
+            f"unsupported seam_adapter_multi_inject_mode='{seam_adapter_multi_inject_mode}'"
+        )
+    if seam_adapter_multi_inject:
+        allowed_multi_blocks = {"first_high_res", "second_high_res"}
+        if not seam_adapter_injection_blocks:
+            raise ValueError("seam_adapter_injection_blocks must not be empty when seam_adapter_multi_inject=true")
+        if len(set(seam_adapter_injection_blocks)) != len(seam_adapter_injection_blocks):
+            raise ValueError("seam_adapter_injection_blocks contains duplicates")
+        invalid_blocks = [block for block in seam_adapter_injection_blocks if block not in allowed_multi_blocks]
+        if invalid_blocks:
+            raise ValueError(
+                "this seam adapter escalation only supports first_high_res and second_high_res blocks; got "
+                + ", ".join(invalid_blocks)
+            )
+        if len(seam_adapter_injection_blocks) > 2:
+            raise ValueError("this seam adapter escalation supports at most two injection blocks")
+    else:
+        seam_adapter_injection_blocks = [seam_adapter_target]
     continuation_rgb_weight_mode_raw = str(seam.get("continuation_rgb_weight_mode", "") or "").strip().lower()
     if continuation_rgb_weight_mode_raw:
         continuation_rgb_weight_mode = continuation_rgb_weight_mode_raw
@@ -1196,7 +1316,12 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "seam_adapter_band_px": int(seam.get("seam_adapter_band_px", continuation_width_px)),
         "seam_adapter_scale": float(seam.get("seam_adapter_scale", 1.0)),
         "seam_adapter_zero_init": bool(seam.get("seam_adapter_zero_init", True)),
-        "seam_adapter_target": str(seam.get("seam_adapter_target", "first_high_res")).strip().lower(),
+        "seam_adapter_target": seam_adapter_target,
+        "seam_adapter_multi_inject": bool(seam.get("seam_adapter_multi_inject", False)),
+        "seam_adapter_injection_blocks": seam_adapter_injection_blocks,
+        "seam_adapter_scale_block0": float(seam.get("seam_adapter_scale_block0", 1.0)),
+        "seam_adapter_scale_block1": float(seam.get("seam_adapter_scale_block1", 0.5)),
+        "seam_adapter_multi_inject_mode": seam_adapter_multi_inject_mode,
         "seam_adapter_per_edge": seam_adapter_per_edge,
         "seam_adapter_extrusion_mode": seam_adapter_extrusion_mode,
         "seam_adapter_inputs": seam_adapter_inputs,
@@ -2901,6 +3026,7 @@ def _collect_module_param_counts(named_parameters) -> Tuple[int, int, Dict[str, 
 def _collect_trainable_module_stats(control_net: torch.nn.Module) -> Dict[str, Dict[str, float]]:
     stats = {
         "semantic_pre_stem": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
+        "seam_adapter": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_residual_blocks": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_mid_block": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "alpha_heads": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
@@ -2916,6 +3042,8 @@ def _collect_trainable_module_stats(control_net: torch.nn.Module) -> Dict[str, D
             bucket = "control_mid_block"
         elif "controlnet_alpha_heads" in name or "controlnet_alpha_baseline_heads" in name:
             bucket = "alpha_heads"
+        elif "controlnet_seam_adapter" in name:
+            bucket = "seam_adapter"
         elif "controlnet_cond_embedding" in name:
             bucket = "semantic_pre_stem"
         else:
@@ -2933,6 +3061,7 @@ def _collect_trainable_module_stats(control_net: torch.nn.Module) -> Dict[str, D
 def _collect_trainable_grad_stats(control_net: torch.nn.Module) -> Dict[str, Dict[str, float]]:
     stats = {
         "semantic_pre_stem": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
+        "seam_adapter": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_residual_blocks": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_mid_block": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "alpha_heads": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
@@ -2948,6 +3077,8 @@ def _collect_trainable_grad_stats(control_net: torch.nn.Module) -> Dict[str, Dic
             bucket = "control_mid_block"
         elif "controlnet_alpha_heads" in name or "controlnet_alpha_baseline_heads" in name:
             bucket = "alpha_heads"
+        elif "controlnet_seam_adapter" in name:
+            bucket = "seam_adapter"
         elif "controlnet_cond_embedding" in name:
             bucket = "semantic_pre_stem"
         else:
@@ -3737,6 +3868,48 @@ def _save_seam_adapter_debug_board(
         draw.text((x + 6, 5), label, fill=(255, 255, 255))
     summary.save(os.path.join(output_dir, "seam_adapter_residual_summary.png"))
 
+    block_diagnostics = (controlnet_diagnostics or {}).get("seam_adapter_block_diagnostics") or {}
+    if block_diagnostics:
+        def _extract_debug_map(value: Optional[torch.Tensor], default: torch.Tensor) -> torch.Tensor:
+            if value is None:
+                return torch.zeros_like(default)
+            tensor = value.detach().float()
+            while tensor.ndim > 2:
+                tensor = tensor[0]
+            if tensor.ndim != 2:
+                return torch.zeros_like(default)
+            return tensor
+
+        def _normalized_debug_map(value: Optional[torch.Tensor], default: torch.Tensor) -> torch.Tensor:
+            tensor = _extract_debug_map(value, default)
+            peak = max(float(tensor.max().item()), 1e-6)
+            return (tensor / peak).clamp(0.0, 1.0)
+
+        block0_diag = block_diagnostics.get("block0", {})
+        block1_diag = block_diagnostics.get("block1", {})
+        block0_mask = _extract_debug_map(block0_diag.get("combined_active_mask"), combined_active_mask)
+        block1_mask = _extract_debug_map(block1_diag.get("combined_active_mask"), combined_active_mask)
+        block0_invalid = _extract_debug_map(block0_diag.get("combined_invalid_mask"), combined_active_mask)
+        block1_invalid = _extract_debug_map(block1_diag.get("combined_invalid_mask"), combined_active_mask)
+
+        multi_tiles = [
+            ("block0_residual", _mask_to_image(_normalized_debug_map(block0_diag.get("residual_energy_map"), combined_active_mask)).convert("RGB")),
+            ("block1_residual", _mask_to_image(_normalized_debug_map(block1_diag.get("residual_energy_map"), combined_active_mask)).convert("RGB")),
+            ("block0_mask", _mask_to_image(block0_mask).convert("RGB")),
+            ("block1_mask", _mask_to_image(block1_mask).convert("RGB")),
+            ("block0_undefined", _mask_to_image(block0_invalid).convert("RGB")),
+            ("block1_undefined", _mask_to_image(block1_invalid).convert("RGB")),
+        ]
+        multi_summary = Image.new("RGB", (len(multi_tiles) * tile_size, tile_size), (18, 18, 18))
+        draw = ImageDraw.Draw(multi_summary)
+        for tile_index, (label, tile) in enumerate(multi_tiles):
+            x = tile_index * tile_size
+            tile = tile.resize((tile_size, tile_size), Image.Resampling.NEAREST)
+            multi_summary.paste(tile, (x, 0))
+            draw.rectangle((x, 0, x + tile_size - 1, 24), fill=(0, 0, 0))
+            draw.text((x + 6, 5), label, fill=(255, 255, 255))
+        multi_summary.save(os.path.join(output_dir, "seam_adapter_multi_inject_summary.png"))
+
 
 def _select_debug_sample_indices(sample_count: int, dataset: TerrainSemanticManifestDataset) -> List[int]:
     indices = list(range(min(sample_count, len(dataset))))
@@ -4273,6 +4446,11 @@ def train(args: argparse.Namespace) -> None:
         seam_adapter_scale=float(seam_config.get("seam_adapter_scale", 1.0)),
         seam_adapter_zero_init=bool(seam_config.get("seam_adapter_zero_init", True)),
         seam_adapter_target=str(seam_config.get("seam_adapter_target", "first_high_res")),
+        seam_adapter_multi_inject=bool(seam_config.get("seam_adapter_multi_inject", False)),
+        seam_adapter_injection_blocks=list(seam_config.get("seam_adapter_injection_blocks", ["first_high_res"])),
+        seam_adapter_scale_block0=float(seam_config.get("seam_adapter_scale_block0", 1.0)),
+        seam_adapter_scale_block1=float(seam_config.get("seam_adapter_scale_block1", 0.5)),
+        seam_adapter_multi_inject_mode=str(seam_config.get("seam_adapter_multi_inject_mode", "shared_trunk_per_block_heads")),
         seam_adapter_conditioning_offset=int(seam_config.get("seam_adapter_conditioning_offset", -1)),
         seam_adapter_per_edge=bool(seam_config.get("seam_adapter_per_edge", False)),
         seam_adapter_extrusion_mode=str(seam_config.get("seam_adapter_extrusion_mode", "decay")),
@@ -4615,6 +4793,7 @@ def train(args: argparse.Namespace) -> None:
         accelerator,
         use_ema,
         control_net_model=unwrap_model(accelerator, control_net),
+        optimizer=optimizer,
     )
     if resumed_ema_state is not None:
         ema_state = resumed_ema_state

@@ -28,6 +28,13 @@ SEAM_EDGE_SLICES = {
 SEAM_EDGE_ORDER = tuple(SEAM_EDGE_SLICES.keys())
 SEAM_ADAPTER_LEGACY_INPUT_CHANNELS = 6
 SEAM_ADAPTER_PER_EDGE_INPUT_CHANNELS = 9
+SEAM_ADAPTER_BLOCK_INDEX_BY_NAME = {
+    "input_conv": 0,
+    "pre_stem": 0,
+    "first_high_res": 1,
+    "second_high_res": 2,
+}
+SEAM_ADAPTER_MULTI_INJECT_MODES = {"shared_residual", "shared_trunk_per_block_heads"}
 
 _SEAM_SOBEL_X_KERNEL = torch.tensor(
     [[-0.25, 0.0, 0.25], [-0.5, 0.0, 0.5], [-0.25, 0.0, 0.25]], dtype=torch.float32
@@ -41,6 +48,48 @@ def _zero_module(module: nn.Module) -> None:
     for name, parameter in module.named_parameters(recurse=False):
         if parameter is not None and (name.endswith("weight") or name.endswith("bias")):
             nn.init.zeros_(parameter)
+
+
+def _normalize_seam_adapter_block_name(block_name: str) -> str:
+    normalized = str(block_name or "first_high_res").strip().lower()
+    if normalized not in SEAM_ADAPTER_BLOCK_INDEX_BY_NAME:
+        raise ValueError(f"unsupported seam adapter injection block '{block_name}'")
+    return normalized
+
+
+def _resolve_seam_adapter_injection_plan(
+    seam_adapter_target: str,
+    seam_adapter_multi_inject: bool,
+    seam_adapter_injection_blocks: Optional[list[str]],
+    seam_adapter_scale_block0: float,
+    seam_adapter_scale_block1: float,
+) -> List[SimpleNamespace]:
+    if seam_adapter_multi_inject:
+        requested_blocks = list(seam_adapter_injection_blocks or ["first_high_res", "second_high_res"])
+        if not requested_blocks:
+            raise ValueError("seam_adapter_injection_blocks must contain at least one block when multi-inject is enabled")
+        if len(requested_blocks) > 2:
+            raise ValueError("this seam adapter escalation supports at most two injection blocks")
+    else:
+        requested_blocks = [seam_adapter_target or "first_high_res"]
+
+    relative_scales = [1.0] if not seam_adapter_multi_inject else [float(seam_adapter_scale_block0), float(seam_adapter_scale_block1)]
+    seen = set()
+    plan: List[SimpleNamespace] = []
+    for injection_index, block_name in enumerate(requested_blocks):
+        normalized_name = _normalize_seam_adapter_block_name(block_name)
+        if normalized_name in seen:
+            raise ValueError(f"duplicate seam adapter injection block '{normalized_name}'")
+        seen.add(normalized_name)
+        plan.append(
+            SimpleNamespace(
+                block_id=f"block{injection_index}",
+                block_name=normalized_name,
+                block_index=int(SEAM_ADAPTER_BLOCK_INDEX_BY_NAME[normalized_name]),
+                relative_scale=float(relative_scales[min(injection_index, len(relative_scales) - 1)]),
+            )
+        )
+    return plan
 
 
 def _edge_distance_fraction(edge_name: str, height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -147,7 +196,7 @@ def _build_legacy_seam_local_adapter_maps_from_conditioning(
 
     seam_visible = cond_image[:, seam_conditioning_offset : seam_conditioning_offset + 16]
     edge_flag_maps = cond_image[:, seam_conditioning_offset + 16 : seam_conditioning_offset + 20]
-    edge_valid = (edge_flag_maps.mean(dim=(2, 3)) > 0.5).to(dtype=dtype)
+    edge_valid = (edge_flag_maps.amax(dim=(2, 3)) > 0.5).to(dtype=dtype)
 
     edge_bounds = {
         edge_name: _edge_support_bounds(seam_visible[:, start_channel:end_channel])
@@ -528,7 +577,7 @@ def _build_per_edge_seam_local_adapter_maps_from_conditioning(
 
     seam_visible = cond_image[:, seam_conditioning_offset : seam_conditioning_offset + 16]
     edge_flag_maps = cond_image[:, seam_conditioning_offset + 16 : seam_conditioning_offset + 20]
-    edge_valid = (edge_flag_maps.mean(dim=(2, 3)) > 0.5).to(dtype=dtype)
+    edge_valid = (edge_flag_maps.amax(dim=(2, 3)) > 0.5).to(dtype=dtype)
     edge_bounds = {
         edge_name: _edge_support_bounds(seam_visible[:, start_channel:end_channel])
         for edge_name, (start_channel, end_channel) in SEAM_EDGE_SLICES.items()
@@ -692,6 +741,11 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         seam_adapter_scale: float = 1.0,
         seam_adapter_zero_init: bool = True,
         seam_adapter_target: str = "first_high_res",
+        seam_adapter_multi_inject: bool = False,
+        seam_adapter_injection_blocks: Optional[list[str]] = None,
+        seam_adapter_scale_block0: float = 1.0,
+        seam_adapter_scale_block1: float = 0.5,
+        seam_adapter_multi_inject_mode: str = "shared_trunk_per_block_heads",
         seam_adapter_conditioning_offset: int = -1,
         seam_adapter_per_edge: bool = False,
         seam_adapter_extrusion_mode: str = "decay",
@@ -705,11 +759,30 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         self.seam_adapter_enabled = bool(seam_adapter_enabled)
         self.seam_adapter_band_px = int(seam_adapter_band_px)
         self.seam_adapter_scale = float(seam_adapter_scale)
-        self.seam_adapter_target = str(seam_adapter_target)
+        self.seam_adapter_target = _normalize_seam_adapter_block_name(seam_adapter_target)
+        self.seam_adapter_multi_inject = bool(seam_adapter_multi_inject)
+        self.seam_adapter_scale_block0 = float(seam_adapter_scale_block0)
+        self.seam_adapter_scale_block1 = float(seam_adapter_scale_block1)
+        self.seam_adapter_multi_inject_mode = str(seam_adapter_multi_inject_mode or "shared_trunk_per_block_heads").strip().lower()
+        if self.seam_adapter_multi_inject_mode not in SEAM_ADAPTER_MULTI_INJECT_MODES:
+            raise ValueError(
+                f"unsupported seam_adapter_multi_inject_mode='{seam_adapter_multi_inject_mode}'"
+            )
         self.seam_adapter_conditioning_offset = int(seam_adapter_conditioning_offset)
         self.seam_adapter_per_edge = bool(seam_adapter_per_edge)
         self.seam_adapter_extrusion_mode = str(seam_adapter_extrusion_mode or "decay").strip().lower()
-        self.seam_adapter_block_index = 1 if self.seam_adapter_target == "first_high_res" else 0
+        self.seam_adapter_injection_blocks = [
+            _normalize_seam_adapter_block_name(block_name)
+            for block_name in (list(seam_adapter_injection_blocks or []) if seam_adapter_injection_blocks is not None else [])
+        ]
+        self.seam_adapter_injection_plan = _resolve_seam_adapter_injection_plan(
+            seam_adapter_target=self.seam_adapter_target,
+            seam_adapter_multi_inject=self.seam_adapter_multi_inject,
+            seam_adapter_injection_blocks=self.seam_adapter_injection_blocks,
+            seam_adapter_scale_block0=self.seam_adapter_scale_block0,
+            seam_adapter_scale_block1=self.seam_adapter_scale_block1,
+        )
+        self.seam_adapter_block_index = int(self.seam_adapter_injection_plan[0].block_index)
 
         # remove unet layers
         self.output_blocks = nn.ModuleList([])
@@ -732,6 +805,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         nn.init.zeros_(self.controlnet_mid_block.bias)  # zero module bias
 
         self.controlnet_seam_adapter = None
+        self.controlnet_seam_adapter_block_heads = nn.ModuleDict()
         if self.seam_adapter_enabled:
             self.controlnet_seam_adapter = SeamLocalHiResAdapter(
                 in_channels=(SEAM_ADAPTER_PER_EDGE_INPUT_CHANNELS if self.seam_adapter_per_edge else SEAM_ADAPTER_LEGACY_INPUT_CHANNELS),
@@ -739,6 +813,15 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                 out_channels=320,
                 zero_init=bool(seam_adapter_zero_init),
             )
+            if self.seam_adapter_multi_inject and self.seam_adapter_multi_inject_mode == "shared_trunk_per_block_heads":
+                # Keep per-block heads symmetric across all injection sites.
+                # Without a head on the primary block, block1 can wake up through its
+                # own bias while block0 remains pinned behind the zero-init trunk.
+                for block_spec in self.seam_adapter_injection_plan:
+                    block_dim = dims[block_spec.block_index]
+                    block_head = nn.Conv2d(320, block_dim, kernel_size=1)
+                    _zero_module(block_head)
+                    self.controlnet_seam_adapter_block_heads[str(block_spec.block_index)] = block_head
 
         self.controlnet_alpha_heads = nn.ModuleDict()
         for index in self.alpha_head_indices:
@@ -838,6 +921,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         seam_per_edge_ratio = None
         seam_corner_active_px = 0.0
         seam_residual_energy_map = None
+        seam_block_diagnostics: Dict[str, Dict[str, object]] = {}
         seam_input_energy = 0.0
         seam_output_energy = 0.0
         seam_invalid_input_energy = 0.0
@@ -887,64 +971,248 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
             seam_input_energy = float(seam_adapter_maps.detach().float().norm().item())
             seam_invalid_input_energy = float((seam_adapter_maps.detach().float() * seam_invalid_mask.detach().float()).norm().item())
 
+        seam_injection_specs_by_index = {
+            int(block_spec.block_index): block_spec for block_spec in self.seam_adapter_injection_plan
+        }
+        seam_primary_block_id = self.seam_adapter_injection_plan[0].block_id if self.seam_adapter_injection_plan else "block0"
+        seam_prepared_cache: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+
+        def _prepare_seam_residual_inputs(current_h: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
+            if seam_adapter_maps is None or seam_adapter_mask is None:
+                return None
+
+            spatial_key = tuple(int(size) for size in current_h.shape[-2:])
+            if spatial_key in seam_prepared_cache:
+                return seam_prepared_cache[spatial_key]
+
+            prepared: Dict[str, torch.Tensor] = {}
+            if seam_adapter_maps.ndim == 5:
+                batch_size, edge_count, channels, map_h, map_w = seam_adapter_maps.shape
+                flat_maps = seam_adapter_maps.reshape(batch_size * edge_count, channels, map_h, map_w)
+                if flat_maps.shape[-2:] != current_h.shape[-2:]:
+                    flat_maps = F.interpolate(flat_maps, size=current_h.shape[-2:], mode="bilinear", align_corners=False)
+
+                flat_mask = seam_adapter_mask.reshape(batch_size * edge_count, 1, seam_adapter_mask.shape[-2], seam_adapter_mask.shape[-1])
+                if flat_mask.shape[-2:] != current_h.shape[-2:]:
+                    flat_mask = F.interpolate(flat_mask, size=current_h.shape[-2:], mode="nearest")
+
+                flat_invalid = None
+                if seam_invalid_mask is not None:
+                    flat_invalid = seam_invalid_mask.reshape(
+                        batch_size * edge_count,
+                        1,
+                        seam_invalid_mask.shape[-2],
+                        seam_invalid_mask.shape[-1],
+                    )
+                    if flat_invalid.shape[-2:] != current_h.shape[-2:]:
+                        flat_invalid = F.interpolate(flat_invalid, size=current_h.shape[-2:], mode="nearest")
+
+                prepared["batch_size"] = torch.tensor(batch_size, device=current_h.device)
+                prepared["edge_count"] = torch.tensor(edge_count, device=current_h.device)
+                prepared["edge_residual_base"] = self.controlnet_seam_adapter(flat_maps).view(
+                    batch_size,
+                    edge_count,
+                    -1,
+                    current_h.shape[-2],
+                    current_h.shape[-1],
+                )
+                prepared["edge_mask"] = flat_mask.view(batch_size, edge_count, 1, current_h.shape[-2], current_h.shape[-1])
+                if flat_invalid is not None:
+                    prepared["edge_invalid_mask"] = flat_invalid.view(
+                        batch_size,
+                        edge_count,
+                        1,
+                        current_h.shape[-2],
+                        current_h.shape[-1],
+                    )
+            else:
+                prepared_maps = seam_adapter_maps
+                prepared_mask = seam_adapter_mask
+                prepared_invalid = seam_invalid_mask
+                if prepared_maps.shape[-2:] != current_h.shape[-2:]:
+                    prepared_maps = F.interpolate(prepared_maps, size=current_h.shape[-2:], mode="bilinear", align_corners=False)
+                if prepared_mask.shape[-2:] != current_h.shape[-2:]:
+                    prepared_mask = F.interpolate(prepared_mask, size=current_h.shape[-2:], mode="nearest")
+                if prepared_invalid is not None and prepared_invalid.shape[-2:] != current_h.shape[-2:]:
+                    prepared_invalid = F.interpolate(prepared_invalid, size=current_h.shape[-2:], mode="nearest")
+                prepared["residual_base"] = self.controlnet_seam_adapter(prepared_maps)
+                prepared["mask"] = prepared_mask
+                if prepared_invalid is not None:
+                    prepared["invalid_mask"] = prepared_invalid
+
+            seam_prepared_cache[spatial_key] = prepared
+            return prepared
+
+        def _apply_seam_adapter_block(current_h: torch.Tensor, block_spec: SimpleNamespace) -> Optional[Dict[str, object]]:
+            prepared = _prepare_seam_residual_inputs(current_h)
+            if prepared is None:
+                return None
+
+            block_scale = float(self.seam_adapter_scale * block_spec.relative_scale)
+            block_head_key = str(block_spec.block_index)
+            block_head = self.controlnet_seam_adapter_block_heads[block_head_key] if block_head_key in self.controlnet_seam_adapter_block_heads else None
+            activation_norm = float(current_h.detach().float().norm().item())
+
+            if "edge_residual_base" in prepared:
+                edge_residual = prepared["edge_residual_base"]
+                batch_size = int(prepared["batch_size"].item())
+                edge_count = int(prepared["edge_count"].item())
+                if block_head is not None:
+                    projected = block_head(edge_residual.view(batch_size * edge_count, edge_residual.shape[2], edge_residual.shape[3], edge_residual.shape[4]))
+                    edge_residual = projected.view(batch_size, edge_count, projected.shape[1], projected.shape[2], projected.shape[3])
+
+                edge_mask = prepared["edge_mask"]
+                masked_residual = edge_residual * edge_mask * block_scale
+                per_edge_output_energy = masked_residual.detach().float().reshape(batch_size, edge_count, -1).norm(dim=2)
+                per_edge_active_px = edge_mask.detach().float().sum(dim=(2, 3, 4))
+                mask_sum = edge_mask.sum(dim=1).clamp_min(1.0)
+                adapter_residual = masked_residual.sum(dim=1) / mask_sum
+                combined_mask = edge_mask.sum(dim=1).clamp(0.0, 1.0)
+                combined_invalid_mask = torch.zeros_like(combined_mask)
+                per_edge_invalid_output_energy = None
+                if "edge_invalid_mask" in prepared:
+                    edge_invalid_mask = prepared["edge_invalid_mask"]
+                    combined_invalid_mask = edge_invalid_mask.sum(dim=1).clamp(0.0, 1.0)
+                    per_edge_invalid_output_energy = (
+                        (masked_residual.detach().float() * edge_invalid_mask.detach().float()).reshape(batch_size, edge_count, -1).norm(dim=2)
+                    )
+            else:
+                adapter_residual = prepared["residual_base"]
+                if block_head is not None:
+                    adapter_residual = block_head(adapter_residual)
+                combined_mask = prepared["mask"]
+                combined_invalid_mask = prepared.get("invalid_mask", torch.zeros_like(combined_mask))
+                adapter_residual = adapter_residual * combined_mask * block_scale
+                per_edge_output_energy = None
+                per_edge_active_px = None
+                per_edge_invalid_output_energy = None
+
+            output_energy = float(adapter_residual.detach().float().norm().item())
+            ratio = output_energy / max(activation_norm, 1e-12)
+            residual_energy_map = adapter_residual.detach().float().pow(2.0).mean(dim=1, keepdim=True).sqrt()
+            combined_active_px = float(combined_mask.detach().float().sum().item()) if combined_mask is not None else 0.0
+            undefined_output_energy = float((adapter_residual.detach().float() * combined_invalid_mask.detach().float()).norm().item())
+            per_edge_ratio = None
+            if per_edge_output_energy is not None:
+                per_edge_ratio = per_edge_output_energy / max(activation_norm, 1e-12)
+
+            return {
+                "block_id": block_spec.block_id,
+                "block_name": block_spec.block_name,
+                "block_index": int(block_spec.block_index),
+                "scale": block_scale,
+                "activation_norm": activation_norm,
+                "adapter_residual": adapter_residual,
+                "output_energy": output_energy,
+                "adapter_to_activation_ratio": ratio,
+                "residual_energy_map": residual_energy_map,
+                "combined_active_mask": combined_mask,
+                "combined_active_px": combined_active_px,
+                "combined_invalid_mask": combined_invalid_mask,
+                "undefined_edge_output_energy": undefined_output_energy,
+                "per_edge_output_energy": per_edge_output_energy,
+                "per_edge_active_px": per_edge_active_px,
+                "per_edge_invalid_output_energy": per_edge_invalid_output_energy,
+                "per_edge_ratio": per_edge_ratio,
+            }
+
+        def _build_seam_adapter_diagnostics_payload() -> Dict[str, object]:
+            block_order = [block_spec.block_id for block_spec in self.seam_adapter_injection_plan]
+            payload = {
+                "multiplier": float(multiplier),
+                "cond_embedding_norm": cond_embedding_norm,
+                "down_block_residual_norms": residual_norms,
+                "down_block_activation_norms": activation_norms,
+                "down_block_residual_to_activation_ratios": residual_to_activation_ratios,
+                "mid_block_residual_norm": float(h.detach().float().norm().item()),
+                "seam_adapter_enabled": bool(self.seam_adapter_enabled),
+                "seam_adapter_scale": seam_adapter_scale,
+                "seam_adapter_band_px": int(self.seam_adapter_band_px),
+                "seam_adapter_input_energy": seam_input_energy,
+                "seam_adapter_output_energy": seam_output_energy,
+                "seam_adapter_to_activation_ratio": seam_adapter_ratio,
+                "seam_adapter_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
+                "seam_adapter_edge_valid_count": float(seam_edge_valid_count.detach().float().mean().item()) if seam_edge_valid_count is not None else 0.0,
+                "seam_adapter_edge_valid_flags": seam_edge_valid_flags.detach().float().cpu() if seam_edge_valid_flags is not None else None,
+                "seam_adapter_combined_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
+                "seam_adapter_corner_active_px": seam_corner_active_px,
+                "seam_adapter_per_edge_input_energy": seam_per_edge_input_energy.detach().float().cpu() if seam_per_edge_input_energy is not None else None,
+                "seam_adapter_per_edge_output_energy": seam_per_edge_output_energy.detach().float().cpu() if seam_per_edge_output_energy is not None else None,
+                "seam_adapter_per_edge_sobel_input_energy": seam_per_edge_sobel_input_energy.detach().float().cpu() if seam_per_edge_sobel_input_energy is not None else None,
+                "seam_adapter_per_edge_invalid_input_energy": seam_per_edge_invalid_input_energy.detach().float().cpu() if seam_per_edge_invalid_input_energy is not None else None,
+                "seam_adapter_per_edge_invalid_output_energy": seam_per_edge_invalid_output_energy.detach().float().cpu() if seam_per_edge_invalid_output_energy is not None else None,
+                "seam_adapter_per_edge_active_px": seam_per_edge_active_px.detach().float().cpu() if seam_per_edge_active_px is not None else None,
+                "seam_adapter_per_edge_ratio": seam_per_edge_ratio.detach().float().cpu() if seam_per_edge_ratio is not None else None,
+                "seam_adapter_combined_active_mask": seam_combined_active_mask.detach().float().cpu() if seam_combined_active_mask is not None else None,
+                "seam_adapter_per_edge_mask": seam_adapter_mask.detach().float().cpu() if seam_adapter_mask is not None and seam_adapter_mask.ndim == 5 else None,
+                "seam_adapter_residual_energy_map": seam_residual_energy_map.detach().float().cpu() if seam_residual_energy_map is not None else None,
+                "seam_adapter_sobel_input_energy": seam_sobel_input_energy,
+                "seam_adapter_undefined_edge_input_energy": seam_invalid_input_energy,
+                "seam_adapter_undefined_edge_output_energy": seam_invalid_output_energy,
+                "seam_adapter_multi_inject_enabled": bool(self.seam_adapter_multi_inject),
+                "seam_adapter_multi_inject_mode": self.seam_adapter_multi_inject_mode,
+                "seam_adapter_injection_block_ids": block_order,
+                "seam_adapter_injection_block_names": [block_spec.block_name for block_spec in self.seam_adapter_injection_plan],
+                "seam_adapter_block_diagnostics": seam_block_diagnostics,
+                "combined_adapter_to_activation_ratio_block0": float(seam_block_diagnostics.get("block0", {}).get("adapter_to_activation_ratio", 0.0) or 0.0),
+                "combined_adapter_to_activation_ratio_block1": float(seam_block_diagnostics.get("block1", {}).get("adapter_to_activation_ratio", 0.0) or 0.0),
+                "total_multi_inject_ratio": float(sum(float(seam_block_diagnostics[block_id].get("adapter_to_activation_ratio", 0.0) or 0.0) for block_id in block_order)),
+                "residual_energy_block0": float(seam_block_diagnostics.get("block0", {}).get("output_energy", 0.0) or 0.0),
+                "residual_energy_block1": float(seam_block_diagnostics.get("block1", {}).get("output_energy", 0.0) or 0.0),
+            }
+            return payload
+
         for i, module in enumerate(self.input_blocks):
             h = call_module(module, h, emb, context)
             if i == 0:
                 cond_embedding = self.controlnet_cond_embedding(cond_image)
                 cond_embedding_norm = float(cond_embedding.detach().float().norm().item())
                 h = cond_embedding + h
-            if self.controlnet_seam_adapter is not None and i == self.seam_adapter_block_index:
-                adapter_maps = seam_adapter_maps
-                adapter_mask = seam_adapter_mask
-                invalid_mask = seam_invalid_mask
-                if adapter_maps is not None and adapter_mask is not None:
-                    if adapter_maps.ndim == 5:
-                        batch_size, edge_count, channels, map_h, map_w = adapter_maps.shape
-                        flat_maps = adapter_maps.reshape(batch_size * edge_count, channels, map_h, map_w)
-                        if flat_maps.shape[-2:] != h.shape[-2:]:
-                            flat_maps = F.interpolate(flat_maps, size=h.shape[-2:], mode="bilinear", align_corners=False)
-                        flat_mask = adapter_mask.reshape(batch_size * edge_count, 1, adapter_mask.shape[-2], adapter_mask.shape[-1])
-                        if flat_mask.shape[-2:] != h.shape[-2:]:
-                            flat_mask = F.interpolate(flat_mask, size=h.shape[-2:], mode="nearest")
-                        flat_invalid = None
-                        if invalid_mask is not None:
-                            flat_invalid = invalid_mask.reshape(batch_size * edge_count, 1, invalid_mask.shape[-2], invalid_mask.shape[-1])
-                            if flat_invalid.shape[-2:] != h.shape[-2:]:
-                                flat_invalid = F.interpolate(flat_invalid, size=h.shape[-2:], mode="nearest")
-                        edge_residual = self.controlnet_seam_adapter(flat_maps)
-                        edge_residual = edge_residual.view(batch_size, edge_count, edge_residual.shape[1], h.shape[-2], h.shape[-1])
-                        edge_mask = flat_mask.view(batch_size, edge_count, 1, h.shape[-2], h.shape[-1])
-                        masked_residual = edge_residual * edge_mask * self.seam_adapter_scale
-                        seam_per_edge_output_energy = masked_residual.detach().float().reshape(batch_size, edge_count, -1).norm(dim=2)
-                        seam_per_edge_active_px = edge_mask.detach().float().sum(dim=(2, 3, 4))
-                        mask_sum = edge_mask.sum(dim=1).clamp_min(1.0)
-                        adapter_residual = masked_residual.sum(dim=1) / mask_sum
-                        if flat_invalid is not None:
-                            invalid_mask = flat_invalid.view(batch_size, edge_count, 1, h.shape[-2], h.shape[-1])
-                            seam_per_edge_invalid_output_energy = (
-                                (masked_residual.detach().float() * invalid_mask.detach().float()).reshape(batch_size, edge_count, -1).norm(dim=2)
-                            )
-                        adapter_mask = edge_mask.sum(dim=1).clamp_(0.0, 1.0)
-                        seam_combined_active_mask = adapter_mask
-                        seam_corner_active_px = float((edge_mask.sum(dim=1) > 1.0).detach().float().sum().item())
-                    else:
-                        if adapter_maps.shape[-2:] != h.shape[-2:]:
-                            adapter_maps = F.interpolate(adapter_maps, size=h.shape[-2:], mode="bilinear", align_corners=False)
-                        if adapter_mask.shape[-2:] != h.shape[-2:]:
-                            adapter_mask = F.interpolate(adapter_mask, size=h.shape[-2:], mode="nearest")
-                        if invalid_mask is not None and invalid_mask.shape[-2:] != h.shape[-2:]:
-                            invalid_mask = F.interpolate(invalid_mask, size=h.shape[-2:], mode="nearest")
-                        adapter_residual = self.controlnet_seam_adapter(adapter_maps) * adapter_mask * self.seam_adapter_scale
-                        seam_combined_active_mask = adapter_mask
-                    activation_norm = float(h.detach().float().norm().item())
-                    h = h + adapter_residual
-                    seam_output_energy = float(adapter_residual.detach().float().norm().item())
-                    seam_adapter_ratio = seam_output_energy / max(activation_norm, 1e-12)
-                    seam_residual_energy_map = adapter_residual.detach().float().pow(2.0).mean(dim=1, keepdim=True).sqrt()
-                    if seam_per_edge_output_energy is not None:
-                        seam_per_edge_ratio = seam_per_edge_output_energy / max(activation_norm, 1e-12)
-                    if invalid_mask is not None:
-                        seam_invalid_output_energy = float((adapter_residual.detach().float() * invalid_mask.detach().float()).norm().item())
+            block_spec = seam_injection_specs_by_index.get(i)
+            if self.controlnet_seam_adapter is not None and block_spec is not None:
+                block_payload = _apply_seam_adapter_block(h, block_spec)
+                if block_payload is not None:
+                    h = h + block_payload["adapter_residual"]
+                    seam_block_diagnostics[block_spec.block_id] = {
+                        "block_id": block_payload["block_id"],
+                        "block_name": block_payload["block_name"],
+                        "block_index": block_payload["block_index"],
+                        "scale": float(block_payload["scale"]),
+                        "activation_norm": float(block_payload["activation_norm"]),
+                        "input_energy": float(seam_input_energy),
+                        "sobel_input_energy": float(seam_sobel_input_energy),
+                        "output_energy": float(block_payload["output_energy"]),
+                        "adapter_to_activation_ratio": float(block_payload["adapter_to_activation_ratio"]),
+                        "active_px": float(block_payload["combined_active_px"]),
+                        "undefined_edge_input_energy": float(seam_invalid_input_energy),
+                        "undefined_edge_output_energy": float(block_payload["undefined_edge_output_energy"]),
+                        "combined_active_mask": block_payload["combined_active_mask"].detach().float().cpu(),
+                        "combined_invalid_mask": block_payload["combined_invalid_mask"].detach().float().cpu(),
+                        "residual_energy_map": block_payload["residual_energy_map"].detach().float().cpu(),
+                        "per_edge_input_energy": seam_per_edge_input_energy.detach().float().cpu() if seam_per_edge_input_energy is not None else None,
+                        "per_edge_sobel_input_energy": seam_per_edge_sobel_input_energy.detach().float().cpu() if seam_per_edge_sobel_input_energy is not None else None,
+                        "per_edge_output_energy": block_payload["per_edge_output_energy"].detach().float().cpu() if block_payload["per_edge_output_energy"] is not None else None,
+                        "per_edge_invalid_input_energy": seam_per_edge_invalid_input_energy.detach().float().cpu() if seam_per_edge_invalid_input_energy is not None else None,
+                        "per_edge_invalid_output_energy": block_payload["per_edge_invalid_output_energy"].detach().float().cpu() if block_payload["per_edge_invalid_output_energy"] is not None else None,
+                        "per_edge_active_px": block_payload["per_edge_active_px"].detach().float().cpu() if block_payload["per_edge_active_px"] is not None else None,
+                        "per_edge_ratio": block_payload["per_edge_ratio"].detach().float().cpu() if block_payload["per_edge_ratio"] is not None else None,
+                    }
+                    if block_spec.block_id == seam_primary_block_id:
+                        seam_output_energy = float(block_payload["output_energy"])
+                        seam_adapter_ratio = float(block_payload["adapter_to_activation_ratio"])
+                        seam_residual_energy_map = block_payload["residual_energy_map"]
+                        seam_combined_active_mask = block_payload["combined_active_mask"]
+                        seam_invalid_output_energy = float(block_payload["undefined_edge_output_energy"])
+                        if block_payload["per_edge_output_energy"] is not None:
+                            seam_per_edge_output_energy = block_payload["per_edge_output_energy"]
+                        if block_payload["per_edge_invalid_output_energy"] is not None:
+                            seam_per_edge_invalid_output_energy = block_payload["per_edge_invalid_output_energy"]
+                        if block_payload["per_edge_active_px"] is not None:
+                            seam_per_edge_active_px = block_payload["per_edge_active_px"]
+                        if block_payload["per_edge_ratio"] is not None:
+                            seam_per_edge_ratio = block_payload["per_edge_ratio"]
+                        if seam_adapter_mask is not None and seam_adapter_mask.ndim == 5:
+                            seam_corner_active_px = float((seam_adapter_mask.sum(dim=1) > 1.0).detach().float().sum().item())
             control_residual = self.controlnet_down_blocks[i](h) * multiplier
             hs.append(control_residual)
             if return_diagnostics:
@@ -961,38 +1229,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
 
         if not return_alpha:
             if return_diagnostics:
-                return hs, h, {
-                    "multiplier": float(multiplier),
-                    "cond_embedding_norm": cond_embedding_norm,
-                    "down_block_residual_norms": residual_norms,
-                    "down_block_activation_norms": activation_norms,
-                    "down_block_residual_to_activation_ratios": residual_to_activation_ratios,
-                    "mid_block_residual_norm": float(h.detach().float().norm().item()),
-                    "seam_adapter_enabled": bool(self.seam_adapter_enabled),
-                    "seam_adapter_scale": seam_adapter_scale,
-                    "seam_adapter_band_px": int(self.seam_adapter_band_px),
-                    "seam_adapter_input_energy": seam_input_energy,
-                    "seam_adapter_output_energy": seam_output_energy,
-                    "seam_adapter_to_activation_ratio": seam_adapter_ratio,
-                    "seam_adapter_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
-                    "seam_adapter_edge_valid_count": float(seam_edge_valid_count.detach().float().mean().item()) if seam_edge_valid_count is not None else 0.0,
-                    "seam_adapter_edge_valid_flags": seam_edge_valid_flags.detach().float().cpu() if seam_edge_valid_flags is not None else None,
-                    "seam_adapter_combined_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
-                    "seam_adapter_corner_active_px": seam_corner_active_px,
-                    "seam_adapter_per_edge_input_energy": seam_per_edge_input_energy.detach().float().cpu() if seam_per_edge_input_energy is not None else None,
-                    "seam_adapter_per_edge_output_energy": seam_per_edge_output_energy.detach().float().cpu() if seam_per_edge_output_energy is not None else None,
-                    "seam_adapter_per_edge_sobel_input_energy": seam_per_edge_sobel_input_energy.detach().float().cpu() if seam_per_edge_sobel_input_energy is not None else None,
-                    "seam_adapter_per_edge_invalid_input_energy": seam_per_edge_invalid_input_energy.detach().float().cpu() if seam_per_edge_invalid_input_energy is not None else None,
-                    "seam_adapter_per_edge_invalid_output_energy": seam_per_edge_invalid_output_energy.detach().float().cpu() if seam_per_edge_invalid_output_energy is not None else None,
-                    "seam_adapter_per_edge_active_px": seam_per_edge_active_px.detach().float().cpu() if seam_per_edge_active_px is not None else None,
-                    "seam_adapter_per_edge_ratio": seam_per_edge_ratio.detach().float().cpu() if seam_per_edge_ratio is not None else None,
-                    "seam_adapter_combined_active_mask": seam_combined_active_mask.detach().float().cpu() if seam_combined_active_mask is not None else None,
-                    "seam_adapter_per_edge_mask": seam_adapter_mask.detach().float().cpu() if seam_adapter_mask is not None and seam_adapter_mask.ndim == 5 else None,
-                    "seam_adapter_residual_energy_map": seam_residual_energy_map.detach().float().cpu() if seam_residual_energy_map is not None else None,
-                    "seam_adapter_sobel_input_energy": seam_sobel_input_energy,
-                    "seam_adapter_undefined_edge_input_energy": seam_invalid_input_energy,
-                    "seam_adapter_undefined_edge_output_energy": seam_invalid_output_energy,
-                }
+                return hs, h, _build_seam_adapter_diagnostics_payload()
             return hs, h
 
         fused_alpha_logits = None
@@ -1042,38 +1279,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
             "baseline_logits": baseline_logits,
         }
         if return_diagnostics:
-            alpha_payload["diagnostics"] = {
-                "multiplier": float(multiplier),
-                "cond_embedding_norm": cond_embedding_norm,
-                "down_block_residual_norms": residual_norms,
-                "down_block_activation_norms": activation_norms,
-                "down_block_residual_to_activation_ratios": residual_to_activation_ratios,
-                "mid_block_residual_norm": float(h.detach().float().norm().item()),
-                "seam_adapter_enabled": bool(self.seam_adapter_enabled),
-                "seam_adapter_scale": seam_adapter_scale,
-                "seam_adapter_band_px": int(self.seam_adapter_band_px),
-                "seam_adapter_input_energy": seam_input_energy,
-                "seam_adapter_output_energy": seam_output_energy,
-                "seam_adapter_to_activation_ratio": seam_adapter_ratio,
-                "seam_adapter_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
-                "seam_adapter_edge_valid_count": float(seam_edge_valid_count.detach().float().mean().item()) if seam_edge_valid_count is not None else 0.0,
-                "seam_adapter_edge_valid_flags": seam_edge_valid_flags.detach().float().cpu() if seam_edge_valid_flags is not None else None,
-                "seam_adapter_combined_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
-                "seam_adapter_corner_active_px": seam_corner_active_px,
-                "seam_adapter_per_edge_input_energy": seam_per_edge_input_energy.detach().float().cpu() if seam_per_edge_input_energy is not None else None,
-                "seam_adapter_per_edge_output_energy": seam_per_edge_output_energy.detach().float().cpu() if seam_per_edge_output_energy is not None else None,
-                "seam_adapter_per_edge_sobel_input_energy": seam_per_edge_sobel_input_energy.detach().float().cpu() if seam_per_edge_sobel_input_energy is not None else None,
-                "seam_adapter_per_edge_invalid_input_energy": seam_per_edge_invalid_input_energy.detach().float().cpu() if seam_per_edge_invalid_input_energy is not None else None,
-                "seam_adapter_per_edge_invalid_output_energy": seam_per_edge_invalid_output_energy.detach().float().cpu() if seam_per_edge_invalid_output_energy is not None else None,
-                "seam_adapter_per_edge_active_px": seam_per_edge_active_px.detach().float().cpu() if seam_per_edge_active_px is not None else None,
-                "seam_adapter_per_edge_ratio": seam_per_edge_ratio.detach().float().cpu() if seam_per_edge_ratio is not None else None,
-                "seam_adapter_combined_active_mask": seam_combined_active_mask.detach().float().cpu() if seam_combined_active_mask is not None else None,
-                "seam_adapter_per_edge_mask": seam_adapter_mask.detach().float().cpu() if seam_adapter_mask is not None and seam_adapter_mask.ndim == 5 else None,
-                "seam_adapter_residual_energy_map": seam_residual_energy_map.detach().float().cpu() if seam_residual_energy_map is not None else None,
-                "seam_adapter_sobel_input_energy": seam_sobel_input_energy,
-                "seam_adapter_undefined_edge_input_energy": seam_invalid_input_energy,
-                "seam_adapter_undefined_edge_output_energy": seam_invalid_output_energy,
-            }
+            alpha_payload["diagnostics"] = _build_seam_adapter_diagnostics_payload()
 
         return hs, h, alpha_payload
 
