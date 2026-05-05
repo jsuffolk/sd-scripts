@@ -2,9 +2,10 @@ from library.terrain_semantic_seam_geometry import center_crop_chw, center_crop_
 import csv
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -14,6 +15,17 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from library import sdxl_model_util, sdxl_train_util
 from library.device_utils import clean_memory_on_device
+from library.terrain_semantic_conditioning import (
+    ModelVisibleConditioningSpec,
+    build_model_visible_conditioning_spec,
+    compose_sample_aware_model_visible_conditioning,
+    compose_model_visible_conditioning,
+)
+from library.terrain_semantic_manifest_dataset import (
+    build_seam_region_maps as shared_build_seam_region_maps,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -278,33 +290,18 @@ def _select_eval_alpha_logits(alpha_outputs: Optional[Dict[str, object]], output
 def _compose_model_visible_conditioning(
     sample: Dict[str, object],
     base_conditioning: torch.Tensor,
+    conditioning_spec: ModelVisibleConditioningSpec,
+    expanded_conditioning_mode: str = "real_expanded",
 ) -> torch.Tensor:
-    """Build model-visible conditioning for eval, including seam channels when present.
-
-    Input/output tensors are channel-first 3D tensors (C, H, W).
-    """
     if not isinstance(base_conditioning, torch.Tensor):
         return base_conditioning
-
-    seam_strip = sample.get("seam_strip_tensor")
-    edge_defined_flags = sample.get("edge_defined_flags")
-    edge_flag_maps = sample.get("edge_flag_maps")
-    if seam_strip is None or edge_defined_flags is None or edge_flag_maps is None:
-        return base_conditioning
-
-    if not isinstance(seam_strip, torch.Tensor) or not isinstance(edge_defined_flags, torch.Tensor) or not isinstance(edge_flag_maps, torch.Tensor):
-        return base_conditioning
-
-    if base_conditioning.shape[-2:] != seam_strip.shape[-2:]:
-        return base_conditioning
-
-    expected_full_channels = base_conditioning.shape[0] + seam_strip.shape[0] + edge_flag_maps.shape[0]
-    if base_conditioning.shape[0] == expected_full_channels:
-        return base_conditioning
-
-    seam_gate = edge_defined_flags.float().view(4, 1, 1).repeat_interleave(4, dim=0)
-    seam_visible = seam_strip.float() * seam_gate
-    return torch.cat([base_conditioning.float(), seam_visible, edge_flag_maps.float()], dim=0)
+    full_conditioning, _ = compose_sample_aware_model_visible_conditioning(
+        sample=sample,
+        spec=conditioning_spec,
+        base_conditioning=base_conditioning.float(),
+        expanded_conditioning_mode=expanded_conditioning_mode,
+    )
+    return full_conditioning
 
 
 def _spatial_shuffle_channels(cond: torch.Tensor, channels: List[int], seed: int) -> torch.Tensor:
@@ -377,24 +374,114 @@ def _build_expected_expanded_seam_rgba(
     interior_w: int,
     halo_px: int,
 ) -> Optional[np.ndarray]:
+    explicit_expanded_target = sample.get("expanded_target_rgba")
     seam_strip = sample.get("seam_strip_tensor")
+    expanded_seam_strip = sample.get("expanded_seam_strip_tensor")
+    expanded_images = sample.get("expanded_images")
     edge_defined = sample.get("edge_defined_flags")
     if seam_strip is None or edge_defined is None:
-        return None
-    if not isinstance(seam_strip, torch.Tensor) or not isinstance(edge_defined, torch.Tensor):
+        if expanded_seam_strip is None or edge_defined is None:
+            return None
+    if not isinstance(edge_defined, torch.Tensor):
         return None
 
     halo = int(max(1, halo_px))
     exp_h, exp_w = expanded_hw(interior_h, interior_w, halo)
     expected = np.zeros((exp_h, exp_w, 4), dtype=np.float32)
 
-    strip = seam_strip.detach().float().cpu().numpy()
     flags = edge_defined.detach().float().cpu().numpy()
 
     def to_01(x: np.ndarray) -> np.ndarray:
         rgb = np.clip((x[:3] + 1.0) * 0.5, 0.0, 1.0)
         a = np.clip(x[3:4], 0.0, 1.0)
         return np.concatenate([rgb, a], axis=0)
+
+    if isinstance(explicit_expanded_target, torch.Tensor):
+        target_rgba = explicit_expanded_target.detach().float().cpu().numpy()
+        if target_rgba.shape[0] == 4 and tuple(int(v) for v in target_rgba.shape[-2:]) == (exp_h, exp_w):
+            return np.clip(target_rgba.transpose(1, 2, 0), 0.0, 1.0)
+
+    def _build_projected_expected_from_expanded_source(source_rgba: np.ndarray) -> np.ndarray:
+        projected = np.zeros((exp_h, exp_w, 4), dtype=np.float32)
+
+        if flags[0] >= 0.5:
+            projected[:halo, :, :] = source_rgba[:halo, :, :]
+        if flags[1] >= 0.5:
+            projected[exp_h - halo :, :, :] = source_rgba[exp_h - halo :, :, :]
+        if flags[2] >= 0.5:
+            projected[:, exp_w - halo :, :] = source_rgba[:, exp_w - halo :, :]
+        if flags[3] >= 0.5:
+            projected[:, :halo, :] = source_rgba[:, :halo, :]
+
+        interior_sum = np.zeros((interior_h, interior_w, 4), dtype=np.float32)
+        interior_weight = np.zeros((interior_h, interior_w, 1), dtype=np.float32)
+
+        if flags[0] >= 0.5:
+            north_src = source_rgba[:halo, halo : halo + interior_w, :].mean(axis=0, keepdims=True)
+            north_fill = np.repeat(north_src, halo, axis=0)
+            interior_sum[:halo, :, :] += north_fill
+            interior_weight[:halo, :, :] += 1.0
+        if flags[1] >= 0.5:
+            south_src = source_rgba[exp_h - halo :, halo : halo + interior_w, :].mean(axis=0, keepdims=True)
+            south_fill = np.repeat(south_src, halo, axis=0)
+            interior_sum[interior_h - halo :, :, :] += south_fill
+            interior_weight[interior_h - halo :, :, :] += 1.0
+        if flags[2] >= 0.5:
+            east_src = source_rgba[halo : halo + interior_h, exp_w - halo :, :].mean(axis=1, keepdims=True)
+            east_fill = np.repeat(east_src, halo, axis=1)
+            interior_sum[:, interior_w - halo :, :] += east_fill
+            interior_weight[:, interior_w - halo :, :] += 1.0
+        if flags[3] >= 0.5:
+            west_src = source_rgba[halo : halo + interior_h, :halo, :].mean(axis=1, keepdims=True)
+            west_fill = np.repeat(west_src, halo, axis=1)
+            interior_sum[:, :halo, :] += west_fill
+            interior_weight[:, :halo, :] += 1.0
+
+        valid = interior_weight > 0.0
+        if np.any(valid):
+            interior_projected = interior_sum / np.maximum(interior_weight, 1e-6)
+            valid_rgb = valid[..., 0]
+            interior_projected[~valid_rgb] = 0.0
+            projected_interior = projected[halo : halo + interior_h, halo : halo + interior_w, :]
+            projected_interior[valid_rgb] = interior_projected[valid_rgb]
+            projected[halo : halo + interior_h, halo : halo + interior_w, :] = projected_interior
+
+        return projected
+
+    if isinstance(expanded_images, torch.Tensor):
+        expanded_rgb = expanded_images.detach().float().cpu()
+        if tuple(int(v) for v in expanded_rgb.shape[-2:]) == (exp_h, exp_w):
+            expanded_alpha = sample.get("expanded_alpha_target")
+            if isinstance(expanded_alpha, torch.Tensor):
+                alpha = expanded_alpha.detach().float().cpu()
+                if alpha.ndim == 2:
+                    alpha = alpha.unsqueeze(0)
+                elif alpha.ndim == 3 and alpha.shape[0] != 1:
+                    alpha = alpha[:1]
+            else:
+                alpha = torch.ones((1, exp_h, exp_w), dtype=torch.float32)
+            source_rgba = np.concatenate(
+                [
+                    np.clip(((expanded_rgb.numpy() + 1.0) * 0.5).transpose(1, 2, 0), 0.0, 1.0),
+                    np.clip(alpha.numpy().transpose(1, 2, 0), 0.0, 1.0),
+                ],
+                axis=2,
+            )
+            return _build_projected_expected_from_expanded_source(source_rgba)
+
+    if isinstance(expanded_seam_strip, torch.Tensor):
+        expanded_strip = expanded_seam_strip.detach().float().cpu().numpy()
+        if expanded_strip.shape[-2:] == (exp_h, exp_w):
+            for edge_idx in range(4):
+                if edge_idx >= len(flags) or flags[edge_idx] < 0.5:
+                    continue
+                edge_rgba = to_01(expanded_strip[edge_idx * 4 : edge_idx * 4 + 4]).transpose(1, 2, 0)
+                expected = np.maximum(expected, edge_rgba)
+            return expected
+
+    if not isinstance(seam_strip, torch.Tensor):
+        return None
+    strip = seam_strip.detach().float().cpu().numpy()
 
     band = int(min(halo, strip.shape[1], strip.shape[2]))
     if band <= 0:
@@ -441,11 +528,21 @@ def _build_expanded_edge_masks(height: int, width: int, halo_px: int, band_px: i
     south_dist_outside = np.clip(yy - interior_max_y, 0.0, None)
     east_dist_outside = np.clip(xx - interior_max_x, 0.0, None)
     west_dist_outside = np.clip(interior_min_x - xx, 0.0, None)
+    north_dist_inside = np.clip(yy - interior_min_y, 0.0, None)
+    south_dist_inside = np.clip(interior_max_y - yy, 0.0, None)
+    east_dist_inside = np.clip(interior_max_x - xx, 0.0, None)
+    west_dist_inside = np.clip(xx - interior_min_x, 0.0, None)
 
     north_active = north_dist_outside > 0.0
     south_active = south_dist_outside > 0.0
     east_active = east_dist_outside > 0.0
     west_active = west_dist_outside > 0.0
+    interior_active = (
+        (yy >= interior_min_y)
+        & (yy <= interior_max_y)
+        & (xx >= interior_min_x)
+        & (xx <= interior_max_x)
+    )
     corner_excluded = ((north_active.astype(np.int32) + south_active.astype(np.int32) + east_active.astype(np.int32) + west_active.astype(np.int32)) > 1)
     outside_single_side = (north_active | south_active | east_active | west_active) & (~corner_excluded)
 
@@ -459,14 +556,30 @@ def _build_expanded_edge_masks(height: int, width: int, halo_px: int, band_px: i
         ],
         axis=0,
     )
-    owner_idx = np.argmin(owner_stack, axis=0)
+    # Deterministic tie-break for equal-distance ownership in priority order north->south->east->west.
+    tie_break_eps = np.array([0.0, 1e-6, 2e-6, 3e-6], dtype=np.float32).reshape(4, 1, 1)
+    owner_idx = np.argmin(owner_stack + tie_break_eps, axis=0)
+    interior_owner_stack = np.stack(
+        [
+            np.where(interior_active, north_dist_inside, inf),
+            np.where(interior_active, south_dist_inside, inf),
+            np.where(interior_active, east_dist_inside, inf),
+            np.where(interior_active, west_dist_inside, inf),
+        ],
+        axis=0,
+    )
+    interior_owner_idx = np.argmin(interior_owner_stack + tie_break_eps, axis=0)
 
     north_owner = outside_single_side & (owner_idx == 0)
     south_owner = outside_single_side & (owner_idx == 1)
     east_owner = outside_single_side & (owner_idx == 2)
     west_owner = outside_single_side & (owner_idx == 3)
+    north_interior_owner = interior_active & (interior_owner_idx == 0)
+    south_interior_owner = interior_active & (interior_owner_idx == 1)
+    east_interior_owner = interior_active & (interior_owner_idx == 2)
+    west_interior_owner = interior_active & (interior_owner_idx == 3)
 
-    def _edge_payload(owner_mask: np.ndarray, distance_map: np.ndarray, side: str) -> Dict[str, np.ndarray]:
+    def _edge_payload(owner_mask: np.ndarray, distance_map: np.ndarray, interior_owner_mask: np.ndarray, interior_distance_map: np.ndarray) -> Dict[str, np.ndarray]:
         halo_all = owner_mask.astype(np.float32)
         halo_inner = (owner_mask & (distance_map <= float(band))).astype(np.float32)
         halo_outer = (owner_mask & (distance_map > float(band))).astype(np.float32)
@@ -474,16 +587,8 @@ def _build_expanded_edge_masks(height: int, width: int, halo_px: int, band_px: i
         ring_4 = (owner_mask & (distance_map > 0.0) & (distance_map <= 4.0)).astype(np.float32)
         ring_8 = (owner_mask & (distance_map > 0.0) & (distance_map <= 8.0)).astype(np.float32)
         ring_16 = (owner_mask & (distance_map > 0.0) & (distance_map <= 16.0)).astype(np.float32)
-
-        interior_outer = z()
-        if side == "top":
-            interior_outer[halo : min(h, halo + band), :] = 1.0
-        elif side == "bottom":
-            interior_outer[max(0, h - halo - band) : h - halo, :] = 1.0
-        elif side == "right":
-            interior_outer[:, max(0, w - halo - band) : w - halo] = 1.0
-        else:
-            interior_outer[:, halo : min(w, halo + band)] = 1.0
+        interior_ring_1 = (interior_owner_mask & (interior_distance_map >= 0.0) & (interior_distance_map <= 1.0)).astype(np.float32)
+        interior_outer = (interior_owner_mask & (interior_distance_map <= float(band))).astype(np.float32)
 
         return {
             "halo_all": halo_all,
@@ -493,15 +598,558 @@ def _build_expanded_edge_masks(height: int, width: int, halo_px: int, band_px: i
             "halo_inner_edge_4px": ring_4,
             "halo_inner_8px": ring_8,
             "halo_inner_16px": ring_16,
+            "interior_edge_1px": interior_ring_1,
             "interior_outer": interior_outer,
             "corner_excluded": corner_excluded.astype(np.float32),
         }
 
-    masks["top"] = _edge_payload(north_owner, north_dist_outside, "top")
-    masks["bottom"] = _edge_payload(south_owner, south_dist_outside, "bottom")
-    masks["right"] = _edge_payload(east_owner, east_dist_outside, "right")
-    masks["left"] = _edge_payload(west_owner, west_dist_outside, "left")
+    masks["top"] = _edge_payload(north_owner, north_dist_outside, north_interior_owner, north_dist_inside)
+    masks["bottom"] = _edge_payload(south_owner, south_dist_outside, south_interior_owner, south_dist_inside)
+    masks["right"] = _edge_payload(east_owner, east_dist_outside, east_interior_owner, east_dist_inside)
+    masks["left"] = _edge_payload(west_owner, west_dist_outside, west_interior_owner, west_dist_inside)
     return masks
+
+
+def _build_expanded_denoise_clamp_masks(
+    height: int,
+    width: int,
+    halo_px: int,
+    inner_px: int,
+    feather_px: int,
+    feather_profile: str,
+    edge_defined_flags: Optional[torch.Tensor],
+    alpha_gate: Optional[np.ndarray] = None,
+    valid_source_mask: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    source_sizes_hw: Optional[torch.Tensor] = None,
+    expanded_source_box: Optional[torch.Tensor] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    h = int(height)
+    w = int(width)
+    halo = int(max(1, halo_px))
+    inner = int(max(0, min(inner_px, halo)))
+    feather = int(max(0, feather_px))
+    edge_band_masks = torch.zeros((1, 4, h, w), dtype=torch.float32)
+    edge_band_masks[0, 0, :halo, :] = 1.0
+    edge_band_masks[0, 1, h - halo :, :] = 1.0
+    edge_band_masks[0, 2, :, w - halo :] = 1.0
+    edge_band_masks[0, 3, :, :halo] = 1.0
+
+    yy = torch.arange(h, dtype=torch.float32).unsqueeze(1).expand(h, w)
+    xx = torch.arange(w, dtype=torch.float32).unsqueeze(0).expand(h, w)
+    band = halo
+    north = torch.clamp(1.0 - (yy - float(band)) / float(max(1, band)), min=0.0, max=1.0)
+    north = north * ((yy >= float(band)) & (yy < float(2 * band))).float()
+    south_anchor = float(h - band - 1)
+    south = torch.clamp(1.0 - (south_anchor - yy) / float(max(1, band)), min=0.0, max=1.0)
+    south = south * ((yy <= south_anchor) & (yy > south_anchor - float(band))).float()
+    west = torch.clamp(1.0 - (xx - float(band)) / float(max(1, band)), min=0.0, max=1.0)
+    west = west * ((xx >= float(band)) & (xx < float(2 * band))).float()
+    east_anchor = float(w - band - 1)
+    east = torch.clamp(1.0 - (east_anchor - xx) / float(max(1, band)), min=0.0, max=1.0)
+    east = east * ((xx <= east_anchor) & (xx > east_anchor - float(band))).float()
+    seam_decay_maps = torch.stack([north, south, east, west], dim=0).unsqueeze(0)
+    if isinstance(edge_defined_flags, torch.Tensor):
+        flags = edge_defined_flags.detach().float().view(1, -1)
+    else:
+        flags = torch.ones((1, 4), dtype=torch.float32)
+
+    valid_mask_tensor = torch.ones((1, 1, h, w), dtype=torch.float32)
+    if valid_source_mask is not None:
+        valid_mask_np = np.asarray(valid_source_mask, dtype=np.float32)
+        if valid_mask_np.ndim == 3:
+            valid_mask_np = valid_mask_np[..., 0]
+        valid_mask_tensor = torch.from_numpy(np.clip(valid_mask_np, 0.0, 1.0)).unsqueeze(0).unsqueeze(0).float()
+    elif alpha_gate is not None:
+        alpha_valid = np.asarray(alpha_gate, dtype=np.float32)
+        if alpha_valid.ndim == 3:
+            alpha_valid = alpha_valid[..., 0]
+        valid_mask_tensor = torch.from_numpy(np.clip(alpha_valid, 0.0, 1.0)).unsqueeze(0).unsqueeze(0).float()
+
+    supervision_mask = valid_mask_tensor.clone()
+    seam_maps = shared_build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=flags,
+        seam_strip_width_px=torch.tensor([float(halo)], dtype=torch.float32),
+        supervision_mask=supervision_mask,
+        seam_config={
+            "margin_inner_px": inner,
+            "continuation_profile": str(feather_profile or "piecewise").strip().lower(),
+            "continuation_width_px": feather,
+            "continuation_base_width_px": feather,
+            "continuation_min_width_px": feather,
+            "continuation_max_width_px": feather,
+            "continuation_noise_enabled": False,
+            "continuation_corner_normalization_enabled": True,
+            "require_defined_for_margin_and_band": True,
+        },
+        expanded_halo_px=halo,
+        source_sizes_hw=source_sizes_hw,
+        expanded_source_boxes=expanded_source_box,
+        valid_expanded_source_mask=valid_mask_tensor,
+        continuation_valid_mask=valid_mask_tensor,
+        style_support_valid_mask=valid_mask_tensor,
+    )
+
+    hard_mask = seam_maps["hard_band_mask"][0, 0].detach().cpu().numpy().astype(np.float32)
+    feather_mask = seam_maps["continuation_distance_weighted"][0, 0].detach().cpu().numpy().astype(np.float32)
+
+    # Criterion 6: log geometry fingerprints so train/eval consistency can be checked per sample.
+    _gap_mask = seam_maps.get("seam_gap_mask")
+    _overlap_mask = seam_maps.get("seam_overlap_mask")
+    _gap_px = float(_gap_mask[0, 0].sum().item()) if _gap_mask is not None else -1.0
+    _overlap_px = float(_overlap_mask[0, 0].sum().item()) if _overlap_mask is not None else -1.0
+    _hard_px = float(np.sum(hard_mask > 0.0))
+    _valid_px = float(valid_mask_tensor[0, 0].sum().item())
+    logger.info(
+        "[seam/invariant/criterion6] eval geometry: hard_band_px=%.1f gap_px=%.1f overlap_px=%.1f "
+        "valid_px=%.1f h=%d w=%d halo=%d inner=%d — "
+        "compare with training log [seam/invariant/OK] for same sample to verify mask parity",
+        _hard_px, _gap_px, _overlap_px, _valid_px, h, w, halo, inner,
+    )
+    if _gap_px > 0.0:
+        logger.warning(
+            "[seam/invariant/criterion6] WARN eval geometry has seam_gap_px=%.1f — "
+            "inner_halo and hard_band do not cover all seam neighbourhood pixels in the eval path",
+            _gap_px,
+        )
+
+    valid_mask_np = valid_mask_tensor[0, 0].detach().cpu().numpy().astype(np.float32)
+    hard_mask = hard_mask * valid_mask_np
+    feather_mask = feather_mask * valid_mask_np
+
+    feather_mask = np.clip(feather_mask * (1.0 - (hard_mask > 0.0).astype(np.float32)), 0.0, 1.0)
+    return hard_mask, feather_mask
+
+
+def _ddpm_pred_original_sample_coeff(scheduler: DDPMScheduler, timestep: torch.Tensor) -> torch.Tensor:
+    timestep_index = int(timestep.item())
+    prev_timestep = timestep_index - (scheduler.config.num_train_timesteps // scheduler.num_inference_steps)
+    alpha_prod_t = scheduler.alphas_cumprod[timestep_index]
+    if prev_timestep >= 0:
+        alpha_prod_t_prev = scheduler.alphas_cumprod[prev_timestep]
+    else:
+        alpha_prod_t_prev = scheduler.one
+    beta_prod_t = 1 - alpha_prod_t
+    current_alpha_t = alpha_prod_t / alpha_prod_t_prev
+    current_beta_t = 1 - current_alpha_t
+    coeff = (alpha_prod_t_prev.sqrt() * current_beta_t) / beta_prod_t.clamp_min(1e-8)
+    return coeff.to(dtype=torch.float32)
+
+
+def _prepare_seam_denoise_clamp_payload(
+    sample: Dict[str, object],
+    *,
+    interior_h: int,
+    interior_w: int,
+    halo_px: int,
+    inner_px: int,
+    feather_px: int,
+    feather_profile: str,
+    hard_threshold: float,
+    clamp_mode: str,
+    latent_h: int,
+    latent_w: int,
+    vae: torch.nn.Module,
+    vae_dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[Dict[str, torch.Tensor]]:
+    expected_rgba = _build_expected_expanded_seam_rgba(
+        sample=sample,
+        interior_h=interior_h,
+        interior_w=interior_w,
+        halo_px=halo_px,
+    )
+    if expected_rgba is None:
+        return None
+
+    exp_h, exp_w = expected_rgba.shape[:2]
+    alpha_gate = (expected_rgba[..., 3] > 0.0).astype(np.float32)
+    if float(np.sum(alpha_gate)) <= 0.0:
+        alpha_gate = (np.abs(expected_rgba[..., :3]).sum(axis=2) > 1e-6).astype(np.float32)
+    valid_source_mask = sample.get("valid_expanded_source_mask")
+    hard_mask_np, feather_mask_np = _build_expanded_denoise_clamp_masks(
+        height=exp_h,
+        width=exp_w,
+        halo_px=halo_px,
+        inner_px=inner_px,
+        feather_px=feather_px,
+        feather_profile=feather_profile,
+        edge_defined_flags=sample.get("edge_defined_flags"),
+        alpha_gate=alpha_gate,
+        valid_source_mask=valid_source_mask,
+        source_sizes_hw=sample.get("original_sizes_hw"),
+        expanded_source_box=sample.get("expanded_crop_box"),
+    )
+    if float(np.sum(hard_mask_np) + np.sum(feather_mask_np)) <= 0.0:
+        return None
+
+    hard_mask = torch.from_numpy(hard_mask_np).to(device=device, dtype=torch.float32).unsqueeze(0)
+    feather_mask = torch.from_numpy(feather_mask_np).to(device=device, dtype=torch.float32).unsqueeze(0)
+    combined_mask = (hard_mask + feather_mask).clamp(0.0, 1.0)
+    seam_target_rgb = torch.from_numpy(expected_rgba[..., :3]).permute(2, 0, 1).to(device=device, dtype=torch.float32)
+    seam_target_rgb = (seam_target_rgb * 2.0) - 1.0
+
+    target_rgb = seam_target_rgb
+    context_rgb: Optional[torch.Tensor] = None
+    expanded_images = sample.get("expanded_images")
+    if isinstance(expanded_images, torch.Tensor):
+        if tuple(int(v) for v in expanded_images.shape[-2:]) == (exp_h, exp_w):
+            context_rgb = expanded_images.detach().to(device=device, dtype=torch.float32)
+    elif isinstance(sample.get("images"), torch.Tensor):
+        images = sample["images"].detach()
+        if tuple(int(v) for v in images.shape[-2:]) == (interior_h, interior_w):
+            context_rgb = torch.zeros((3, exp_h, exp_w), device=device, dtype=torch.float32)
+            context_rgb[:, halo : halo + interior_h, halo : halo + interior_w] = images.to(device=device, dtype=torch.float32)
+
+    if context_rgb is not None:
+        target_rgb = (context_rgb * (1.0 - hard_mask)) + (seam_target_rgb * hard_mask)
+    else:
+        target_rgb = seam_target_rgb * hard_mask
+
+    payload: Dict[str, torch.Tensor] = {
+        "target_rgb": target_rgb,
+        "hard_mask": hard_mask,
+        "feather_mask": feather_mask,
+        "combined_mask": combined_mask,
+    }
+    combined_mask_np = np.clip(hard_mask_np + feather_mask_np, 0.0, 1.0)
+    if isinstance(sample.get("edge_defined_flags"), torch.Tensor):
+        flags = sample["edge_defined_flags"].detach().float().cpu().view(-1).numpy()
+    else:
+        flags = np.ones((4,), dtype=np.float32)
+    undefined_hard_np, undefined_feather_np = _build_expanded_denoise_clamp_masks(
+        height=exp_h,
+        width=exp_w,
+        halo_px=halo_px,
+        inner_px=inner_px,
+        feather_px=feather_px,
+        feather_profile=feather_profile,
+        edge_defined_flags=torch.from_numpy((flags < 0.5).astype(np.float32)),
+        alpha_gate=alpha_gate,
+        valid_source_mask=valid_source_mask,
+        source_sizes_hw=sample.get("original_sizes_hw"),
+        expanded_source_box=sample.get("expanded_crop_box"),
+    )
+    undefined_combined_np = np.clip(undefined_hard_np + undefined_feather_np, 0.0, 1.0)
+    payload["applied_px"] = torch.tensor(float(np.sum(combined_mask_np > 0.0)), dtype=torch.float32)
+    payload["hard_applied_px"] = torch.tensor(float(np.sum(hard_mask_np > 0.0)), dtype=torch.float32)
+    payload["feather_applied_px"] = torch.tensor(float(np.sum(feather_mask_np > 0.0)), dtype=torch.float32)
+    payload["undefined_overlap_px"] = torch.tensor(
+        float(np.sum((combined_mask_np > 0.0) & (undefined_combined_np > 0.0))),
+        dtype=torch.float32,
+    )
+
+    if str(clamp_mode).strip().lower() == "latent":
+        with torch.no_grad():
+            encoded = vae.encode(target_rgb.unsqueeze(0).to(dtype=vae_dtype)).latent_dist.mode()
+        target_latent = encoded.to(dtype=torch.float32) * float(sdxl_model_util.VAE_SCALE_FACTOR)
+        hard_latent = F.interpolate(hard_mask.unsqueeze(0), size=(latent_h, latent_w), mode="area").squeeze(0)
+        feather_latent = F.interpolate(feather_mask.unsqueeze(0), size=(latent_h, latent_w), mode="area").squeeze(0)
+        hard_latent = hard_latent.clamp(0.0, 1.0)
+        feather_latent = feather_latent.clamp(0.0, 1.0)
+        hard_binary = (hard_latent > float(hard_threshold)).float()
+        combined_latent = (hard_latent + feather_latent).clamp(0.0, 1.0)
+        soft_latent = (combined_latent - hard_binary).clamp(0.0, 1.0)
+        # Criterion 7: the downsampled latent clamp should touch the seam-side support boundary,
+        # and there should be no uncovered one-pixel boundary between support and hard/feather.
+        if isinstance(sample.get("edge_defined_flags"), torch.Tensor):
+            flags = sample["edge_defined_flags"].detach().float().cpu().view(-1).numpy()
+        else:
+            flags = np.ones((4,), dtype=np.float32)
+        edge_masks_support = _build_expanded_edge_masks(
+            exp_h,
+            exp_w,
+            halo_px=halo_px,
+            band_px=max(1, min(int(inner_px), int(halo_px))),
+        )
+        valid_support_np: Optional[np.ndarray] = None
+        if valid_source_mask is not None:
+            valid_support_np = np.asarray(valid_source_mask, dtype=np.float32)
+            if valid_support_np.ndim == 3:
+                valid_support_np = valid_support_np[..., 0]
+            valid_support_np = np.clip(valid_support_np, 0.0, 1.0)
+        elif alpha_gate is not None:
+            valid_support_np = np.asarray(alpha_gate, dtype=np.float32)
+            if valid_support_np.ndim == 3:
+                valid_support_np = valid_support_np[..., 0]
+            valid_support_np = np.clip(valid_support_np, 0.0, 1.0)
+
+        trusted_boundary_expanded: Optional[np.ndarray] = None
+        if isinstance(sample.get("trusted_mask"), torch.Tensor):
+            trusted_mask = sample["trusted_mask"].detach().float().cpu().numpy()
+            if trusted_mask.ndim == 3:
+                trusted_mask = trusted_mask[0]
+            trusted_boundary_expanded = np.zeros((exp_h, exp_w), dtype=np.float32)
+            trusted_h = min(int(interior_h), int(trusted_mask.shape[-2]))
+            trusted_w = min(int(interior_w), int(trusted_mask.shape[-1]))
+            trusted_boundary_expanded[halo_px : halo_px + trusted_h, halo_px : halo_px + trusted_w] = trusted_mask[:trusted_h, :trusted_w]
+
+        support_boundary_latent = torch.zeros((1, latent_h, latent_w), device=device, dtype=torch.float32)
+        support_side_specs = [
+            (0, "top"),
+            (1, "bottom"),
+            (2, "right"),
+            (3, "left"),
+        ]
+        for edge_idx, side_name in support_side_specs:
+            if edge_idx >= len(flags) or float(flags[edge_idx]) < 0.5:
+                continue
+            side_masks = edge_masks_support[side_name]
+            support_boundary_np = np.clip(
+                side_masks["halo_inner_edge_1px"]
+                + (
+                    side_masks["interior_edge_1px"]
+                    if trusted_boundary_expanded is None
+                    else (trusted_boundary_expanded * side_masks["interior_edge_1px"])
+                ),
+                0.0,
+                1.0,
+            )
+            if valid_support_np is not None:
+                support_boundary_np = support_boundary_np * valid_support_np
+            support_boundary_mask = F.interpolate(
+                torch.from_numpy(support_boundary_np).to(device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0),
+                size=(latent_h, latent_w),
+                mode="area",
+            ).clamp(0.0, 1.0).squeeze(0)
+            support_boundary_latent = torch.maximum(support_boundary_latent, support_boundary_mask)
+
+        support_boundary_binary = (support_boundary_latent > 1e-6).float()
+        hard_touch_region = _expand_mask(hard_binary.unsqueeze(0), 1).squeeze(0)
+        combined_positive = (combined_latent > 1e-6).float()
+        combined_touch_region = _expand_mask(combined_positive.unsqueeze(0), 1).squeeze(0)
+        support_boundary_px = float(support_boundary_binary.sum().item())
+        hard_support_touch_px = float((support_boundary_binary * hard_touch_region).sum().item())
+        boundary_gap_px = float((support_boundary_binary * (1.0 - combined_touch_region)).sum().item())
+        boundary_gap_ratio = boundary_gap_px / max(support_boundary_px, 1e-6)
+        logger.info(
+            "[seam/invariant/criterion7] eval latent clamp boundary: support_boundary_px=%.1f "
+            "hard_touch_px=%.1f boundary_gap_px=%.1f boundary_gap_ratio=%.4f latent_h=%d latent_w=%d halo_px=%d inner_px=%d",
+            support_boundary_px,
+            hard_support_touch_px,
+            boundary_gap_px,
+            boundary_gap_ratio,
+            latent_h,
+            latent_w,
+            halo_px,
+            inner_px,
+        )
+        if hard_support_touch_px <= 0.0:
+            logger.warning(
+                "[seam/invariant/criterion7] WARN eval latent hard clamp does not touch seam-side support: "
+                "support_boundary_px=%.1f latent_h=%d latent_w=%d halo_px=%d inner_px=%d",
+                support_boundary_px,
+                latent_h,
+                latent_w,
+                halo_px,
+                inner_px,
+            )
+        if boundary_gap_px > 0.0:
+            logger.warning(
+                "[seam/invariant/criterion7] WARN eval latent boundary gap detected: gap_px=%.1f ratio=%.4f — "
+                "one-pixel seam-side support boundary is not touched by hard/feather clamp at latent scale",
+                boundary_gap_px,
+                boundary_gap_ratio,
+            )
+        if float(soft_latent.max().detach().item()) > 0.0:
+            edge_masks_hard = _build_expanded_edge_masks(
+                exp_h,
+                exp_w,
+                halo_px=halo_px,
+                band_px=max(1, min(int(inner_px), int(halo_px))),
+            )
+            edge_masks_soft = _build_expanded_edge_masks(
+                exp_h,
+                exp_w,
+                halo_px=halo_px,
+                band_px=max(1, min(int(feather_px), int(halo_px))),
+            )
+            projected_sum_latent = torch.zeros_like(target_latent)
+            projected_weight_latent = torch.zeros((1, 1, latent_h, latent_w), device=device, dtype=torch.float32)
+            side_specs = [
+                (0, "top", "north"),
+                (1, "bottom", "south"),
+                (2, "right", "east"),
+                (3, "left", "west"),
+            ]
+            for edge_idx, side_name, edge_name in side_specs:
+                if edge_idx >= len(flags) or float(flags[edge_idx]) < 0.5:
+                    continue
+                src_mask_np = edge_masks_hard[side_name]["halo_inner"]
+                dst_mask_np = edge_masks_soft[side_name]["interior_outer"]
+                src_mask_latent = F.interpolate(
+                    torch.from_numpy(src_mask_np).to(device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0),
+                    size=(latent_h, latent_w),
+                    mode="area",
+                ).clamp(0.0, 1.0)
+                dst_mask_latent = F.interpolate(
+                    torch.from_numpy(dst_mask_np).to(device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0),
+                    size=(latent_h, latent_w),
+                    mode="area",
+                ).clamp(0.0, 1.0)
+                dst_mask_latent = dst_mask_latent * soft_latent.unsqueeze(0)
+                if float(src_mask_latent.max().detach().item()) <= 0.0 or float(dst_mask_latent.max().detach().item()) <= 0.0:
+                    continue
+                src_presence = src_mask_latent[0, 0]
+                dst_presence = dst_mask_latent[0, 0]
+                if edge_name in {"north", "south"}:
+                    src_rows = torch.nonzero(src_presence.amax(dim=1) > 0.0, as_tuple=False).flatten()
+                    dst_rows = torch.nonzero(dst_presence.amax(dim=1) > 0.0, as_tuple=False).flatten()
+                    if src_rows.numel() == 0 or dst_rows.numel() == 0:
+                        continue
+                    src_y0 = int(src_rows[0].item())
+                    src_y1 = int(src_rows[-1].item()) + 1
+                    dst_y0 = int(dst_rows[0].item())
+                    dst_y1 = int(dst_rows[-1].item()) + 1
+                    src_slice = target_latent[:, :, src_y0:src_y1, :]
+                    src_weight = src_mask_latent[:, :, src_y0:src_y1, :]
+                    projected_edge_latent = F.interpolate(
+                        src_slice * src_weight,
+                        size=(max(1, dst_y1 - dst_y0), latent_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    projected_edge_weight = F.interpolate(
+                        src_weight,
+                        size=(max(1, dst_y1 - dst_y0), latent_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    projected_edge_latent = torch.where(
+                        projected_edge_weight > 0.0,
+                        projected_edge_latent / projected_edge_weight.clamp_min(1e-6),
+                        torch.zeros_like(projected_edge_latent),
+                    )
+                    edge_target = torch.zeros_like(target_latent)
+                    edge_gate = torch.zeros((1, 1, latent_h, latent_w), device=device, dtype=torch.float32)
+                    edge_target[:, :, dst_y0:dst_y1, :] = projected_edge_latent
+                    edge_gate[:, :, dst_y0:dst_y1, :] = dst_mask_latent[:, :, dst_y0:dst_y1, :]
+                else:
+                    src_cols = torch.nonzero(src_presence.amax(dim=0) > 0.0, as_tuple=False).flatten()
+                    dst_cols = torch.nonzero(dst_presence.amax(dim=0) > 0.0, as_tuple=False).flatten()
+                    if src_cols.numel() == 0 or dst_cols.numel() == 0:
+                        continue
+                    src_x0 = int(src_cols[0].item())
+                    src_x1 = int(src_cols[-1].item()) + 1
+                    dst_x0 = int(dst_cols[0].item())
+                    dst_x1 = int(dst_cols[-1].item()) + 1
+                    src_slice = target_latent[:, :, :, src_x0:src_x1]
+                    src_weight = src_mask_latent[:, :, :, src_x0:src_x1]
+                    projected_edge_latent = F.interpolate(
+                        src_slice * src_weight,
+                        size=(latent_h, max(1, dst_x1 - dst_x0)),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    projected_edge_weight = F.interpolate(
+                        src_weight,
+                        size=(latent_h, max(1, dst_x1 - dst_x0)),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    projected_edge_latent = torch.where(
+                        projected_edge_weight > 0.0,
+                        projected_edge_latent / projected_edge_weight.clamp_min(1e-6),
+                        torch.zeros_like(projected_edge_latent),
+                    )
+                    edge_target = torch.zeros_like(target_latent)
+                    edge_gate = torch.zeros((1, 1, latent_h, latent_w), device=device, dtype=torch.float32)
+                    edge_target[:, :, :, dst_x0:dst_x1] = projected_edge_latent
+                    edge_gate[:, :, :, dst_x0:dst_x1] = dst_mask_latent[:, :, :, dst_x0:dst_x1]
+                projected_sum_latent = projected_sum_latent + (edge_target * edge_gate)
+                projected_weight_latent = projected_weight_latent + edge_gate
+
+            if float(projected_weight_latent.max().detach().item()) > 0.0:
+                projected_target_latent = torch.where(
+                    projected_weight_latent > 0.0,
+                    projected_sum_latent / projected_weight_latent.clamp_min(1e-6),
+                    target_latent,
+                )
+                target_latent = (target_latent * (1.0 - soft_latent.unsqueeze(0))) + (projected_target_latent * soft_latent.unsqueeze(0))
+        payload["target_latent"] = target_latent
+        payload["hard_mask_latent"] = hard_latent
+        payload["hard_mask_latent_binary"] = hard_binary
+        payload["feather_mask_latent"] = feather_latent
+        payload["soft_mask_latent"] = soft_latent
+        payload["combined_mask_latent"] = (hard_binary + soft_latent).clamp(0.0, 1.0)
+        payload["combined_mask_latent_raw"] = combined_latent
+        payload["hard_threshold"] = torch.tensor(float(hard_threshold), dtype=torch.float32)
+        payload["latent_support_boundary_px"] = torch.tensor(support_boundary_px, dtype=torch.float32)
+        payload["latent_hard_support_touch_px"] = torch.tensor(hard_support_touch_px, dtype=torch.float32)
+        payload["latent_hard_touches_support"] = torch.tensor(1.0 if hard_support_touch_px > 0.0 else 0.0, dtype=torch.float32)
+        payload["latent_boundary_gap_px"] = torch.tensor(boundary_gap_px, dtype=torch.float32)
+        payload["latent_boundary_gap_ratio"] = torch.tensor(boundary_gap_ratio, dtype=torch.float32)
+    return payload
+
+
+def _apply_seam_denoise_clamp(
+    pred_x0: torch.Tensor,
+    *,
+    clamp_mode: str,
+    clamp_payload: Dict[str, torch.Tensor],
+    vae: torch.nn.Module,
+    vae_dtype: torch.dtype,
+    capture_rgb_diagnostics: bool = True,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    mode = str(clamp_mode or "latent").strip().lower()
+    diagnostics: Dict[str, torch.Tensor] = {}
+    if mode == "latent":
+        blend = clamp_payload["combined_mask_latent"].to(device=pred_x0.device, dtype=pred_x0.dtype)
+        hard = clamp_payload["hard_mask_latent_binary"].to(device=pred_x0.device, dtype=pred_x0.dtype)
+        hard_raw = clamp_payload["hard_mask_latent"].to(device=pred_x0.device, dtype=pred_x0.dtype)
+        soft = clamp_payload["soft_mask_latent"].to(device=pred_x0.device, dtype=pred_x0.dtype)
+        target = clamp_payload["target_latent"].to(device=pred_x0.device, dtype=pred_x0.dtype)
+        pred_x0_clamped = pred_x0 * (1.0 - hard - soft) + target * (hard + soft)
+        diagnostics["clamp_delta_latent"] = (pred_x0_clamped - pred_x0).detach().float()
+        diagnostics["clamp_hard_mask"] = hard.detach().float().cpu()
+        diagnostics["clamp_combined_mask"] = blend.detach().float().cpu()
+        diagnostics["clamp_hard_mask_raw"] = hard_raw.detach().float().cpu()
+        diagnostics["clamp_soft_mask_latent"] = soft.detach().float().cpu()
+        if clamp_payload.get("hard_threshold") is not None:
+            diagnostics["clamp_hard_threshold"] = clamp_payload["hard_threshold"].detach().float().cpu()
+        if capture_rgb_diagnostics:
+            with torch.no_grad():
+                decoded_pre = vae.decode((pred_x0 / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample
+                decoded_post = vae.decode((pred_x0_clamped / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample
+            diagnostics["clamp_decoded_pre"] = decoded_pre.detach().float().cpu().squeeze(0)
+            diagnostics["clamp_decoded_post"] = decoded_post.detach().float().cpu().squeeze(0)
+        return pred_x0_clamped, diagnostics
+
+    with torch.no_grad():
+        decoded = vae.decode((pred_x0 / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample
+    decoded = decoded.to(dtype=torch.float32)
+    target_rgb = clamp_payload["target_rgb"].unsqueeze(0).to(device=decoded.device, dtype=decoded.dtype)
+    blend = clamp_payload["combined_mask"].unsqueeze(0).to(device=decoded.device, dtype=decoded.dtype)
+    hard = clamp_payload["hard_mask"].unsqueeze(0).to(device=decoded.device, dtype=decoded.dtype)
+    feather = (blend - hard).clamp(0.0, 1.0)
+
+    decoded_clamped = decoded.clone()
+    hard_bool = hard >= 0.999
+    decoded_clamped = torch.where(hard_bool, target_rgb, decoded_clamped)
+    if torch.count_nonzero(feather > 0.0).item() > 0:
+        decoded_clamped = decoded_clamped * (1.0 - feather) + target_rgb * feather
+    with torch.no_grad():
+        encoded = vae.encode(decoded_clamped.to(dtype=vae_dtype)).latent_dist.mode()
+        decoded_reencoded = vae.decode(encoded).sample.to(dtype=torch.float32)
+    pred_x0_clamped = encoded.to(device=pred_x0.device, dtype=torch.float32) * float(sdxl_model_util.VAE_SCALE_FACTOR)
+    diagnostics["clamp_pre_rgb_min"] = decoded.detach().float().amin().cpu()
+    diagnostics["clamp_pre_rgb_max"] = decoded.detach().float().amax().cpu()
+    diagnostics["clamp_pre_rgb_mean"] = decoded.detach().float().mean().cpu()
+    diagnostics["clamp_target_rgb_min"] = target_rgb.detach().float().amin().cpu()
+    diagnostics["clamp_target_rgb_max"] = target_rgb.detach().float().amax().cpu()
+    diagnostics["clamp_target_rgb_mean"] = target_rgb.detach().float().mean().cpu()
+    diagnostics["clamp_post_rgb_min"] = decoded_clamped.detach().float().amin().cpu()
+    diagnostics["clamp_post_rgb_max"] = decoded_clamped.detach().float().amax().cpu()
+    diagnostics["clamp_post_rgb_mean"] = decoded_clamped.detach().float().mean().cpu()
+    diagnostics["clamp_decoded_pre"] = decoded.detach().float().cpu().squeeze(0)
+    diagnostics["clamp_delta_rgb"] = (decoded_clamped - decoded).detach().float().cpu().squeeze(0)
+    diagnostics["clamp_target_rgb"] = target_rgb.detach().float().cpu().squeeze(0)
+    diagnostics["clamp_hard_mask"] = hard.detach().float().cpu().squeeze(0)
+    diagnostics["clamp_combined_mask"] = blend.detach().float().cpu().squeeze(0)
+    diagnostics["clamp_decoded_post"] = decoded_clamped.detach().float().cpu().squeeze(0)
+    diagnostics["clamp_decoded_reencoded"] = decoded_reencoded.detach().float().cpu().squeeze(0)
+    return pred_x0_clamped, diagnostics
 
 
 def _render_one(
@@ -521,6 +1169,14 @@ def _render_one(
     alpha_output_source: str,
     expanded_prediction_enabled: bool = False,
     expanded_halo_px: int = 0,
+    seam_denoise_clamp: bool = False,
+    seam_denoise_clamp_inner_px: int = 0,
+    seam_denoise_clamp_feather_px: int = 160,
+    seam_denoise_clamp_feather_profile: str = "smoothstep",
+    seam_denoise_clamp_every_n_steps: int = 1,
+    seam_denoise_clamp_mode: str = "latent",
+    seam_denoise_clamp_hard_threshold: float = 0.5,
+    conditioning_spec: Optional[ModelVisibleConditioningSpec] = None,
     override_conditioning: Optional[torch.Tensor] = None,
     override_full_conditioning: Optional[torch.Tensor] = None,
 ) -> Dict[str, object]:
@@ -528,7 +1184,27 @@ def _render_one(
         cond = override_full_conditioning.unsqueeze(0).to(device=device, dtype=control_dtype)
     else:
         raw_cond = override_conditioning if override_conditioning is not None else sample["conditioning_images"]
-        visible_cond = _compose_model_visible_conditioning(sample, raw_cond)
+        if conditioning_spec is None:
+            full_channel_names = sample.get("full_conditioning_channel_names") or sample.get("channel_names") or []
+            channel_names = sample.get("channel_names") or []
+            seam_channel_count = 0
+            if isinstance(sample.get("seam_strip_tensor"), torch.Tensor):
+                seam_channel_count += int(sample["seam_strip_tensor"].shape[0])
+            if isinstance(sample.get("edge_flag_maps"), torch.Tensor):
+                seam_channel_count += int(sample["edge_flag_maps"].shape[0])
+            style_start = min(len(full_channel_names), int(raw_cond.shape[0]) + seam_channel_count)
+            conditioning_spec = build_model_visible_conditioning_spec(
+                seam_enabled=isinstance(sample.get("seam_strip_tensor"), torch.Tensor),
+                channel_names=channel_names,
+                full_conditioning_channel_names=full_channel_names,
+                style_conditioning_channel_names=full_channel_names[style_start:],
+                seam_config={},
+                style_ratio_config={},
+                terrain_mask_channel_index=int(channel_names.index("terrain_mask")) if "terrain_mask" in channel_names else -1,
+                terrain_mask_black_is_terrain=True,
+                alpha_binary_threshold=0.5,
+            )
+        visible_cond = _compose_model_visible_conditioning(sample, raw_cond, conditioning_spec)
         cond = visible_cond.unsqueeze(0).to(device=device, dtype=control_dtype)
 
     interior_h = int(sample["target_sizes_hw"][0].item())
@@ -538,7 +1214,13 @@ def _render_one(
     target_h, target_w = (interior_h, interior_w)
     if use_expanded:
         target_h, target_w = expanded_hw(interior_h, interior_w, halo_px)
-        cond = pad_chw_spatial(cond.squeeze(0), halo_px=halo_px, mode="constant").unsqueeze(0).to(device=device, dtype=control_dtype)
+        if tuple(cond.shape[-2:]) == (interior_h, interior_w):
+            cond = pad_chw_spatial(cond.squeeze(0), halo_px=halo_px, mode="constant").unsqueeze(0).to(device=device, dtype=control_dtype)
+        elif tuple(cond.shape[-2:]) != (target_h, target_w):
+            raise ValueError(
+                "expanded generic eval conditioning shape mismatch: "
+                + f"got={tuple(cond.shape[-2:])} expected={(target_h, target_w)}"
+            )
 
     te1, te2, pool2 = cached_text
     text_embedding = torch.cat([te1, te2], dim=2)
@@ -565,8 +1247,31 @@ def _render_one(
     scheduler.set_timesteps(max(2, steps), device=device)
     alpha_probs = None
     alpha_logits = None
+    clamp_enabled = bool(seam_denoise_clamp) and use_expanded and halo_px > 0
+    clamp_payload = None
+    if clamp_enabled:
+        clamp_payload = _prepare_seam_denoise_clamp_payload(
+            sample=sample,
+            interior_h=interior_h,
+            interior_w=interior_w,
+            halo_px=halo_px,
+            inner_px=int(seam_denoise_clamp_inner_px),
+            feather_px=int(seam_denoise_clamp_feather_px),
+            feather_profile=str(seam_denoise_clamp_feather_profile),
+            hard_threshold=float(seam_denoise_clamp_hard_threshold),
+            clamp_mode=seam_denoise_clamp_mode,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            vae=vae,
+            vae_dtype=vae_dtype,
+            device=device,
+        )
+        clamp_enabled = clamp_payload is not None
+    clamp_steps_applied = 0
+    clamp_diagnostics: Dict[str, torch.Tensor] = {}
+    pred_x0 = None
     with torch.no_grad():
-        for timestep in scheduler.timesteps:
+        for step_index, timestep in enumerate(scheduler.timesteps):
             t = timestep.expand(1).to(device=device, dtype=torch.long)
             input_resi_add, mid_add, alpha_outputs = control_net(
                 noisy.to(dtype=control_dtype),
@@ -585,10 +1290,32 @@ def _render_one(
                 [x.to(dtype=weight_dtype) for x in input_resi_add],
                 mid_add.to(dtype=weight_dtype),
             )
-            noisy = scheduler.step(eps, timestep, noisy).prev_sample
+            step_out = scheduler.step(eps, timestep, noisy)
+            pred_x0 = step_out.pred_original_sample.to(dtype=torch.float32)
+            if clamp_enabled and (
+                (step_index % max(1, int(seam_denoise_clamp_every_n_steps)) == 0)
+                or (step_index == len(scheduler.timesteps) - 1)
+            ):
+                capture_rgb_diagnostics = step_index == len(scheduler.timesteps) - 1
+                pred_x0_clamped, clamp_diagnostics = _apply_seam_denoise_clamp(
+                    pred_x0,
+                    clamp_mode=seam_denoise_clamp_mode,
+                    clamp_payload=clamp_payload,
+                    vae=vae,
+                    vae_dtype=vae_dtype,
+                    capture_rgb_diagnostics=capture_rgb_diagnostics,
+                )
+                coeff = _ddpm_pred_original_sample_coeff(scheduler, timestep).to(device=step_out.prev_sample.device, dtype=step_out.prev_sample.dtype)
+                coeff = coeff.view(1, 1, 1, 1)
+                noisy = step_out.prev_sample + coeff * (pred_x0_clamped.to(dtype=step_out.prev_sample.dtype) - pred_x0.to(dtype=step_out.prev_sample.dtype))
+                pred_x0 = pred_x0_clamped
+                clamp_steps_applied += 1
+            else:
+                noisy = step_out.prev_sample
 
-        alpha_t = scheduler.alphas_cumprod[scheduler.timesteps[-1]].to(device=device, dtype=torch.float32).view(1, 1, 1, 1)
-        pred_x0 = noisy.float() / alpha_t.sqrt()
+        if pred_x0 is None:
+            alpha_t = scheduler.alphas_cumprod[scheduler.timesteps[-1]].to(device=device, dtype=torch.float32).view(1, 1, 1, 1)
+            pred_x0 = noisy.float() / alpha_t.sqrt()
         decoded = vae.decode((pred_x0 / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample[0]
 
         selected_logits = _select_eval_alpha_logits(alpha_outputs, alpha_output_source)
@@ -648,7 +1375,81 @@ def _render_one(
         "expanded_halo_px": float(halo_px),
         "expanded_rgb_tensor": expanded_decoded_cpu,
         "expanded_alpha_prob": expanded_alpha_probs,
+        "seam_denoise_clamp_enabled": float(1.0 if clamp_enabled else 0.0),
+        "seam_denoise_clamp_steps_applied": float(clamp_steps_applied),
+        "seam_denoise_clamp_expected_steps": float(
+            0.0
+            if not clamp_enabled
+            else len(
+                [
+                    i
+                    for i in range(len(scheduler.timesteps))
+                    if (i % max(1, int(seam_denoise_clamp_every_n_steps)) == 0)
+                    or (i == len(scheduler.timesteps) - 1)
+                ]
+            )
+        ),
+        "seam_denoise_clamp_mode": str(seam_denoise_clamp_mode),
     }
+    if clamp_diagnostics:
+        output["clamp_combined_mask"] = clamp_diagnostics.get("clamp_combined_mask")
+        output["clamp_hard_mask"] = clamp_diagnostics.get("clamp_hard_mask")
+        if clamp_diagnostics.get("clamp_decoded_pre") is not None:
+            output["clamp_decoded_pre"] = clamp_diagnostics["clamp_decoded_pre"]
+        if clamp_diagnostics.get("clamp_decoded_post") is not None:
+            output["clamp_decoded_post"] = clamp_diagnostics["clamp_decoded_post"]
+        if clamp_diagnostics.get("clamp_decoded_reencoded") is not None:
+            output["clamp_decoded_reencoded"] = clamp_diagnostics["clamp_decoded_reencoded"]
+        if clamp_diagnostics.get("clamp_target_rgb") is not None:
+            output["clamp_target_rgb"] = clamp_diagnostics["clamp_target_rgb"]
+        if clamp_diagnostics.get("clamp_delta_rgb") is not None:
+            clamp_delta = clamp_diagnostics["clamp_delta_rgb"]
+            output["clamp_delta_rgb"] = clamp_delta
+            output["seam_denoise_clamp_delta_mean"] = float(clamp_delta.abs().mean().item())
+            output["seam_denoise_clamp_delta_max"] = float(clamp_delta.abs().max().item())
+        elif clamp_diagnostics.get("clamp_delta_latent") is not None:
+            clamp_delta = clamp_diagnostics["clamp_delta_latent"]
+            output["clamp_delta_latent"] = clamp_delta.detach().float().cpu()
+            output["seam_denoise_clamp_delta_mean"] = float(clamp_delta.abs().mean().item())
+            output["seam_denoise_clamp_delta_max"] = float(clamp_delta.abs().max().item())
+        if clamp_diagnostics.get("clamp_hard_mask_raw") is not None:
+            output["clamp_hard_mask_raw"] = clamp_diagnostics["clamp_hard_mask_raw"]
+        if clamp_diagnostics.get("clamp_soft_mask_latent") is not None:
+            output["clamp_soft_mask_latent"] = clamp_diagnostics["clamp_soft_mask_latent"]
+        if clamp_diagnostics.get("clamp_hard_threshold") is not None:
+            output["seam_denoise_clamp_hard_threshold"] = float(clamp_diagnostics["clamp_hard_threshold"].item())
+        for stat_key in (
+            "clamp_pre_rgb_min",
+            "clamp_pre_rgb_max",
+            "clamp_pre_rgb_mean",
+            "clamp_target_rgb_min",
+            "clamp_target_rgb_max",
+            "clamp_target_rgb_mean",
+            "clamp_post_rgb_min",
+            "clamp_post_rgb_max",
+            "clamp_post_rgb_mean",
+        ):
+            if clamp_diagnostics.get(stat_key) is not None:
+                output[stat_key] = float(clamp_diagnostics[stat_key].item())
+    if clamp_payload is not None:
+        if output.get("clamp_target_rgb") is None and clamp_payload.get("target_rgb") is not None:
+            output["clamp_target_rgb"] = clamp_payload["target_rgb"].detach().float().cpu()
+        output["seam_denoise_clamp_applied_px"] = float(clamp_payload["applied_px"].item())
+        output["seam_denoise_clamp_hard_applied_px"] = float(clamp_payload["hard_applied_px"].item())
+        output["seam_denoise_clamp_feather_applied_px"] = float(clamp_payload["feather_applied_px"].item())
+        output["seam_denoise_clamp_undefined_overlap_px"] = float(clamp_payload["undefined_overlap_px"].item())
+        if clamp_payload.get("latent_support_boundary_px") is not None:
+            output["seam_denoise_clamp_latent_support_boundary_px"] = float(clamp_payload["latent_support_boundary_px"].item())
+        if clamp_payload.get("latent_hard_support_touch_px") is not None:
+            output["seam_denoise_clamp_latent_hard_support_touch_px"] = float(clamp_payload["latent_hard_support_touch_px"].item())
+        if clamp_payload.get("latent_hard_touches_support") is not None:
+            output["seam_denoise_clamp_latent_hard_touches_support"] = float(clamp_payload["latent_hard_touches_support"].item())
+        if clamp_payload.get("latent_boundary_gap_px") is not None:
+            output["seam_denoise_clamp_latent_boundary_gap_px"] = float(clamp_payload["latent_boundary_gap_px"].item())
+        if clamp_payload.get("latent_boundary_gap_ratio") is not None:
+            output["seam_denoise_clamp_latent_boundary_gap_ratio"] = float(clamp_payload["latent_boundary_gap_ratio"].item())
+        if clamp_payload.get("hard_threshold") is not None:
+            output["seam_denoise_clamp_hard_threshold"] = float(clamp_payload["hard_threshold"].item())
     if debug_latent is not None:
         output["pred_x0_latent"] = debug_latent
     return output
@@ -807,6 +1608,12 @@ def run_eval_step(
         },
         "expanded_prediction_enabled": bool(eval_config.get("expanded_prediction_enabled", False)),
         "expanded_halo_px": int(eval_config.get("expanded_halo_px", 0)),
+        "seam_denoise_clamp": bool(eval_config.get("seam_denoise_clamp", False)),
+        "seam_denoise_clamp_inner_px": int(eval_config.get("seam_denoise_clamp_inner_px", 0)),
+        "seam_denoise_clamp_feather_px": int(eval_config.get("seam_denoise_clamp_feather_px", 160)),
+        "seam_denoise_clamp_feather_profile": str(eval_config.get("seam_denoise_clamp_feather_profile", "smoothstep")),
+        "seam_denoise_clamp_every_n_steps": int(eval_config.get("seam_denoise_clamp_every_n_steps", 1)),
+        "seam_denoise_clamp_mode": str(eval_config.get("seam_denoise_clamp_mode", "latent")),
     }
     _write_json(os.path.join(step_dir, "eval_run_config.json"), run_config)
 
@@ -817,6 +1624,17 @@ def run_eval_step(
 
     terrain_mask_index = dataset.channel_names.index("terrain_mask")
     terrain_black_is_terrain = bool(eval_config.get("terrain_mask_black_is_terrain", True))
+    conditioning_spec = build_model_visible_conditioning_spec(
+        seam_enabled=bool(getattr(dataset, "seam_enabled", False)),
+        channel_names=getattr(dataset, "channel_names", []),
+        full_conditioning_channel_names=getattr(dataset, "full_conditioning_channel_names", []),
+        style_conditioning_channel_names=getattr(dataset, "style_conditioning_channel_names", []),
+        seam_config=getattr(dataset, "seam_config", {}),
+        style_ratio_config=getattr(dataset, "style_ratio_config", {}),
+        terrain_mask_channel_index=int(getattr(dataset, "terrain_mask_channel_index", -1)),
+        terrain_mask_black_is_terrain=bool(getattr(dataset, "terrain_mask_black_is_terrain", True)),
+        alpha_binary_threshold=float(getattr(dataset, "alpha_binary_threshold", 0.5)),
+    )
     full_scene_for_panel: Optional[Tuple[EvalSample, Dict[str, object], Dict[str, object]]] = None
 
     for sample_info in resolved_samples:
@@ -849,6 +1667,14 @@ def run_eval_step(
                 alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
                 expanded_prediction_enabled=bool(eval_config.get("expanded_prediction_enabled", False)),
                 expanded_halo_px=int(eval_config.get("expanded_halo_px", 0)),
+                seam_denoise_clamp=bool(eval_config.get("seam_denoise_clamp", False)),
+                seam_denoise_clamp_inner_px=int(eval_config.get("seam_denoise_clamp_inner_px", 0)),
+                seam_denoise_clamp_feather_px=int(eval_config.get("seam_denoise_clamp_feather_px", 160)),
+                seam_denoise_clamp_feather_profile=str(eval_config.get("seam_denoise_clamp_feather_profile", "smoothstep")),
+                seam_denoise_clamp_every_n_steps=int(eval_config.get("seam_denoise_clamp_every_n_steps", 1)),
+                seam_denoise_clamp_mode=str(eval_config.get("seam_denoise_clamp_mode", "latent")),
+                seam_denoise_clamp_hard_threshold=float(eval_config.get("seam_denoise_clamp_hard_threshold", 0.5)),
+                conditioning_spec=conditioning_spec,
             )
             rgb_path = os.path.join(step_dir, f"{sample_info.eval_id}_seed{seed:06d}_rgb.png")
             pred_alpha_path = os.path.join(step_dir, f"{sample_info.eval_id}_seed{seed:06d}_pred_alpha.png")
@@ -868,6 +1694,42 @@ def run_eval_step(
                     debug_dir = os.path.join(step_dir, "debug")
                     os.makedirs(debug_dir, exist_ok=True)
                     torch.save(render["pred_x0_latent"], os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_latent.pt"))
+                if render.get("clamp_combined_mask") is not None:
+                    debug_dir = os.path.join(step_dir, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    _mask_to_image(render["clamp_combined_mask"].squeeze(0) if render["clamp_combined_mask"].ndim == 3 else render["clamp_combined_mask"]).save(
+                        os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_clamp_applied_mask.png")
+                    )
+                if render.get("clamp_hard_mask") is not None:
+                    debug_dir = os.path.join(step_dir, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    _mask_to_image(render["clamp_hard_mask"].squeeze(0) if render["clamp_hard_mask"].ndim == 3 else render["clamp_hard_mask"]).save(
+                        os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_clamp_hard_mask.png")
+                    )
+                if render.get("clamp_target_rgb") is not None:
+                    debug_dir = os.path.join(step_dir, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    _tensor_to_image(render["clamp_target_rgb"]).save(
+                        os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_clamp_target_rgb.png")
+                    )
+                if render.get("clamp_decoded_pre") is not None:
+                    debug_dir = os.path.join(step_dir, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    _tensor_to_image(render["clamp_decoded_pre"]).save(
+                        os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_preclamp_rgb.png")
+                    )
+                if render.get("clamp_decoded_post") is not None:
+                    debug_dir = os.path.join(step_dir, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    _tensor_to_image(render["clamp_decoded_post"]).save(
+                        os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_postclamp_rgb.png")
+                    )
+                if render.get("clamp_delta_rgb") is not None:
+                    debug_dir = os.path.join(step_dir, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    _float_to_grayscale_image(render["clamp_delta_rgb"].abs().mean(dim=0)).save(
+                        os.path.join(debug_dir, f"{sample_info.eval_id}_seed{seed:06d}_clamp_delta_map.png")
+                    )
 
         assert primary_render is not None
         edge_map_var = _edge_map_variance([_smooth_edge_map(img) for img in seed_rgb_list])
@@ -878,6 +1740,10 @@ def run_eval_step(
         halo_inner_edge_4px_rgb_loss = 0.0
         halo_inner_8px_rgb_loss = 0.0
         halo_inner_16px_rgb_loss = 0.0
+        pre_clamp_inner_8px_loss = 0.0
+        post_clamp_inner_8px_loss = 0.0
+        post_clamp_decoded_inner_8px_loss = 0.0
+        final_inner_8px_loss = 0.0
         interior_continuation_l1 = 0.0
         halo_to_interior_alignment = 0.0
         halo_effect_strength = 0.0
@@ -896,6 +1762,7 @@ def run_eval_step(
             expanded_rgb = ((expanded_rgb + 1.0) * 0.5).permute(1, 2, 0).numpy()
             expanded_alpha = primary_render["expanded_alpha_prob"].detach().float().cpu().numpy()
             pred_rgba_exp = np.concatenate([expanded_rgb, expanded_alpha[..., None]], axis=2)
+            pred_rgb_exp = pred_rgba_exp[..., :3]
 
             expected_rgba_exp = _build_expected_expanded_seam_rgba(
                 sample=sample,
@@ -904,6 +1771,7 @@ def run_eval_step(
                 halo_px=halo_px,
             )
             if expected_rgba_exp is not None and expected_rgba_exp.shape[0] == exp_h and expected_rgba_exp.shape[1] == exp_w:
+                expected_rgb_exp = expected_rgba_exp[..., :3]
                 band = max(1, min(int(eval_config.get("halo_inner_eval_px", 32)), halo_px))
                 continuation_band = max(1, min(int(sample.get("seam_strip_width_px", torch.tensor(float(halo_px))).item()), halo_px))
                 masks = _build_expanded_edge_masks(exp_h, exp_w, halo_px=halo_px, band_px=band)
@@ -920,12 +1788,25 @@ def run_eval_step(
                 halo_edge_4_vals: List[float] = []
                 halo_edge_8_vals: List[float] = []
                 halo_edge_16_vals: List[float] = []
+                pre_clamp_edge_8_vals: List[float] = []
+                post_clamp_edge_8_vals: List[float] = []
+                final_edge_8_vals: List[float] = []
                 interior_vals: List[float] = []
                 align_vals: List[float] = []
                 copy_diff_sums: List[float] = []
                 copy_diff_counts: List[float] = []
                 copy_diff_max_values: List[float] = []
                 per_pixel_rgba_diff = np.mean(np.abs(pred_rgba_exp - expected_rgba_exp), axis=2)
+                pre_clamp_rgb = primary_render.get("clamp_decoded_pre")
+                post_clamp_rgb = primary_render.get("clamp_decoded_post")
+                if isinstance(pre_clamp_rgb, torch.Tensor):
+                    pre_clamp_rgb = ((pre_clamp_rgb.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).permute(1, 2, 0).numpy()
+                else:
+                    pre_clamp_rgb = None
+                if isinstance(post_clamp_rgb, torch.Tensor):
+                    post_clamp_rgb = ((post_clamp_rgb.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).permute(1, 2, 0).numpy()
+                else:
+                    post_clamp_rgb = None
                 for side_idx, side in enumerate(sides):
                     if side_idx < len(ef) and ef[side_idx] < 0.5:
                         continue
@@ -935,10 +1816,15 @@ def run_eval_step(
                     m_all = masks[side]["halo_all"]
                     halo_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_h))
                     halo_outer_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_ho))
-                    halo_edge_1_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_edge_1px"]))
-                    halo_edge_4_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_edge_4px"]))
-                    halo_edge_8_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_8px"]))
-                    halo_edge_16_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, masks[side]["halo_inner_16px"]))
+                    halo_edge_1_vals.append(_masked_l1(pred_rgb_exp, expected_rgb_exp, masks[side]["halo_inner_edge_1px"]))
+                    halo_edge_4_vals.append(_masked_l1(pred_rgb_exp, expected_rgb_exp, masks[side]["halo_inner_edge_4px"]))
+                    halo_edge_8_vals.append(_masked_l1(pred_rgb_exp, expected_rgb_exp, masks[side]["halo_inner_8px"]))
+                    halo_edge_16_vals.append(_masked_l1(pred_rgb_exp, expected_rgb_exp, masks[side]["halo_inner_16px"]))
+                    final_edge_8_vals.append(_masked_l1(pred_rgb_exp, expected_rgb_exp, masks[side]["halo_inner_8px"]))
+                    if pre_clamp_rgb is not None:
+                        pre_clamp_edge_8_vals.append(_masked_l1(pre_clamp_rgb, expected_rgb_exp, masks[side]["halo_inner_8px"]))
+                    if post_clamp_rgb is not None:
+                        post_clamp_edge_8_vals.append(_masked_l1(post_clamp_rgb, expected_rgb_exp, masks[side]["halo_inner_8px"]))
                     interior_vals.append(_masked_l1(pred_rgba_exp, expected_rgba_exp, m_i))
                     align_vals.append(
                         _mean_gradient_cosine(
@@ -949,21 +1835,23 @@ def run_eval_step(
                     )
                     copy_diff_sums.append(float(np.sum(per_pixel_rgba_diff * m_all)))
                     copy_diff_counts.append(float(np.sum(m_all)))
-                    if float(np.sum(m_all)) > 0.0:
-                        copy_diff_max_values.append(float(np.max(per_pixel_rgba_diff[m_all > 0.0])))
-
                 if halo_vals:
                     halo_inner_recon_l1 = float(np.mean(halo_vals))
                 if halo_outer_vals:
                     halo_outer_recon_l1 = float(np.mean(halo_outer_vals))
-                if halo_edge_1_vals:
-                    halo_inner_edge_1px_rgb_loss = float(np.mean(halo_edge_1_vals))
                 if halo_edge_4_vals:
                     halo_inner_edge_4px_rgb_loss = float(np.mean(halo_edge_4_vals))
                 if halo_edge_8_vals:
                     halo_inner_8px_rgb_loss = float(np.mean(halo_edge_8_vals))
                 if halo_edge_16_vals:
                     halo_inner_16px_rgb_loss = float(np.mean(halo_edge_16_vals))
+                if pre_clamp_edge_8_vals:
+                    pre_clamp_inner_8px_loss = float(np.mean(pre_clamp_edge_8_vals))
+                if post_clamp_edge_8_vals:
+                    post_clamp_inner_8px_loss = float(np.mean(post_clamp_edge_8_vals))
+                    post_clamp_decoded_inner_8px_loss = float(np.mean(post_clamp_edge_8_vals))
+                if final_edge_8_vals:
+                    final_inner_8px_loss = float(np.mean(final_edge_8_vals))
                 if interior_vals:
                     interior_continuation_l1 = float(np.mean(interior_vals))
                 if align_vals:
@@ -974,7 +1862,7 @@ def run_eval_step(
                     expanded_halo_copy_diff_max = float(max(copy_diff_max_values))
 
                 try:
-                    full_cond = _compose_model_visible_conditioning(sample, sample["conditioning_images"])
+                    full_cond = _compose_model_visible_conditioning(sample, sample["conditioning_images"], conditioning_spec)
                     if isinstance(full_cond, torch.Tensor):
                         cond_zero = full_cond.clone()
                         base_ch = int(sample["conditioning_images"].shape[0])
@@ -998,6 +1886,7 @@ def run_eval_step(
                             alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
                             expanded_prediction_enabled=use_expanded,
                             expanded_halo_px=halo_px,
+                            conditioning_spec=conditioning_spec,
                             override_full_conditioning=cond_zero,
                         )
                         base_rgb = np.asarray(primary_render["rgb"].convert("RGB"), dtype=np.float32)
@@ -1024,6 +1913,7 @@ def run_eval_step(
                         alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
                         expanded_prediction_enabled=False,
                         expanded_halo_px=0,
+                        conditioning_spec=conditioning_spec,
                     )
                     base_rgb = np.asarray(primary_render["rgb"].convert("RGB"), dtype=np.float32)
                     direct_rgb = np.asarray(direct_render["rgb"].convert("RGB"), dtype=np.float32)
@@ -1104,6 +1994,10 @@ def run_eval_step(
                 "halo_inner_edge_4px_rgb_loss": halo_inner_edge_4px_rgb_loss,
                 "halo_inner_8px_rgb_loss": halo_inner_8px_rgb_loss,
                 "halo_inner_16px_rgb_loss": halo_inner_16px_rgb_loss,
+                "pre_clamp_inner_8px_loss": pre_clamp_inner_8px_loss,
+                "post_clamp_inner_8px_loss": post_clamp_inner_8px_loss,
+                "post_clamp_decoded_inner_8px_loss": post_clamp_decoded_inner_8px_loss,
+                "final_inner_8px_loss": final_inner_8px_loss,
                 "interior_continuation_l1": interior_continuation_l1,
                 "halo_to_interior_alignment": halo_to_interior_alignment,
                 "halo_effect_strength": halo_effect_strength,
@@ -1111,6 +2005,20 @@ def run_eval_step(
                 "expanded_vs_direct_alpha_l1": expanded_vs_direct_alpha_l1,
                 "expanded_halo_copy_diff_mean": expanded_halo_copy_diff_mean,
                 "expanded_halo_copy_diff_max": expanded_halo_copy_diff_max,
+                "seam_denoise_clamp_enabled": float(render.get("seam_denoise_clamp_enabled", 0.0)),
+                "seam_denoise_clamp_steps_applied": float(render.get("seam_denoise_clamp_steps_applied", 0.0)),
+                "seam_denoise_clamp_expected_steps": float(render.get("seam_denoise_clamp_expected_steps", 0.0)),
+                "seam_denoise_clamp_applied_px": float(render.get("seam_denoise_clamp_applied_px", 0.0)),
+                "seam_denoise_clamp_hard_applied_px": float(render.get("seam_denoise_clamp_hard_applied_px", 0.0)),
+                "seam_denoise_clamp_feather_applied_px": float(render.get("seam_denoise_clamp_feather_applied_px", 0.0)),
+                "seam_denoise_clamp_undefined_overlap_px": float(render.get("seam_denoise_clamp_undefined_overlap_px", 0.0)),
+                "seam_denoise_clamp_delta_mean": float(render.get("seam_denoise_clamp_delta_mean", 0.0)),
+                "seam_denoise_clamp_delta_max": float(render.get("seam_denoise_clamp_delta_max", 0.0)),
+                "seam_denoise_clamp_latent_support_boundary_px": float(render.get("seam_denoise_clamp_latent_support_boundary_px", 0.0)),
+                "seam_denoise_clamp_latent_hard_support_touch_px": float(render.get("seam_denoise_clamp_latent_hard_support_touch_px", 0.0)),
+                "seam_denoise_clamp_latent_hard_touches_support": float(render.get("seam_denoise_clamp_latent_hard_touches_support", 0.0)),
+                "seam_denoise_clamp_latent_boundary_gap_px": float(render.get("seam_denoise_clamp_latent_boundary_gap_px", 0.0)),
+                "seam_denoise_clamp_latent_boundary_gap_ratio": float(render.get("seam_denoise_clamp_latent_boundary_gap_ratio", 0.0)),
             }
         )
 
@@ -1226,6 +2134,10 @@ def run_eval_step(
             "halo_inner_edge_4px_rgb_loss",
             "halo_inner_8px_rgb_loss",
             "halo_inner_16px_rgb_loss",
+            "pre_clamp_inner_8px_loss",
+            "post_clamp_inner_8px_loss",
+            "post_clamp_decoded_inner_8px_loss",
+            "final_inner_8px_loss",
             "interior_continuation_l1",
             "halo_to_interior_alignment",
             "halo_effect_strength",
@@ -1233,6 +2145,20 @@ def run_eval_step(
             "expanded_vs_direct_alpha_l1",
             "expanded_halo_copy_diff_mean",
             "expanded_halo_copy_diff_max",
+            "seam_denoise_clamp_enabled",
+            "seam_denoise_clamp_steps_applied",
+            "seam_denoise_clamp_expected_steps",
+            "seam_denoise_clamp_applied_px",
+            "seam_denoise_clamp_hard_applied_px",
+            "seam_denoise_clamp_feather_applied_px",
+            "seam_denoise_clamp_undefined_overlap_px",
+            "seam_denoise_clamp_delta_mean",
+            "seam_denoise_clamp_delta_max",
+            "seam_denoise_clamp_latent_support_boundary_px",
+            "seam_denoise_clamp_latent_hard_support_touch_px",
+            "seam_denoise_clamp_latent_hard_touches_support",
+            "seam_denoise_clamp_latent_boundary_gap_px",
+            "seam_denoise_clamp_latent_boundary_gap_ratio",
         ],
     )
 
@@ -1262,6 +2188,7 @@ def run_eval_step(
             alpha_output_source=str(eval_config.get("alpha_output_source", "main")),
             expanded_prediction_enabled=bool(eval_config.get("expanded_prediction_enabled", False)),
             expanded_halo_px=int(eval_config.get("expanded_halo_px", 0)),
+            conditioning_spec=conditioning_spec,
         )
         full_scene_for_panel = (first, sample, render)
 
@@ -1312,6 +2239,10 @@ def run_eval_step(
         "halo_inner_edge_4px_rgb_loss": float(np.mean([row.get("halo_inner_edge_4px_rgb_loss", 0.0) for row in metrics_rows])),
         "halo_inner_8px_rgb_loss": float(np.mean([row.get("halo_inner_8px_rgb_loss", 0.0) for row in metrics_rows])),
         "halo_inner_16px_rgb_loss": float(np.mean([row.get("halo_inner_16px_rgb_loss", 0.0) for row in metrics_rows])),
+        "pre_clamp_inner_8px_loss": float(np.mean([row.get("pre_clamp_inner_8px_loss", 0.0) for row in metrics_rows])),
+        "post_clamp_inner_8px_loss": float(np.mean([row.get("post_clamp_inner_8px_loss", 0.0) for row in metrics_rows])),
+        "post_clamp_decoded_inner_8px_loss": float(np.mean([row.get("post_clamp_decoded_inner_8px_loss", 0.0) for row in metrics_rows])),
+        "final_inner_8px_loss": float(np.mean([row.get("final_inner_8px_loss", 0.0) for row in metrics_rows])),
         "interior_continuation_l1": float(np.mean([row.get("interior_continuation_l1", 0.0) for row in metrics_rows])),
         "halo_to_interior_alignment": float(np.mean([row.get("halo_to_interior_alignment", 0.0) for row in metrics_rows])),
         "halo_effect_strength": float(np.mean([row.get("halo_effect_strength", 0.0) for row in metrics_rows])),
@@ -1319,6 +2250,20 @@ def run_eval_step(
         "expanded_vs_direct_alpha_l1": float(np.mean([row.get("expanded_vs_direct_alpha_l1", 0.0) for row in metrics_rows])),
         "expanded_halo_copy_diff_mean": float(np.mean([row.get("expanded_halo_copy_diff_mean", 0.0) for row in metrics_rows])),
         "expanded_halo_copy_diff_max": float(np.mean([row.get("expanded_halo_copy_diff_max", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_enabled": float(np.mean([row.get("seam_denoise_clamp_enabled", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_steps_applied": float(np.mean([row.get("seam_denoise_clamp_steps_applied", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_expected_steps": float(np.mean([row.get("seam_denoise_clamp_expected_steps", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_applied_px": float(np.mean([row.get("seam_denoise_clamp_applied_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_hard_applied_px": float(np.mean([row.get("seam_denoise_clamp_hard_applied_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_feather_applied_px": float(np.mean([row.get("seam_denoise_clamp_feather_applied_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_undefined_overlap_px": float(np.mean([row.get("seam_denoise_clamp_undefined_overlap_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_delta_mean": float(np.mean([row.get("seam_denoise_clamp_delta_mean", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_delta_max": float(np.mean([row.get("seam_denoise_clamp_delta_max", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_latent_support_boundary_px": float(np.mean([row.get("seam_denoise_clamp_latent_support_boundary_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_latent_hard_support_touch_px": float(np.mean([row.get("seam_denoise_clamp_latent_hard_support_touch_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_latent_hard_touches_support": float(np.mean([row.get("seam_denoise_clamp_latent_hard_touches_support", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_latent_boundary_gap_px": float(np.mean([row.get("seam_denoise_clamp_latent_boundary_gap_px", 0.0) for row in metrics_rows])),
+        "seam_denoise_clamp_latent_boundary_gap_ratio": float(np.mean([row.get("seam_denoise_clamp_latent_boundary_gap_ratio", 0.0) for row in metrics_rows])),
         "seam_margin_inner_recon_l1": float(np.mean([row.get("halo_inner_recon_l1", 0.0) for row in metrics_rows])),
         "seam_margin_outer_recon_l1": float(np.mean([row.get("halo_outer_recon_l1", 0.0) for row in metrics_rows])),
         "seam_interior_continuation_l1": float(np.mean([row.get("interior_continuation_l1", 0.0) for row in metrics_rows])),
@@ -1578,6 +2523,17 @@ def run_semantic_binding_eval(
     terrain_mask_ch: int = int(binding_config.get("terrain_mask_channel_index", 3))
     ablation_seed: int = int(binding_config.get("ablation_shuffle_seed", 9999))
     alpha_output_source: str = str(binding_config.get("alpha_output_source", "main"))
+    conditioning_spec = build_model_visible_conditioning_spec(
+        seam_enabled=bool(getattr(dataset, "seam_enabled", False)),
+        channel_names=getattr(dataset, "channel_names", []),
+        full_conditioning_channel_names=getattr(dataset, "full_conditioning_channel_names", []),
+        style_conditioning_channel_names=getattr(dataset, "style_conditioning_channel_names", []),
+        seam_config=getattr(dataset, "seam_config", {}),
+        style_ratio_config=getattr(dataset, "style_ratio_config", {}),
+        terrain_mask_channel_index=int(getattr(dataset, "terrain_mask_channel_index", -1)),
+        terrain_mask_black_is_terrain=bool(getattr(dataset, "terrain_mask_black_is_terrain", True)),
+        alpha_binary_threshold=float(getattr(dataset, "alpha_binary_threshold", 0.5)),
+    )
 
     null_space_groups: List[List[int]] = [
         [int(ch) for ch in grp]
@@ -1608,6 +2564,14 @@ def run_semantic_binding_eval(
             seed=seed,
             write_latent_debug=False,
             alpha_output_source=alpha_output_source,
+            seam_denoise_clamp=bool(binding_config.get("seam_denoise_clamp", False)),
+            seam_denoise_clamp_inner_px=int(binding_config.get("seam_denoise_clamp_inner_px", 0)),
+            seam_denoise_clamp_feather_px=int(binding_config.get("seam_denoise_clamp_feather_px", 160)),
+            seam_denoise_clamp_feather_profile=str(binding_config.get("seam_denoise_clamp_feather_profile", "smoothstep")),
+            seam_denoise_clamp_every_n_steps=int(binding_config.get("seam_denoise_clamp_every_n_steps", 1)),
+            seam_denoise_clamp_mode=str(binding_config.get("seam_denoise_clamp_mode", "latent")),
+            seam_denoise_clamp_hard_threshold=float(binding_config.get("seam_denoise_clamp_hard_threshold", 0.5)),
+            conditioning_spec=conditioning_spec,
             override_conditioning=override,
         )["rgb"]
 
@@ -1628,6 +2592,14 @@ def run_semantic_binding_eval(
             seed=seed,
             write_latent_debug=False,
             alpha_output_source=alpha_output_source,
+            seam_denoise_clamp=bool(binding_config.get("seam_denoise_clamp", False)),
+            seam_denoise_clamp_inner_px=int(binding_config.get("seam_denoise_clamp_inner_px", 0)),
+            seam_denoise_clamp_feather_px=int(binding_config.get("seam_denoise_clamp_feather_px", 160)),
+            seam_denoise_clamp_feather_profile=str(binding_config.get("seam_denoise_clamp_feather_profile", "smoothstep")),
+            seam_denoise_clamp_every_n_steps=int(binding_config.get("seam_denoise_clamp_every_n_steps", 1)),
+            seam_denoise_clamp_mode=str(binding_config.get("seam_denoise_clamp_mode", "latent")),
+            seam_denoise_clamp_hard_threshold=float(binding_config.get("seam_denoise_clamp_hard_threshold", 0.5)),
+            conditioning_spec=conditioning_spec,
             override_full_conditioning=full_override,
         )["rgb"]
 
@@ -1714,7 +2686,7 @@ def run_semantic_binding_eval(
         edge_band_masks = base_sample.get("edge_band_masks")
         seam_strip_width_px = int(float(base_sample.get("seam_strip_width_px", 0.0) or 0.0))
         if isinstance(seam_strip, torch.Tensor):
-            full_base_cond = _compose_model_visible_conditioning(base_sample, base_cond)
+            full_base_cond = _compose_model_visible_conditioning(base_sample, base_cond, conditioning_spec)
             strip_start = int(base_cond.shape[0])
             strip_end = strip_start + int(seam_strip.shape[0])
             perturbed_full = _spatial_shuffle_channels(full_base_cond, list(range(strip_start, strip_end)), ablation_seed + 700)

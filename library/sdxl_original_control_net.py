@@ -19,6 +19,11 @@ from library import sdxl_original_unet
 from library.sdxl_model_util import convert_sdxl_unet_state_dict_to_diffusers, convert_diffusers_unet_state_dict_to_sdxl
 
 
+def _smoothstep01(value: torch.Tensor) -> torch.Tensor:
+    value = value.clamp(0.0, 1.0)
+    return value.square() * (3.0 - (2.0 * value))
+
+
 SEAM_EDGE_SLICES = {
     "north": (0, 4),
     "south": (4, 8),
@@ -687,6 +692,15 @@ class SeamLocalHiResAdapter(nn.Module):
         return self.proj_out(hidden)
 
 
+def _module_parameter_norm(module: Optional[nn.Module]) -> float:
+    if module is None:
+        return 0.0
+    total = 0.0
+    for parameter in module.parameters():
+        total += float(parameter.detach().float().pow(2.0).sum().item())
+    return math.sqrt(max(total, 0.0))
+
+
 class ControlNetConditioningEmbedding(nn.Module):
     def __init__(self, conditioning_channels: int = 3, pre_embed_channels: Optional[list[int]] = None):
         super().__init__()
@@ -749,6 +763,16 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         seam_adapter_conditioning_offset: int = -1,
         seam_adapter_per_edge: bool = False,
         seam_adapter_extrusion_mode: str = "decay",
+        seam_adapter_profile: str = "smoothstep",
+        seam_adapter_falloff_power: float = 2.0,
+        seam_adapter_decay_k: float = 0.02,
+        seam_adapter_anchor_px: float = 32.0,
+        seam_adapter_floor_px: float = 16.0,
+        seam_adapter_floor_value: float = 0.85,
+        seam_adapter_style_bias_enabled: bool = False,
+        seam_adapter_style_bias_strength: float = 1.0,
+        seam_adapter_style_bias_decay_k: float = 0.02,
+        seam_adapter_style_bias_profile: str = "smoothstep",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -771,6 +795,16 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         self.seam_adapter_conditioning_offset = int(seam_adapter_conditioning_offset)
         self.seam_adapter_per_edge = bool(seam_adapter_per_edge)
         self.seam_adapter_extrusion_mode = str(seam_adapter_extrusion_mode or "decay").strip().lower()
+        self.seam_adapter_profile = str(seam_adapter_profile or "smoothstep").strip().lower()
+        self.seam_adapter_falloff_power = float(max(1e-3, float(seam_adapter_falloff_power)))
+        self.seam_adapter_decay_k = float(max(0.0, float(seam_adapter_decay_k)))
+        self.seam_adapter_anchor_px = float(max(0.0, float(seam_adapter_anchor_px)))
+        self.seam_adapter_floor_px = float(max(0.0, float(seam_adapter_floor_px)))
+        self.seam_adapter_floor_value = float(min(max(float(seam_adapter_floor_value), 0.0), 1.0))
+        self.seam_adapter_style_bias_enabled = bool(seam_adapter_style_bias_enabled)
+        self.seam_adapter_style_bias_strength = float(max(0.0, float(seam_adapter_style_bias_strength)))
+        self.seam_adapter_style_bias_decay_k = float(max(0.0, float(seam_adapter_style_bias_decay_k)))
+        self.seam_adapter_style_bias_profile = str(seam_adapter_style_bias_profile or seam_adapter_profile or "smoothstep").strip().lower()
         self.seam_adapter_injection_blocks = [
             _normalize_seam_adapter_block_name(block_name)
             for block_name in (list(seam_adapter_injection_blocks or []) if seam_adapter_injection_blocks is not None else [])
@@ -842,7 +876,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         info = super().load_state_dict(sd, strict=True, assign=True)
         return info
 
-    def load_state_dict(self, state_dict: dict, strict: bool = True, assign: bool = True) -> Any:
+    def load_state_dict(self, state_dict: dict, strict: bool = True, assign: bool = False) -> Any:
         # convert state_dict to SAI format
         unet_sd = {}
         for k in list(state_dict.keys()):
@@ -850,6 +884,32 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                 unet_sd[k] = state_dict.pop(k)
         unet_sd = convert_diffusers_unet_state_dict_to_sdxl(unet_sd)
         state_dict.update(unet_sd)
+
+        cond_embedding_key = "controlnet_cond_embedding.pre_blocks.0.weight"
+        loaded_cond_embedding = state_dict.get(cond_embedding_key)
+        current_cond_embedding = self.controlnet_cond_embedding.pre_blocks[0].weight
+        if isinstance(loaded_cond_embedding, torch.Tensor) and tuple(loaded_cond_embedding.shape) != tuple(current_cond_embedding.shape):
+            shape_compatible = (
+                loaded_cond_embedding.ndim == 4
+                and current_cond_embedding.ndim == 4
+                and loaded_cond_embedding.shape[0] == current_cond_embedding.shape[0]
+                and loaded_cond_embedding.shape[2:] == current_cond_embedding.shape[2:]
+                and loaded_cond_embedding.shape[1] <= current_cond_embedding.shape[1]
+            )
+            if shape_compatible:
+                expanded_cond_embedding = current_cond_embedding.detach().clone()
+                expanded_cond_embedding.zero_()
+                expanded_cond_embedding[:, : loaded_cond_embedding.shape[1], :, :] = loaded_cond_embedding.to(
+                    device=expanded_cond_embedding.device,
+                    dtype=expanded_cond_embedding.dtype,
+                )
+                state_dict[cond_embedding_key] = expanded_cond_embedding
+                logger.warning(
+                    "[resume/style_channels] expanded %s from %s to %s by zero-initializing new conditioning channels",
+                    cond_embedding_key,
+                    tuple(loaded_cond_embedding.shape),
+                    tuple(current_cond_embedding.shape),
+                )
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def state_dict(self, destination=None, prefix="", keep_vars=False):
@@ -929,6 +989,11 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
         seam_adapter_ratio = 0.0
         seam_adapter_scale = float(self.seam_adapter_scale if self.seam_adapter_enabled else 0.0)
         seam_sobel_input_energy = 0.0
+        seam_adapter_input_source = "disabled"
+        seam_adapter_maps_from_kwargs = False
+        seam_adapter_resume_info = getattr(self, "seam_adapter_resume_debug", {}) or {}
+        seam_adapter_param_norm = _module_parameter_norm(self.controlnet_seam_adapter)
+        seam_adapter_proj_out_param_norm = float(_module_parameter_norm(getattr(self.controlnet_seam_adapter, "proj_out", None)))
 
         if self.seam_adapter_enabled:
             seam_adapter_maps = kwargs.pop("seam_local_maps", None)
@@ -937,6 +1002,8 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
             seam_edge_valid_count = kwargs.pop("seam_local_edge_valid_count", None)
             seam_edge_valid_flags = kwargs.pop("seam_local_edge_valid_flags", None)
             seam_combined_active_mask = kwargs.pop("seam_local_combined_active_mask", None)
+            seam_adapter_maps_from_kwargs = seam_adapter_maps is not None and seam_adapter_mask is not None
+            seam_adapter_input_source = "kwargs" if seam_adapter_maps_from_kwargs else "conditioning"
             if seam_adapter_maps is None or seam_adapter_mask is None:
                 seam_payload = build_seam_local_adapter_maps_from_conditioning(
                     cond_image,
@@ -1009,6 +1076,13 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
 
                 prepared["batch_size"] = torch.tensor(batch_size, device=current_h.device)
                 prepared["edge_count"] = torch.tensor(edge_count, device=current_h.device)
+                prepared["edge_maps"] = flat_maps.view(
+                    batch_size,
+                    edge_count,
+                    channels,
+                    current_h.shape[-2],
+                    current_h.shape[-1],
+                )
                 prepared["edge_residual_base"] = self.controlnet_seam_adapter(flat_maps).view(
                     batch_size,
                     edge_count,
@@ -1037,11 +1111,95 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                     prepared_invalid = F.interpolate(prepared_invalid, size=current_h.shape[-2:], mode="nearest")
                 prepared["residual_base"] = self.controlnet_seam_adapter(prepared_maps)
                 prepared["mask"] = prepared_mask
+                prepared["maps"] = prepared_maps
                 if prepared_invalid is not None:
                     prepared["invalid_mask"] = prepared_invalid
 
             seam_prepared_cache[spatial_key] = prepared
             return prepared
+
+        def _resolve_seam_adapter_strength(map_tensor: torch.Tensor, mask_tensor: torch.Tensor) -> torch.Tensor:
+            if map_tensor.shape[-3] <= 6:
+                return mask_tensor
+
+            distance_to_seam = map_tensor.select(dim=-3, index=6).unsqueeze(-3).clamp(0.0, 1.0)
+            distance_px = distance_to_seam * float(max(1, int(self.seam_adapter_band_px)))
+            inv = (1.0 - distance_to_seam).clamp(0.0, 1.0)
+
+            if self.seam_adapter_profile == "linear":
+                shape_weight = inv
+            elif self.seam_adapter_profile == "cosine":
+                shape_weight = 0.5 - (0.5 * torch.cos(inv * math.pi))
+            elif self.seam_adapter_profile == "power":
+                shape_weight = inv.pow(self.seam_adapter_falloff_power)
+            elif self.seam_adapter_profile == "piecewise":
+                early_drop_px = 32.0
+                early_drop_value = 0.5
+                near_seam_floor_px = min(8.0, early_drop_px)
+                near_seam_floor_value = max(self.seam_adapter_floor_value, 0.85)
+                early_t = (distance_px / max(early_drop_px, 1e-6)).clamp(0.0, 1.0)
+                early_weight = 1.0 - ((1.0 - early_drop_value) * _smoothstep01(early_t))
+                tail_denom = float(max(1.0, self.seam_adapter_band_px - early_drop_px))
+                tail_t = ((distance_px - early_drop_px) / tail_denom).clamp(0.0, 1.0)
+                tail_weight = early_drop_value * (1.0 - _smoothstep01(tail_t))
+                shape_weight = torch.where(distance_px <= early_drop_px, early_weight, tail_weight)
+                floor_mask = distance_px <= near_seam_floor_px
+                shape_weight = torch.where(
+                    floor_mask,
+                    torch.maximum(shape_weight, torch.full_like(shape_weight, near_seam_floor_value)),
+                    shape_weight,
+                )
+            else:
+                shape_weight = _smoothstep01(inv)
+
+            if self.seam_adapter_decay_k > 0.0:
+                decay_weight = torch.exp(-self.seam_adapter_decay_k * distance_px)
+            else:
+                decay_weight = torch.ones_like(distance_px)
+
+            strength = shape_weight * decay_weight
+            if self.seam_adapter_floor_px > 0.0 and self.seam_adapter_floor_value > 0.0:
+                floor_mask = distance_px < self.seam_adapter_floor_px
+                strength = torch.where(
+                    floor_mask,
+                    torch.maximum(strength, torch.full_like(strength, self.seam_adapter_floor_value)),
+                    strength,
+                )
+            if self.seam_adapter_anchor_px > 0.0:
+                strength = torch.where(distance_px <= self.seam_adapter_anchor_px, torch.ones_like(strength), strength)
+
+            if self.seam_adapter_style_bias_enabled and self.seam_adapter_style_bias_strength > 0.0:
+                if self.seam_adapter_style_bias_profile == "linear":
+                    style_bias_shape = inv
+                elif self.seam_adapter_style_bias_profile == "cosine":
+                    style_bias_shape = 0.5 - (0.5 * torch.cos(inv * math.pi))
+                elif self.seam_adapter_style_bias_profile == "power":
+                    style_bias_shape = inv.pow(self.seam_adapter_falloff_power)
+                elif self.seam_adapter_style_bias_profile == "piecewise":
+                    early_drop_px = 32.0
+                    early_drop_value = 0.5
+                    near_seam_floor_px = min(8.0, early_drop_px)
+                    early_t = (distance_px / max(early_drop_px, 1e-6)).clamp(0.0, 1.0)
+                    early_weight = 1.0 - ((1.0 - early_drop_value) * _smoothstep01(early_t))
+                    tail_denom = float(max(1.0, self.seam_adapter_band_px - early_drop_px))
+                    tail_t = ((distance_px - early_drop_px) / tail_denom).clamp(0.0, 1.0)
+                    tail_weight = early_drop_value * (1.0 - _smoothstep01(tail_t))
+                    style_bias_shape = torch.where(distance_px <= early_drop_px, early_weight, tail_weight)
+                    style_bias_shape = torch.where(
+                        distance_px <= near_seam_floor_px,
+                        torch.maximum(style_bias_shape, torch.full_like(style_bias_shape, 0.85)),
+                        style_bias_shape,
+                    )
+                else:
+                    style_bias_shape = _smoothstep01(inv)
+                if self.seam_adapter_style_bias_decay_k > 0.0:
+                    style_bias_decay = torch.exp(-self.seam_adapter_style_bias_decay_k * distance_px)
+                else:
+                    style_bias_decay = torch.ones_like(distance_px)
+                style_bias = style_bias_shape * style_bias_decay
+                strength = strength * (1.0 + (self.seam_adapter_style_bias_strength * style_bias))
+
+            return (strength.clamp(0.0, 1.0) * mask_tensor).to(dtype=mask_tensor.dtype)
 
         def _apply_seam_adapter_block(current_h: torch.Tensor, block_spec: SimpleNamespace) -> Optional[Dict[str, object]]:
             prepared = _prepare_seam_residual_inputs(current_h)
@@ -1052,6 +1210,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
             block_head_key = str(block_spec.block_index)
             block_head = self.controlnet_seam_adapter_block_heads[block_head_key] if block_head_key in self.controlnet_seam_adapter_block_heads else None
             activation_norm = float(current_h.detach().float().norm().item())
+            head_parameter_norm = _module_parameter_norm(block_head)
 
             if "edge_residual_base" in prepared:
                 edge_residual = prepared["edge_residual_base"]
@@ -1062,12 +1221,16 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                     edge_residual = projected.view(batch_size, edge_count, projected.shape[1], projected.shape[2], projected.shape[3])
 
                 edge_mask = prepared["edge_mask"]
-                masked_residual = edge_residual * edge_mask * block_scale
+                edge_strength = _resolve_seam_adapter_strength(prepared["edge_maps"], edge_mask)
+                pre_scale_masked_residual = edge_residual * edge_strength
+                masked_residual = pre_scale_masked_residual * block_scale
+                per_edge_pre_scale_output_energy = pre_scale_masked_residual.detach().float().reshape(batch_size, edge_count, -1).norm(dim=2)
                 per_edge_output_energy = masked_residual.detach().float().reshape(batch_size, edge_count, -1).norm(dim=2)
-                per_edge_active_px = edge_mask.detach().float().sum(dim=(2, 3, 4))
-                mask_sum = edge_mask.sum(dim=1).clamp_min(1.0)
-                adapter_residual = masked_residual.sum(dim=1) / mask_sum
-                combined_mask = edge_mask.sum(dim=1).clamp(0.0, 1.0)
+                per_edge_active_px = edge_strength.detach().float().sum(dim=(2, 3, 4))
+                strength_sum = edge_strength.sum(dim=1).clamp_min(1.0)
+                pre_scale_residual = pre_scale_masked_residual.sum(dim=1) / strength_sum
+                adapter_residual = masked_residual.sum(dim=1) / strength_sum
+                combined_mask = edge_strength.sum(dim=1).clamp(0.0, 1.0)
                 combined_invalid_mask = torch.zeros_like(combined_mask)
                 per_edge_invalid_output_energy = None
                 if "edge_invalid_mask" in prepared:
@@ -1080,18 +1243,24 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                 adapter_residual = prepared["residual_base"]
                 if block_head is not None:
                     adapter_residual = block_head(adapter_residual)
-                combined_mask = prepared["mask"]
+                combined_mask = _resolve_seam_adapter_strength(prepared["maps"], prepared["mask"])
                 combined_invalid_mask = prepared.get("invalid_mask", torch.zeros_like(combined_mask))
-                adapter_residual = adapter_residual * combined_mask * block_scale
+                pre_scale_residual = adapter_residual * combined_mask
+                adapter_residual = pre_scale_residual * block_scale
+                per_edge_pre_scale_output_energy = None
                 per_edge_output_energy = None
                 per_edge_active_px = None
                 per_edge_invalid_output_energy = None
 
+            pre_scale_output_energy = float(pre_scale_residual.detach().float().norm().item())
             output_energy = float(adapter_residual.detach().float().norm().item())
             ratio = output_energy / max(activation_norm, 1e-12)
             residual_energy_map = adapter_residual.detach().float().pow(2.0).mean(dim=1, keepdim=True).sqrt()
             combined_active_px = float(combined_mask.detach().float().sum().item()) if combined_mask is not None else 0.0
             undefined_output_energy = float((adapter_residual.detach().float() * combined_invalid_mask.detach().float()).norm().item())
+            injected_h = current_h + adapter_residual
+            injected_delta_energy = float((injected_h.detach().float() - current_h.detach().float()).norm().item())
+            post_injection_activation_norm = float(injected_h.detach().float().norm().item())
             per_edge_ratio = None
             if per_edge_output_energy is not None:
                 per_edge_ratio = per_edge_output_energy / max(activation_norm, 1e-12)
@@ -1102,18 +1271,25 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                 "block_index": int(block_spec.block_index),
                 "scale": block_scale,
                 "activation_norm": activation_norm,
+                "parameter_norm": seam_adapter_param_norm,
+                "head_parameter_norm": head_parameter_norm,
+                "pre_scale_output_energy": pre_scale_output_energy,
                 "adapter_residual": adapter_residual,
                 "output_energy": output_energy,
                 "adapter_to_activation_ratio": ratio,
                 "residual_energy_map": residual_energy_map,
+                "injected_delta_energy": injected_delta_energy,
+                "post_injection_activation_norm": post_injection_activation_norm,
                 "combined_active_mask": combined_mask,
                 "combined_active_px": combined_active_px,
                 "combined_invalid_mask": combined_invalid_mask,
                 "undefined_edge_output_energy": undefined_output_energy,
+                "per_edge_pre_scale_output_energy": per_edge_pre_scale_output_energy,
                 "per_edge_output_energy": per_edge_output_energy,
                 "per_edge_active_px": per_edge_active_px,
                 "per_edge_invalid_output_energy": per_edge_invalid_output_energy,
                 "per_edge_ratio": per_edge_ratio,
+                "hook_fired": 1.0,
             }
 
         def _build_seam_adapter_diagnostics_payload() -> Dict[str, object]:
@@ -1128,15 +1304,29 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                 "seam_adapter_enabled": bool(self.seam_adapter_enabled),
                 "seam_adapter_scale": seam_adapter_scale,
                 "seam_adapter_band_px": int(self.seam_adapter_band_px),
+                "seam_adapter_param_norm": seam_adapter_param_norm,
+                "seam_adapter_proj_out_param_norm": seam_adapter_proj_out_param_norm,
                 "seam_adapter_input_energy": seam_input_energy,
+                "seam_adapter_pre_scale_output_energy": float(seam_block_diagnostics.get(seam_primary_block_id, {}).get("pre_scale_output_energy", 0.0) or 0.0),
                 "seam_adapter_output_energy": seam_output_energy,
+                "seam_adapter_injected_delta_energy": float(seam_block_diagnostics.get(seam_primary_block_id, {}).get("injected_delta_energy", 0.0) or 0.0),
+                "seam_adapter_post_injection_activation_norm": float(seam_block_diagnostics.get(seam_primary_block_id, {}).get("post_injection_activation_norm", 0.0) or 0.0),
+                "seam_adapter_hook_fired": float(seam_block_diagnostics.get(seam_primary_block_id, {}).get("hook_fired", 0.0) or 0.0),
                 "seam_adapter_to_activation_ratio": seam_adapter_ratio,
+                "seam_adapter_input_source": seam_adapter_input_source,
+                "seam_adapter_input_from_kwargs": 1.0 if seam_adapter_maps_from_kwargs else 0.0,
+                "seam_adapter_cond_embedding_norm": cond_embedding_norm,
+                "seam_adapter_weights_restored": float(seam_adapter_resume_info.get("weights_restored", 0.0) or 0.0),
+                "seam_adapter_ema_weights_restored": float(seam_adapter_resume_info.get("ema_weights_restored", 0.0) or 0.0),
+                "seam_adapter_checkpoint_proj_out_norm": float(seam_adapter_resume_info.get("checkpoint_proj_out_norm", 0.0) or 0.0),
+                "seam_adapter_checkpoint_proj_out_absmax": float(seam_adapter_resume_info.get("checkpoint_proj_out_absmax", 0.0) or 0.0),
                 "seam_adapter_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
                 "seam_adapter_edge_valid_count": float(seam_edge_valid_count.detach().float().mean().item()) if seam_edge_valid_count is not None else 0.0,
                 "seam_adapter_edge_valid_flags": seam_edge_valid_flags.detach().float().cpu() if seam_edge_valid_flags is not None else None,
                 "seam_adapter_combined_active_px": float(seam_combined_active_mask.detach().float().sum().item()) if seam_combined_active_mask is not None else 0.0,
                 "seam_adapter_corner_active_px": seam_corner_active_px,
                 "seam_adapter_per_edge_input_energy": seam_per_edge_input_energy.detach().float().cpu() if seam_per_edge_input_energy is not None else None,
+                "seam_adapter_per_edge_pre_scale_output_energy": seam_block_diagnostics.get(seam_primary_block_id, {}).get("per_edge_pre_scale_output_energy"),
                 "seam_adapter_per_edge_output_energy": seam_per_edge_output_energy.detach().float().cpu() if seam_per_edge_output_energy is not None else None,
                 "seam_adapter_per_edge_sobel_input_energy": seam_per_edge_sobel_input_energy.detach().float().cpu() if seam_per_edge_sobel_input_energy is not None else None,
                 "seam_adapter_per_edge_invalid_input_energy": seam_per_edge_invalid_input_energy.detach().float().cpu() if seam_per_edge_invalid_input_energy is not None else None,
@@ -1179,10 +1369,16 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                         "block_index": block_payload["block_index"],
                         "scale": float(block_payload["scale"]),
                         "activation_norm": float(block_payload["activation_norm"]),
+                        "parameter_norm": float(block_payload["parameter_norm"]),
+                        "head_parameter_norm": float(block_payload["head_parameter_norm"]),
                         "input_energy": float(seam_input_energy),
                         "sobel_input_energy": float(seam_sobel_input_energy),
+                        "pre_scale_output_energy": float(block_payload["pre_scale_output_energy"]),
                         "output_energy": float(block_payload["output_energy"]),
                         "adapter_to_activation_ratio": float(block_payload["adapter_to_activation_ratio"]),
+                        "injected_delta_energy": float(block_payload["injected_delta_energy"]),
+                        "post_injection_activation_norm": float(block_payload["post_injection_activation_norm"]),
+                        "hook_fired": float(block_payload["hook_fired"]),
                         "active_px": float(block_payload["combined_active_px"]),
                         "undefined_edge_input_energy": float(seam_invalid_input_energy),
                         "undefined_edge_output_energy": float(block_payload["undefined_edge_output_energy"]),
@@ -1191,6 +1387,7 @@ class SdxlControlNet(sdxl_original_unet.SdxlUNet2DConditionModel):
                         "residual_energy_map": block_payload["residual_energy_map"].detach().float().cpu(),
                         "per_edge_input_energy": seam_per_edge_input_energy.detach().float().cpu() if seam_per_edge_input_energy is not None else None,
                         "per_edge_sobel_input_energy": seam_per_edge_sobel_input_energy.detach().float().cpu() if seam_per_edge_sobel_input_energy is not None else None,
+                        "per_edge_pre_scale_output_energy": block_payload["per_edge_pre_scale_output_energy"].detach().float().cpu() if block_payload["per_edge_pre_scale_output_energy"] is not None else None,
                         "per_edge_output_energy": block_payload["per_edge_output_energy"].detach().float().cpu() if block_payload["per_edge_output_energy"] is not None else None,
                         "per_edge_invalid_input_energy": seam_per_edge_invalid_input_energy.detach().float().cpu() if seam_per_edge_invalid_input_energy is not None else None,
                         "per_edge_invalid_output_energy": block_payload["per_edge_invalid_output_energy"].detach().float().cpu() if block_payload["per_edge_invalid_output_energy"] is not None else None,

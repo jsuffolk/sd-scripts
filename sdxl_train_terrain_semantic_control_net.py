@@ -1,12 +1,11 @@
 import argparse
-import copy
 import csv
 import json
 import os
 import random
 import re
 import math
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -43,6 +42,7 @@ from library.terrain_semantic_eval import (
 from library.terrain_semantic_manifest_dataset import (
     SemanticChannelSpec,
     TerrainSemanticManifestDataset,
+    build_style_support_valid_mask as shared_build_style_support_valid_mask,
     build_seam_region_maps as shared_build_seam_region_maps,
     build_seam_supervision_mask as shared_build_seam_supervision_mask,
     center_embed_spatial_tensor as shared_center_embed_spatial_tensor,
@@ -100,8 +100,52 @@ SEAM_ADAPTER_DIAG_FIELDS = (
     "band_px",
     "input_energy",
     "sobel_input_energy",
+    "pre_scale_output_energy",
     "output_energy",
+    "injected_delta_energy",
+    "post_injection_activation_norm",
     "adapter_to_activation_ratio",
+    "cond_embedding_norm",
+    "parameter_norm",
+    "head_parameter_norm",
+    "proj_out_weight_norm",
+    "proj_out_bias_norm",
+    "proj_out_weight_grad_norm",
+    "proj_out_bias_grad_norm",
+    "proj_out_weight_post_step_norm",
+    "proj_out_bias_post_step_norm",
+    "proj_out_weight_delta_abs_sum",
+    "proj_out_bias_delta_abs_sum",
+    "upstream_adapter_grad_norm",
+    "block_heads_grad_norm",
+    "proj_out_weight_requires_grad",
+    "proj_out_bias_requires_grad",
+    "block_heads_require_grad",
+    "proj_out_weight_in_optimizer",
+    "proj_out_bias_in_optimizer",
+    "block_heads_in_optimizer",
+    "proj_out_optimizer_lr",
+    "block_heads_optimizer_lr",
+    "proj_out_optimizer_group",
+    "block_heads_optimizer_group",
+    "proj_out_weight_optimizer_state_present",
+    "proj_out_weight_optimizer_state_step",
+    "proj_out_weight_optimizer_exp_avg_norm",
+    "proj_out_weight_optimizer_exp_avg_sq_norm",
+    "proj_out_weight_optimizer_state_step_post",
+    "proj_out_weight_optimizer_exp_avg_norm_post",
+    "proj_out_weight_optimizer_exp_avg_sq_norm_post",
+    "optimizer_step_was_skipped",
+    "multi_inject_enabled",
+    "scale_block0",
+    "scale_block1",
+    "weights_restored",
+    "ema_weights_restored",
+    "checkpoint_proj_out_norm",
+    "checkpoint_proj_out_absmax",
+    "input_from_kwargs",
+    "hook_fired",
+    "input_source",
     "active_px",
     "edge_valid",
     "edge_valid_count",
@@ -276,15 +320,7 @@ def load_extended_training_state(
     accelerator: Accelerator,
     ema_decay_enabled: bool,
     control_net_model: Optional[torch.nn.Module] = None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> tuple[int, Optional[Dict[str, torch.Tensor]]]:
-    fresh_optimizer_state = copy.deepcopy(optimizer.state_dict()) if optimizer is not None else None
-
-    def _restore_fresh_optimizer_state() -> None:
-        if optimizer is None or fresh_optimizer_state is None:
-            return
-        optimizer.load_state_dict(fresh_optimizer_state)
-
     def _load_checkpoint_state_dict(path: str) -> Dict[str, torch.Tensor]:
         ext = os.path.splitext(path)[1].lower()
         if ext == ".safetensors":
@@ -345,11 +381,56 @@ def load_extended_training_state(
 
         return merged, adapted_keys, skipped_keys
 
+    def _build_seam_adapter_resume_debug_info(state_dir: str, ema_loaded: bool) -> Dict[str, object]:
+        raw_model = control_net_model
+        if raw_model is None:
+            return {}
+
+        model_state_path = _resolve_model_state_path(state_dir)
+        if model_state_path is None:
+            info: Dict[str, object] = {
+                "weights_restored": 0.0,
+                "ema_weights_restored": 0.0,
+                "checkpoint_proj_out_norm": 0.0,
+                "checkpoint_proj_out_absmax": 0.0,
+            }
+            setattr(raw_model, "seam_adapter_resume_debug", info)
+            return info
+
+        source_state = _load_checkpoint_state_dict(model_state_path)
+        adapter_keys = [
+            key
+            for key in source_state.keys()
+            if key.startswith("controlnet_seam_adapter.") or key.startswith("controlnet_seam_adapter_block_heads.")
+        ]
+        checkpoint_proj_out = source_state.get("controlnet_seam_adapter.proj_out.weight")
+        checkpoint_proj_out_norm = float(checkpoint_proj_out.detach().float().norm().item()) if checkpoint_proj_out is not None else 0.0
+        checkpoint_proj_out_absmax = float(checkpoint_proj_out.detach().float().abs().max().item()) if checkpoint_proj_out is not None else 0.0
+        info = {
+            "weights_restored": 1.0 if adapter_keys else 0.0,
+            "ema_weights_restored": 1.0 if ema_loaded and os.path.exists(ema_state_path(state_dir)) else 0.0,
+            "checkpoint_proj_out_norm": checkpoint_proj_out_norm,
+            "checkpoint_proj_out_absmax": checkpoint_proj_out_absmax,
+            "checkpoint_adapter_key_count": float(len(adapter_keys)),
+        }
+        setattr(raw_model, "seam_adapter_resume_debug", info)
+        logger.info(
+            "[resume/seam_adapter] weights_restored=%s ema_weights_restored=%s checkpoint_adapter_keys=%d checkpoint_proj_out_norm=%.6f checkpoint_proj_out_absmax=%.6f",
+            int(info["weights_restored"]),
+            int(info["ema_weights_restored"]),
+            len(adapter_keys),
+            checkpoint_proj_out_norm,
+            checkpoint_proj_out_absmax,
+        )
+        if adapter_keys and checkpoint_proj_out_absmax <= 0.0:
+            logger.warning(
+                "[resume/seam_adapter] checkpoint restored seam adapter tensors but controlnet_seam_adapter.proj_out is still exactly zero"
+            )
+        return info
+
     def _fallback_resume_with_model_only() -> tuple[int, Optional[Dict[str, torch.Tensor]]]:
         if control_net_model is None:
             raise RuntimeError("resume fallback requires control_net_model")
-
-        _restore_fresh_optimizer_state()
 
         model_state_path = _resolve_model_state_path(args.resume)
         if model_state_path is None:
@@ -418,6 +499,8 @@ def load_extended_training_state(
                 )
             logger.info(f"[resume] loaded compatible EMA state from {ema_path}")
 
+        _build_seam_adapter_resume_debug_info(args.resume, resumed_ema_state is not None)
+
         logger.info(f"[resume] restored_global_step={resumed_step} (fallback=model+ema-only)")
         return resumed_step, resumed_ema_state
 
@@ -427,8 +510,6 @@ def load_extended_training_state(
     logger.info(f"[resume] loading training state from {args.resume}")
     try:
         accelerator.load_state(args.resume)
-        if optimizer is not None and control_net_model is not None:
-            verify_optimizer_parameter_membership(optimizer, control_net_model)
     except (RuntimeError, ValueError) as resume_error:
         logger.warning(f"[resume] accelerator.load_state failed: {resume_error}")
         return _fallback_resume_with_model_only()
@@ -446,6 +527,8 @@ def load_extended_training_state(
         resumed_ema_state = load_safetensors(ema_path)
         resumed_ema_state = {key: value.to(device="cpu", dtype=torch.float32) for key, value in resumed_ema_state.items()}
         logger.info(f"[resume] loaded EMA state from {ema_path}")
+
+    _build_seam_adapter_resume_debug_info(args.resume, resumed_ema_state is not None)
 
     logger.info(f"[resume] restored_global_step={resumed_step}")
     return resumed_step, resumed_ema_state
@@ -640,7 +723,7 @@ def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, objec
 def _format_seam_adapter_diag_row(row: Dict[str, object]) -> Dict[str, object]:
     formatted = {}
     for field in SEAM_ADAPTER_DIAG_FIELDS:
-        default_value = "" if field in {"block_id", "edge"} else 0.0
+        default_value = "" if field in {"block_id", "edge", "input_source"} else 0.0
         formatted[field] = row.get(field, default_value)
     return formatted
 
@@ -665,6 +748,53 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
     enabled = 1.0 if diagnostics.get("seam_adapter_enabled", False) else 0.0
     scale = float(diagnostics.get("seam_adapter_scale", 0.0) or 0.0)
     band_px = float(diagnostics.get("seam_adapter_band_px", 0.0) or 0.0)
+    cond_embedding_norm = float(diagnostics.get("seam_adapter_cond_embedding_norm", diagnostics.get("cond_embedding_norm", 0.0)) or 0.0)
+    parameter_norm = float(diagnostics.get("seam_adapter_param_norm", 0.0) or 0.0)
+    proj_out_weight_norm = float(diagnostics.get("seam_adapter_proj_out_weight_norm", 0.0) or 0.0)
+    proj_out_bias_norm = float(diagnostics.get("seam_adapter_proj_out_bias_norm", 0.0) or 0.0)
+    proj_out_weight_grad_norm = float(diagnostics.get("seam_adapter_proj_out_weight_grad_norm", 0.0) or 0.0)
+    proj_out_bias_grad_norm = float(diagnostics.get("seam_adapter_proj_out_bias_grad_norm", 0.0) or 0.0)
+    proj_out_weight_post_step_norm = float(diagnostics.get("seam_adapter_proj_out_weight_post_step_norm", 0.0) or 0.0)
+    proj_out_bias_post_step_norm = float(diagnostics.get("seam_adapter_proj_out_bias_post_step_norm", 0.0) or 0.0)
+    proj_out_weight_delta_abs_sum = float(diagnostics.get("seam_adapter_proj_out_weight_delta_abs_sum", 0.0) or 0.0)
+    proj_out_bias_delta_abs_sum = float(diagnostics.get("seam_adapter_proj_out_bias_delta_abs_sum", 0.0) or 0.0)
+    upstream_adapter_grad_norm = float(diagnostics.get("seam_adapter_upstream_grad_norm", 0.0) or 0.0)
+    block_heads_grad_norm = float(diagnostics.get("seam_adapter_block_heads_grad_norm", 0.0) or 0.0)
+    proj_out_weight_requires_grad = float(diagnostics.get("seam_adapter_proj_out_weight_requires_grad", 0.0) or 0.0)
+    proj_out_bias_requires_grad = float(diagnostics.get("seam_adapter_proj_out_bias_requires_grad", 0.0) or 0.0)
+    block_heads_require_grad = float(diagnostics.get("seam_adapter_block_heads_require_grad", 0.0) or 0.0)
+    proj_out_weight_in_optimizer = float(diagnostics.get("seam_adapter_proj_out_weight_in_optimizer", 0.0) or 0.0)
+    proj_out_bias_in_optimizer = float(diagnostics.get("seam_adapter_proj_out_bias_in_optimizer", 0.0) or 0.0)
+    block_heads_in_optimizer = float(diagnostics.get("seam_adapter_block_heads_in_optimizer", 0.0) or 0.0)
+    proj_out_optimizer_lr = float(diagnostics.get("seam_adapter_proj_out_optimizer_lr", 0.0) or 0.0)
+    block_heads_optimizer_lr = float(diagnostics.get("seam_adapter_block_heads_optimizer_lr", 0.0) or 0.0)
+    proj_out_optimizer_group = float(diagnostics.get("seam_adapter_proj_out_optimizer_group", -1.0))
+    block_heads_optimizer_group = float(diagnostics.get("seam_adapter_block_heads_optimizer_group", -1.0))
+    proj_out_weight_optimizer_state_present = float(diagnostics.get("seam_adapter_proj_out_weight_optimizer_state_present", 0.0) or 0.0)
+    proj_out_weight_optimizer_state_step = float(diagnostics.get("seam_adapter_proj_out_weight_optimizer_state_step", 0.0) or 0.0)
+    proj_out_weight_optimizer_exp_avg_norm = float(diagnostics.get("seam_adapter_proj_out_weight_optimizer_exp_avg_norm", 0.0) or 0.0)
+    proj_out_weight_optimizer_exp_avg_sq_norm = float(
+        diagnostics.get("seam_adapter_proj_out_weight_optimizer_exp_avg_sq_norm", 0.0) or 0.0
+    )
+    proj_out_weight_optimizer_state_step_post = float(
+        diagnostics.get("seam_adapter_proj_out_weight_optimizer_state_step_post", 0.0) or 0.0
+    )
+    proj_out_weight_optimizer_exp_avg_norm_post = float(
+        diagnostics.get("seam_adapter_proj_out_weight_optimizer_exp_avg_norm_post", 0.0) or 0.0
+    )
+    proj_out_weight_optimizer_exp_avg_sq_norm_post = float(
+        diagnostics.get("seam_adapter_proj_out_weight_optimizer_exp_avg_sq_norm_post", 0.0) or 0.0
+    )
+    optimizer_step_was_skipped = float(diagnostics.get("seam_adapter_optimizer_step_was_skipped", 0.0) or 0.0)
+    multi_inject_enabled = float(diagnostics.get("seam_adapter_multi_inject_enabled_runtime", 0.0) or 0.0)
+    scale_block0 = float(diagnostics.get("seam_adapter_scale_block0_runtime", 0.0) or 0.0)
+    scale_block1 = float(diagnostics.get("seam_adapter_scale_block1_runtime", 0.0) or 0.0)
+    proj_out_checkpoint_norm = float(diagnostics.get("seam_adapter_checkpoint_proj_out_norm", 0.0) or 0.0)
+    proj_out_checkpoint_absmax = float(diagnostics.get("seam_adapter_checkpoint_proj_out_absmax", 0.0) or 0.0)
+    weights_restored = float(diagnostics.get("seam_adapter_weights_restored", 0.0) or 0.0)
+    ema_weights_restored = float(diagnostics.get("seam_adapter_ema_weights_restored", 0.0) or 0.0)
+    input_from_kwargs = float(diagnostics.get("seam_adapter_input_from_kwargs", 0.0) or 0.0)
+    input_source = str(diagnostics.get("seam_adapter_input_source", "") or "")
     edge_valid = _tensor_edge_values(diagnostics.get("seam_adapter_edge_valid_flags"))
     rows = []
     block_diagnostics = diagnostics.get("seam_adapter_block_diagnostics") or {}
@@ -677,13 +807,20 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
                 "scale": scale,
                 "input_energy": float(diagnostics.get("seam_adapter_input_energy", 0.0) or 0.0),
                 "sobel_input_energy": float(diagnostics.get("seam_adapter_sobel_input_energy", 0.0) or 0.0),
+                "pre_scale_output_energy": float(diagnostics.get("seam_adapter_pre_scale_output_energy", 0.0) or 0.0),
                 "output_energy": float(diagnostics.get("seam_adapter_output_energy", 0.0) or 0.0),
+                "injected_delta_energy": float(diagnostics.get("seam_adapter_injected_delta_energy", 0.0) or 0.0),
+                "post_injection_activation_norm": float(diagnostics.get("seam_adapter_post_injection_activation_norm", 0.0) or 0.0),
                 "adapter_to_activation_ratio": float(diagnostics.get("seam_adapter_to_activation_ratio", 0.0) or 0.0),
+                "parameter_norm": parameter_norm,
+                "head_parameter_norm": 0.0,
+                "hook_fired": float(diagnostics.get("seam_adapter_hook_fired", 0.0) or 0.0),
                 "active_px": float(diagnostics.get("seam_adapter_combined_active_px", diagnostics.get("seam_adapter_active_px", 0.0)) or 0.0),
                 "undefined_edge_input_energy": float(diagnostics.get("seam_adapter_undefined_edge_input_energy", 0.0) or 0.0),
                 "undefined_edge_output_energy": float(diagnostics.get("seam_adapter_undefined_edge_output_energy", 0.0) or 0.0),
                 "per_edge_input_energy": diagnostics.get("seam_adapter_per_edge_input_energy"),
                 "per_edge_sobel_input_energy": diagnostics.get("seam_adapter_per_edge_sobel_input_energy"),
+                "per_edge_pre_scale_output_energy": diagnostics.get("seam_adapter_per_edge_pre_scale_output_energy"),
                 "per_edge_output_energy": diagnostics.get("seam_adapter_per_edge_output_energy"),
                 "per_edge_ratio": diagnostics.get("seam_adapter_per_edge_ratio"),
                 "per_edge_active_px": diagnostics.get("seam_adapter_per_edge_active_px"),
@@ -699,6 +836,7 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
         sobel_input_energy = _tensor_edge_values(
             block_diag.get("per_edge_sobel_input_energy", diagnostics.get("seam_adapter_per_edge_sobel_input_energy"))
         )
+        pre_scale_output_energy = _tensor_edge_values(block_diag.get("per_edge_pre_scale_output_energy"))
         output_energy = _tensor_edge_values(block_diag.get("per_edge_output_energy"))
         ratio = _tensor_edge_values(block_diag.get("per_edge_ratio"))
         active_px = _tensor_edge_values(block_diag.get("per_edge_active_px"))
@@ -719,8 +857,52 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
                         "band_px": band_px,
                         "input_energy": input_energy[edge_index],
                         "sobel_input_energy": sobel_input_energy[edge_index],
+                        "pre_scale_output_energy": pre_scale_output_energy[edge_index],
                         "output_energy": output_energy[edge_index],
+                        "injected_delta_energy": 0.0,
+                        "post_injection_activation_norm": float(block_diag.get("post_injection_activation_norm", 0.0) or 0.0),
                         "adapter_to_activation_ratio": ratio[edge_index],
+                        "cond_embedding_norm": cond_embedding_norm,
+                        "parameter_norm": float(block_diag.get("parameter_norm", parameter_norm) or 0.0),
+                        "head_parameter_norm": float(block_diag.get("head_parameter_norm", 0.0) or 0.0),
+                        "proj_out_weight_norm": proj_out_weight_norm,
+                        "proj_out_bias_norm": proj_out_bias_norm,
+                        "proj_out_weight_grad_norm": proj_out_weight_grad_norm,
+                        "proj_out_bias_grad_norm": proj_out_bias_grad_norm,
+                        "proj_out_weight_post_step_norm": proj_out_weight_post_step_norm,
+                        "proj_out_bias_post_step_norm": proj_out_bias_post_step_norm,
+                        "proj_out_weight_delta_abs_sum": proj_out_weight_delta_abs_sum,
+                        "proj_out_bias_delta_abs_sum": proj_out_bias_delta_abs_sum,
+                        "upstream_adapter_grad_norm": upstream_adapter_grad_norm,
+                        "block_heads_grad_norm": block_heads_grad_norm,
+                        "proj_out_weight_requires_grad": proj_out_weight_requires_grad,
+                        "proj_out_bias_requires_grad": proj_out_bias_requires_grad,
+                        "block_heads_require_grad": block_heads_require_grad,
+                        "proj_out_weight_in_optimizer": proj_out_weight_in_optimizer,
+                        "proj_out_bias_in_optimizer": proj_out_bias_in_optimizer,
+                        "block_heads_in_optimizer": block_heads_in_optimizer,
+                        "proj_out_optimizer_lr": proj_out_optimizer_lr,
+                        "block_heads_optimizer_lr": block_heads_optimizer_lr,
+                        "proj_out_optimizer_group": proj_out_optimizer_group,
+                        "block_heads_optimizer_group": block_heads_optimizer_group,
+                        "proj_out_weight_optimizer_state_present": proj_out_weight_optimizer_state_present,
+                        "proj_out_weight_optimizer_state_step": proj_out_weight_optimizer_state_step,
+                        "proj_out_weight_optimizer_exp_avg_norm": proj_out_weight_optimizer_exp_avg_norm,
+                        "proj_out_weight_optimizer_exp_avg_sq_norm": proj_out_weight_optimizer_exp_avg_sq_norm,
+                        "proj_out_weight_optimizer_state_step_post": proj_out_weight_optimizer_state_step_post,
+                        "proj_out_weight_optimizer_exp_avg_norm_post": proj_out_weight_optimizer_exp_avg_norm_post,
+                        "proj_out_weight_optimizer_exp_avg_sq_norm_post": proj_out_weight_optimizer_exp_avg_sq_norm_post,
+                        "optimizer_step_was_skipped": optimizer_step_was_skipped,
+                        "multi_inject_enabled": multi_inject_enabled,
+                        "scale_block0": scale_block0,
+                        "scale_block1": scale_block1,
+                        "weights_restored": weights_restored,
+                        "ema_weights_restored": ema_weights_restored,
+                        "checkpoint_proj_out_norm": proj_out_checkpoint_norm,
+                        "checkpoint_proj_out_absmax": proj_out_checkpoint_absmax,
+                        "input_from_kwargs": input_from_kwargs,
+                        "hook_fired": float(block_diag.get("hook_fired", 0.0) or 0.0),
+                        "input_source": input_source,
                         "active_px": active_px[edge_index],
                         "edge_valid": edge_valid[edge_index],
                         "edge_valid_count": edge_valid[edge_index],
@@ -741,8 +923,52 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
                     "band_px": band_px,
                     "input_energy": float(block_diag.get("input_energy", diagnostics.get("seam_adapter_input_energy", 0.0)) or 0.0),
                     "sobel_input_energy": float(block_diag.get("sobel_input_energy", diagnostics.get("seam_adapter_sobel_input_energy", 0.0)) or 0.0),
+                    "pre_scale_output_energy": float(block_diag.get("pre_scale_output_energy", 0.0) or 0.0),
                     "output_energy": float(block_diag.get("output_energy", 0.0) or 0.0),
+                    "injected_delta_energy": float(block_diag.get("injected_delta_energy", 0.0) or 0.0),
+                    "post_injection_activation_norm": float(block_diag.get("post_injection_activation_norm", 0.0) or 0.0),
                     "adapter_to_activation_ratio": float(block_diag.get("adapter_to_activation_ratio", 0.0) or 0.0),
+                    "cond_embedding_norm": cond_embedding_norm,
+                    "parameter_norm": float(block_diag.get("parameter_norm", parameter_norm) or 0.0),
+                    "head_parameter_norm": float(block_diag.get("head_parameter_norm", 0.0) or 0.0),
+                    "proj_out_weight_norm": proj_out_weight_norm,
+                    "proj_out_bias_norm": proj_out_bias_norm,
+                    "proj_out_weight_grad_norm": proj_out_weight_grad_norm,
+                    "proj_out_bias_grad_norm": proj_out_bias_grad_norm,
+                    "proj_out_weight_post_step_norm": proj_out_weight_post_step_norm,
+                    "proj_out_bias_post_step_norm": proj_out_bias_post_step_norm,
+                    "proj_out_weight_delta_abs_sum": proj_out_weight_delta_abs_sum,
+                    "proj_out_bias_delta_abs_sum": proj_out_bias_delta_abs_sum,
+                    "upstream_adapter_grad_norm": upstream_adapter_grad_norm,
+                    "block_heads_grad_norm": block_heads_grad_norm,
+                    "proj_out_weight_requires_grad": proj_out_weight_requires_grad,
+                    "proj_out_bias_requires_grad": proj_out_bias_requires_grad,
+                    "block_heads_require_grad": block_heads_require_grad,
+                    "proj_out_weight_in_optimizer": proj_out_weight_in_optimizer,
+                    "proj_out_bias_in_optimizer": proj_out_bias_in_optimizer,
+                    "block_heads_in_optimizer": block_heads_in_optimizer,
+                    "proj_out_optimizer_lr": proj_out_optimizer_lr,
+                    "block_heads_optimizer_lr": block_heads_optimizer_lr,
+                    "proj_out_optimizer_group": proj_out_optimizer_group,
+                    "block_heads_optimizer_group": block_heads_optimizer_group,
+                    "proj_out_weight_optimizer_state_present": proj_out_weight_optimizer_state_present,
+                    "proj_out_weight_optimizer_state_step": proj_out_weight_optimizer_state_step,
+                    "proj_out_weight_optimizer_exp_avg_norm": proj_out_weight_optimizer_exp_avg_norm,
+                    "proj_out_weight_optimizer_exp_avg_sq_norm": proj_out_weight_optimizer_exp_avg_sq_norm,
+                    "proj_out_weight_optimizer_state_step_post": proj_out_weight_optimizer_state_step_post,
+                    "proj_out_weight_optimizer_exp_avg_norm_post": proj_out_weight_optimizer_exp_avg_norm_post,
+                    "proj_out_weight_optimizer_exp_avg_sq_norm_post": proj_out_weight_optimizer_exp_avg_sq_norm_post,
+                    "optimizer_step_was_skipped": optimizer_step_was_skipped,
+                    "multi_inject_enabled": multi_inject_enabled,
+                    "scale_block0": scale_block0,
+                    "scale_block1": scale_block1,
+                    "weights_restored": weights_restored,
+                    "ema_weights_restored": ema_weights_restored,
+                    "checkpoint_proj_out_norm": proj_out_checkpoint_norm,
+                    "checkpoint_proj_out_absmax": proj_out_checkpoint_absmax,
+                    "input_from_kwargs": input_from_kwargs,
+                    "hook_fired": float(block_diag.get("hook_fired", 0.0) or 0.0),
+                    "input_source": input_source,
                     "active_px": float(block_diag.get("active_px", 0.0) or 0.0),
                     "edge_valid": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
                     "edge_valid_count": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
@@ -769,8 +995,52 @@ def _build_seam_adapter_diag_rows(step: int, diagnostics: Dict[str, object]) -> 
                 "band_px": band_px,
                 "input_energy": float(diagnostics.get("seam_adapter_input_energy", 0.0) or 0.0),
                 "sobel_input_energy": float(diagnostics.get("seam_adapter_sobel_input_energy", 0.0) or 0.0),
+                "pre_scale_output_energy": float(diagnostics.get("seam_adapter_pre_scale_output_energy", 0.0) or 0.0),
                 "output_energy": float(sum(float(block_diagnostics.get(block_id, {}).get("output_energy", 0.0) or 0.0) for block_id in block_order)),
+                "injected_delta_energy": float(diagnostics.get("seam_adapter_injected_delta_energy", 0.0) or 0.0),
+                "post_injection_activation_norm": float(diagnostics.get("seam_adapter_post_injection_activation_norm", 0.0) or 0.0),
                 "adapter_to_activation_ratio": float(diagnostics.get("total_multi_inject_ratio", diagnostics.get("seam_adapter_to_activation_ratio", 0.0)) or 0.0),
+                "cond_embedding_norm": cond_embedding_norm,
+                "parameter_norm": parameter_norm,
+                "head_parameter_norm": 0.0,
+                "proj_out_weight_norm": proj_out_weight_norm,
+                "proj_out_bias_norm": proj_out_bias_norm,
+                "proj_out_weight_grad_norm": proj_out_weight_grad_norm,
+                "proj_out_bias_grad_norm": proj_out_bias_grad_norm,
+                "proj_out_weight_post_step_norm": proj_out_weight_post_step_norm,
+                "proj_out_bias_post_step_norm": proj_out_bias_post_step_norm,
+                "proj_out_weight_delta_abs_sum": proj_out_weight_delta_abs_sum,
+                "proj_out_bias_delta_abs_sum": proj_out_bias_delta_abs_sum,
+                "upstream_adapter_grad_norm": upstream_adapter_grad_norm,
+                "block_heads_grad_norm": block_heads_grad_norm,
+                "proj_out_weight_requires_grad": proj_out_weight_requires_grad,
+                "proj_out_bias_requires_grad": proj_out_bias_requires_grad,
+                "block_heads_require_grad": block_heads_require_grad,
+                "proj_out_weight_in_optimizer": proj_out_weight_in_optimizer,
+                "proj_out_bias_in_optimizer": proj_out_bias_in_optimizer,
+                "block_heads_in_optimizer": block_heads_in_optimizer,
+                "proj_out_optimizer_lr": proj_out_optimizer_lr,
+                "block_heads_optimizer_lr": block_heads_optimizer_lr,
+                "proj_out_optimizer_group": proj_out_optimizer_group,
+                "block_heads_optimizer_group": block_heads_optimizer_group,
+                "proj_out_weight_optimizer_state_present": proj_out_weight_optimizer_state_present,
+                "proj_out_weight_optimizer_state_step": proj_out_weight_optimizer_state_step,
+                "proj_out_weight_optimizer_exp_avg_norm": proj_out_weight_optimizer_exp_avg_norm,
+                "proj_out_weight_optimizer_exp_avg_sq_norm": proj_out_weight_optimizer_exp_avg_sq_norm,
+                "proj_out_weight_optimizer_state_step_post": proj_out_weight_optimizer_state_step_post,
+                "proj_out_weight_optimizer_exp_avg_norm_post": proj_out_weight_optimizer_exp_avg_norm_post,
+                "proj_out_weight_optimizer_exp_avg_sq_norm_post": proj_out_weight_optimizer_exp_avg_sq_norm_post,
+                "optimizer_step_was_skipped": optimizer_step_was_skipped,
+                "multi_inject_enabled": multi_inject_enabled,
+                "scale_block0": scale_block0,
+                "scale_block1": scale_block1,
+                "weights_restored": weights_restored,
+                "ema_weights_restored": ema_weights_restored,
+                "checkpoint_proj_out_norm": proj_out_checkpoint_norm,
+                "checkpoint_proj_out_absmax": proj_out_checkpoint_absmax,
+                "input_from_kwargs": input_from_kwargs,
+                "hook_fired": float(diagnostics.get("seam_adapter_hook_fired", 0.0) or 0.0),
+                "input_source": input_source,
                 "active_px": float(diagnostics.get("seam_adapter_combined_active_px", diagnostics.get("seam_adapter_active_px", 0.0)) or 0.0),
                 "edge_valid": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
                 "edge_valid_count": float(diagnostics.get("seam_adapter_edge_valid_count", 0.0) or 0.0),
@@ -1149,6 +1419,143 @@ def parse_conditioning_config(config: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def _resolve_optional_config_path(config: Dict[str, object], value: object) -> str:
+    if value is None:
+        return ""
+    normalized = str(value).strip()
+    if not normalized:
+        return ""
+    if os.path.isabs(normalized):
+        return os.path.normpath(normalized)
+    return os.path.normpath(os.path.join(config["__config_dir"], normalized))
+
+
+def _parse_float_boundaries(raw_value: object, default: List[float], field_name: str) -> List[float]:
+    if raw_value is None:
+        values = [float(value) for value in default]
+    elif isinstance(raw_value, str):
+        values = [float(token.strip()) for token in raw_value.split(",") if token.strip()]
+    elif isinstance(raw_value, list):
+        values = [float(value) for value in raw_value]
+    else:
+        raise ValueError(f"{field_name} must be a list of floats or a comma-separated string")
+
+    if not values:
+        raise ValueError(f"{field_name} must not be empty")
+    if values != sorted(values):
+        raise ValueError(f"{field_name} must be sorted in ascending order")
+    return values
+
+
+def parse_style_pool_config(config: Dict[str, object]) -> Dict[str, object]:
+    style_pool = config.get("style_pool", {}) or {}
+    enabled = bool(style_pool.get("enabled", False))
+
+    mapping_path = _resolve_optional_config_path(config, style_pool.get("mapping_path"))
+    family_manifest_path = _resolve_optional_config_path(config, style_pool.get("family_manifest_path"))
+    feature_cache_dir = _resolve_optional_config_path(config, style_pool.get("feature_cache_dir"))
+
+    if enabled and not mapping_path:
+        raise ValueError("style_pool.mapping_path is required when [style_pool].enabled=true")
+
+    prompt_embedding_mode = str(style_pool.get("prompt_embedding_mode", "side_channel") or "side_channel").strip().lower()
+    if prompt_embedding_mode not in {"side_channel"}:
+        raise ValueError("style_pool.prompt_embedding_mode must be 'side_channel' in this phase")
+
+    original_reference_embedding_mode = str(
+        style_pool.get("original_reference_embedding_mode", "image_only") or "image_only"
+    ).strip().lower()
+    if original_reference_embedding_mode not in {"image_only", "image_plus_neutral_token"}:
+        raise ValueError(
+            "style_pool.original_reference_embedding_mode must be 'image_only' or 'image_plus_neutral_token'"
+        )
+
+    prototype_count = int(style_pool.get("prototype_count", style_pool.get("k", 3)))
+    if prototype_count < 1:
+        raise ValueError("style_pool.prototype_count must be >= 1")
+
+    return {
+        "enabled": enabled,
+        "mapping_path": mapping_path,
+        "family_manifest_path": family_manifest_path,
+        "feature_cache_dir": feature_cache_dir,
+        "prompt_embedding_mode": prompt_embedding_mode,
+        "original_reference_embedding_mode": original_reference_embedding_mode,
+        "sampler_seed": int(style_pool.get("sampler_seed", style_pool.get("deterministic_sampler_seed", 1337))),
+        "prototype_count": prototype_count,
+        "clustering_mode": str(style_pool.get("clustering_mode", "kmeans") or "kmeans").strip().lower(),
+        "clustering_seed": int(style_pool.get("clustering_seed", 1337)),
+        "assignment_randomization_enabled": bool(style_pool.get("assignment_randomization_enabled", False)),
+    }
+
+
+def parse_style_ratio_config(config: Dict[str, object]) -> Dict[str, object]:
+    style_ratio = config.get("style_ratio", {}) or {}
+    loss_weights = style_ratio.get("loss_weights", {}) if isinstance(style_ratio.get("loss_weights", {}), dict) else {}
+
+    hard_band_end_px = 32.0
+    near_band_end_px = float(style_ratio.get("near_band_end_px", 64.0))
+    overlap_band_end_px = float(style_ratio.get("overlap_band_end_px", 96.0))
+    soft_field_end_px = float(style_ratio.get("soft_field_end_px", 400.0))
+    if near_band_end_px < hard_band_end_px:
+        raise ValueError("style_ratio.near_band_end_px must be >= 32")
+    if overlap_band_end_px < near_band_end_px:
+        raise ValueError("style_ratio.overlap_band_end_px must be >= style_ratio.near_band_end_px")
+    if soft_field_end_px < overlap_band_end_px:
+        raise ValueError("style_ratio.soft_field_end_px must be >= style_ratio.overlap_band_end_px")
+
+    return {
+        "enabled": bool(style_ratio.get("enabled", False)),
+        "plumbing_only": bool(style_ratio.get("plumbing_only", False)),
+        "outer_halo_px": int(style_ratio.get("outer_halo_px", 160)),
+        "inner_halo_px": int(style_ratio.get("inner_halo_px", 32)),
+        "hard_band_end_px": hard_band_end_px,
+        "near_band_end_px": near_band_end_px,
+        "overlap_band_end_px": overlap_band_end_px,
+        "soft_field_end_px": soft_field_end_px,
+        "soft_field_knee_fraction": float(style_ratio.get("soft_field_knee_fraction", 0.22)),
+        "soft_field_knee_value": float(style_ratio.get("soft_field_knee_value", 0.55)),
+        "soft_field_tail_gamma": float(style_ratio.get("soft_field_tail_gamma", 2.0)),
+        "temperature": float(style_ratio.get("temperature", 0.25)),
+        "patch_sizes": [int(value) for value in style_ratio.get("patch_sizes", [32, 64])],
+        "bucket_c_edges": _parse_float_boundaries(
+            style_ratio.get("bucket_c_edges"),
+            [0.0, 0.25, 0.5, 0.75, 1.01],
+            "style_ratio.bucket_c_edges",
+        ),
+        "bucket_distance_edges_px": _parse_float_boundaries(
+            style_ratio.get("bucket_distance_edges_px"),
+            [64.0, 96.0, 160.0, 240.0, 400.0],
+            "style_ratio.bucket_distance_edges_px",
+        ),
+        "ratio_warmup_steps": int(style_ratio.get("ratio_warmup_steps", 0)),
+        "ratio_ramp_steps": int(style_ratio.get("ratio_ramp_steps", 0)),
+        "ratio_gate_grad_threshold": float(style_ratio.get("ratio_gate_grad_threshold", 0.0)),
+        "ratio_gate_ema_window": int(style_ratio.get("ratio_gate_ema_window", 50)),
+        "ratio_gate_slope_abs_max": float(style_ratio.get("ratio_gate_slope_abs_max", 0.0)),
+        "controlnet_style_ramp_start_px": float(style_ratio.get("controlnet_style_ramp_start_px", 64.0)),
+        "controlnet_style_ramp_end_px": float(style_ratio.get("controlnet_style_ramp_end_px", 96.0)),
+        "low_frequency_blur_radius": int(style_ratio.get("low_frequency_blur_radius", 17)),
+        "lab_features_enabled": bool(style_ratio.get("lab_features_enabled", False)),
+        "loss_weights": {
+            "outer_halo_rgb_weight": float(loss_weights.get("outer_halo_rgb_weight", 0.25)),
+            "inner_halo_rgb_weight": float(loss_weights.get("inner_halo_rgb_weight", 0.75)),
+            "near_normal_grad_weight": float(loss_weights.get("near_normal_grad_weight", 1.0)),
+            "near_tangent_grad_weight": float(loss_weights.get("near_tangent_grad_weight", 0.25)),
+            "near_lowfreq_weight": float(loss_weights.get("near_lowfreq_weight", 0.10)),
+            "overlap_normal_grad_weight": float(loss_weights.get("overlap_normal_grad_weight", 0.75)),
+            "overlap_tangent_grad_weight": float(loss_weights.get("overlap_tangent_grad_weight", 0.15)),
+            "overlap_lowfreq_weight": float(loss_weights.get("overlap_lowfreq_weight", 0.08)),
+            "style_ratio_kl_weight_max": float(loss_weights.get("style_ratio_kl_weight_max", 0.10)),
+            "style_ratio_overlap_weight_start": float(loss_weights.get("style_ratio_overlap_weight_start", 0.0)),
+            "style_ratio_overlap_weight_end": float(loss_weights.get("style_ratio_overlap_weight_end", 0.5)),
+            "style_ratio_soft_weight": float(loss_weights.get("style_ratio_soft_weight", 1.0)),
+            "entropy_weight": float(loss_weights.get("entropy_weight", 0.003)),
+            "interior_core_weight": float(loss_weights.get("interior_core_weight", 0.10)),
+        },
+    }
+
+
 def _parse_step_value_schedule(raw_schedule: object, field_name: str) -> List[Tuple[int, float]]:
     if raw_schedule is None:
         return []
@@ -1291,6 +1698,7 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "halo_outer_rgb_weight": halo_outer_rgb_weight,
         "continuation_width_px": continuation_width_px,
         "continuation_peak_rgb_weight": continuation_peak_rgb_weight,
+        "continuation_tail_power": float(seam.get("continuation_tail_power", 1.5)),
         "interior_core_rgb_weight": interior_core_rgb_weight,
         "continuation_gradient_loss_weight": continuation_gradient_loss_weight,
         "continuation_gradient_loss_weight_schedule": continuation_gradient_loss_weight_schedule,
@@ -1462,6 +1870,8 @@ def build_dataset(
     semantic_config: Dict[str, object],
     alpha_config: Dict[str, object],
     seam_config: Optional[Dict[str, object]] = None,
+    style_pool_config: Optional[Dict[str, object]] = None,
+    style_ratio_config: Optional[Dict[str, object]] = None,
 ) -> TerrainSemanticManifestDataset:
     training = semantic_config["training"]
     verification = semantic_config.get("verification", {})
@@ -1510,6 +1920,9 @@ def build_dataset(
         boundary_alignment_error_max_px=float((seam_config or {}).get("boundary_alignment_error_max_px", 0.5)),
         boundary_consistency_error_max_px=float((seam_config or {}).get("boundary_consistency_error_max_px", 0.5)),
         seam_seed=int((seam_config or {}).get("seed", 1337)),
+        source_to_train_scale=float(training.get("source_to_train_scale", 1.0)),
+        style_pool_config=dict(style_pool_config or {}),
+        style_ratio_config=dict(style_ratio_config or {}),
     )
 
 
@@ -1573,6 +1986,8 @@ def semantic_collate(samples: List[Dict[str, object]]) -> Dict[str, object]:
     batch["assigned_crop_class"] = [sample.get("assigned_crop_class", "") for sample in samples]
     batch["crop_size_class"] = [sample["crop_size_class"] for sample in samples]
     batch["generation_strategy"] = [sample["generation_strategy"] for sample in samples]
+    if "style_pool_entry" in samples[0]:
+        batch["style_pool_entry"] = [sample.get("style_pool_entry") for sample in samples]
     batch["prompt"] = samples[0]["prompt"]
     batch["prompt2"] = samples[0]["prompt2"]
     batch["channel_names"] = samples[0]["channel_names"]
@@ -1590,6 +2005,7 @@ def build_model_visible_conditioning(
 ) -> Tuple[torch.Tensor, List[str], Dict[str, float]]:
     conditioning = batch["conditioning_images"].to(device, dtype=dtype)
     seam_enabled = bool(seam_config.get("enabled", False))
+    style_channel_names = list(getattr(dataset, "style_conditioning_channel_names", []))
     diagnostics = {
         "seam_enabled": 1.0 if seam_enabled else 0.0,
         "seam_defined_ratio": 0.0,
@@ -1599,6 +2015,11 @@ def build_model_visible_conditioning(
         "seam_undefined_edges_count": 0.0,
         "seam_undefined_pre_gate_l2": 0.0,
         "seam_undefined_post_gate_l2": 0.0,
+        "style_conditioning_enabled": 1.0 if bool(getattr(dataset, "style_ratio_enabled", False)) else 0.0,
+        "style_conditioning_channels": float(len(style_channel_names)),
+        "style_conditioning_l2": 0.0,
+        "style_conditioning_ramp_mean": 0.0,
+        "style_conditioning_influence_c_mean": 0.0,
     }
     edge_names = ("north", "south", "east", "west")
     for edge_name in edge_names:
@@ -1606,7 +2027,17 @@ def build_model_visible_conditioning(
         diagnostics[f"seam_edge_{edge_name}_pre_gate_l2"] = 0.0
         diagnostics[f"seam_edge_{edge_name}_post_gate_l2"] = 0.0
         diagnostics[f"seam_edge_{edge_name}_visible_l2"] = 0.0
+
+    style_conditioning = conditioning.new_zeros(
+        conditioning.shape[0],
+        len(style_channel_names),
+        conditioning.shape[-2],
+        conditioning.shape[-1],
+    )
     if not seam_enabled or batch.get("seam_strip_tensor") is None or batch.get("edge_defined_flags") is None or batch.get("edge_flag_maps") is None:
+        if style_conditioning.shape[1] > 0:
+            full_conditioning = torch.cat([conditioning, style_conditioning], dim=1)
+            return full_conditioning, dataset.full_conditioning_channel_names, diagnostics
         return conditioning, dataset.channel_names, diagnostics
 
     seam_strip = batch["seam_strip_tensor"].to(device, dtype=dtype)
@@ -1616,7 +2047,87 @@ def build_model_visible_conditioning(
     # Final post-augmentation gating right before ControlNet input assembly.
     seam_gate = edge_defined_flags.repeat_interleave(4, dim=1).unsqueeze(-1).unsqueeze(-1)
     seam_visible = seam_strip * seam_gate
-    full_conditioning = torch.cat([conditioning, seam_visible, edge_flag_maps], dim=1)
+    full_conditioning_parts = [conditioning, seam_visible, edge_flag_maps]
+
+    if style_conditioning.shape[1] > 0 and batch.get("edge_band_masks") is not None and batch.get("seam_decay_maps") is not None and batch.get("seam_strip_width_px") is not None:
+        continuation_valid_mask = torch.ones_like(conditioning[:, :1])
+        terrain_mask_index = getattr(dataset, "terrain_mask_channel_index", -1)
+        if terrain_mask_index >= 0:
+            continuation_valid_mask = _terrain_mask_to_occupancy(
+                conditioning[:, terrain_mask_index : terrain_mask_index + 1],
+                bool(getattr(dataset, "terrain_mask_black_is_terrain", True)),
+            )
+            continuation_valid_mask = (
+                continuation_valid_mask >= float(getattr(dataset, "alpha_binary_threshold", 0.5))
+            ).to(dtype=dtype)
+        alpha_target = batch.get("alpha_target")
+        if alpha_target is not None:
+            alpha_target = alpha_target.to(device, dtype=dtype)
+        style_support_valid_mask = shared_build_style_support_valid_mask(
+            conditioning_images=conditioning,
+            alpha_target=alpha_target,
+            halo_px=0,
+            alpha_binary_threshold=float(getattr(dataset, "alpha_binary_threshold", 0.5)),
+            terrain_mask_channel_index=terrain_mask_index,
+            terrain_mask_black_is_terrain=bool(getattr(dataset, "terrain_mask_black_is_terrain", True)),
+            style_ratio_config=getattr(dataset, "style_ratio_config", {}),
+        ).to(device=device, dtype=dtype)
+
+        seam_maps = _build_seam_region_maps(
+            edge_band_masks=batch["edge_band_masks"].to(device, dtype=dtype),
+            seam_decay_maps=batch["seam_decay_maps"].to(device, dtype=dtype),
+            edge_defined_flags=edge_defined_flags,
+            seam_strip_width_px=batch["seam_strip_width_px"].to(device, dtype=dtype),
+            supervision_mask=torch.ones_like(conditioning[:, :1]),
+            seam_config=seam_config,
+            source_sizes_hw=batch.get("original_sizes_hw").to(device, dtype=dtype) if batch.get("original_sizes_hw") is not None else None,
+            continuation_valid_mask=continuation_valid_mask,
+            style_support_valid_mask=style_support_valid_mask,
+            style_ratio_config=getattr(dataset, "style_ratio_config", {}),
+        )
+        ramp_mask = seam_maps["controlnet_style_effect_mask"].to(dtype=dtype)
+        q_per_edge = seam_maps["soft_field_q_per_edge"].to(dtype=dtype) * ramp_mask
+        q_interior = seam_maps["soft_field_q_interior"].to(dtype=dtype) * ramp_mask
+        influence_c = seam_maps["soft_field_influence_c"].to(dtype=dtype) * ramp_mask
+        near_band_mask = seam_maps["near_band_mask"].to(dtype=dtype)
+        overlap_band_mask = seam_maps["overlap_band_mask"].to(dtype=dtype)
+
+        edge_rgb_means: List[torch.Tensor] = []
+        for edge_index in range(len(edge_names)):
+            edge_slice = seam_strip[:, edge_index * 4 : edge_index * 4 + 4]
+            edge_rgb = edge_slice[:, :3]
+            edge_alpha = edge_slice[:, 3:4].clamp(0.0, 1.0)
+            support = torch.maximum(edge_alpha, edge_rgb.detach().abs().amax(dim=1, keepdim=True))
+            support_sum = support.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            edge_rgb_means.append((edge_rgb * support).sum(dim=(-2, -1), keepdim=True) / support_sum)
+        edge_rgb_mean_tensor = torch.stack(edge_rgb_means, dim=1)
+
+        blended_lowfreq = conditioning.new_zeros(conditioning.shape[0], 3, conditioning.shape[-2], conditioning.shape[-1])
+        for edge_index in range(len(edge_names)):
+            blended_lowfreq = blended_lowfreq + (
+                q_per_edge[:, edge_index : edge_index + 1] * edge_rgb_mean_tensor[:, edge_index]
+            )
+
+        style_conditioning = torch.cat(
+            [
+                q_per_edge,
+                q_interior,
+                influence_c,
+                near_band_mask,
+                overlap_band_mask,
+                ramp_mask,
+                blended_lowfreq * ramp_mask,
+            ],
+            dim=1,
+        )
+        diagnostics["style_conditioning_l2"] = float(style_conditioning.detach().float().pow(2.0).mean().sqrt().item())
+        diagnostics["style_conditioning_ramp_mean"] = float(ramp_mask.detach().float().mean().item())
+        diagnostics["style_conditioning_influence_c_mean"] = float(influence_c.detach().float().mean().item())
+
+    if style_conditioning.shape[1] > 0:
+        full_conditioning_parts.append(style_conditioning)
+
+    full_conditioning = torch.cat(full_conditioning_parts, dim=1)
 
     undefined_edge_flags = (1.0 - edge_defined_flags).clamp(0.0, 1.0)
     undefined_gate = undefined_edge_flags.repeat_interleave(4, dim=1).unsqueeze(-1).unsqueeze(-1)
@@ -1853,6 +2364,857 @@ def _gaussian_blur5x5(x: torch.Tensor) -> torch.Tensor:
     k2 = (k2 / k2.sum()).view(1, 1, 5, 5)
     weight = k2.repeat(x.shape[1], 1, 1, 1)
     return F.conv2d(x, weight, stride=1, padding=2, groups=x.shape[1])
+
+
+def _odd_kernel_size(value: int) -> int:
+    kernel = max(1, int(value))
+    return kernel if (kernel % 2) == 1 else (kernel + 1)
+
+
+def _box_blur(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if x.ndim != 4:
+        return x
+    kernel = _odd_kernel_size(kernel_size)
+    if kernel <= 1:
+        return x
+    return F.avg_pool2d(x, kernel_size=kernel, stride=1, padding=kernel // 2)
+
+
+def _rgb_to_lab(rgb01: torch.Tensor) -> torch.Tensor:
+    if rgb01.ndim != 4 or rgb01.shape[1] != 3:
+        raise ValueError(f"expected RGB tensor [batch, 3, height, width], got {tuple(rgb01.shape)}")
+
+    rgb = rgb01.clamp(0.0, 1.0)
+    threshold = 0.04045
+    linear = torch.where(
+        rgb <= threshold,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055).pow(2.4),
+    )
+
+    xyz_from_rgb = torch.tensor(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ],
+        device=rgb.device,
+        dtype=rgb.dtype,
+    )
+    xyz = torch.einsum("ij,bjhw->bihw", xyz_from_rgb, linear)
+    white = torch.tensor([0.95047, 1.0, 1.08883], device=rgb.device, dtype=rgb.dtype).view(1, 3, 1, 1)
+    xyz = xyz / white
+
+    epsilon = 0.008856
+    kappa = 903.3
+    f_xyz = torch.where(
+        xyz > epsilon,
+        xyz.pow(1.0 / 3.0),
+        ((kappa * xyz) + 16.0) / 116.0,
+    )
+
+    l_channel = (116.0 * f_xyz[:, 1:2]) - 16.0
+    a_channel = 500.0 * (f_xyz[:, 0:1] - f_xyz[:, 1:2])
+    b_channel = 200.0 * (f_xyz[:, 1:2] - f_xyz[:, 2:3])
+    return torch.cat([l_channel / 100.0, a_channel / 128.0, b_channel / 128.0], dim=1)
+
+
+def _compute_handcrafted_style_features(
+    patches_rgb01: torch.Tensor,
+    *,
+    blur_radius: int,
+    lab_enabled: bool,
+) -> torch.Tensor:
+    if patches_rgb01.ndim != 4 or patches_rgb01.shape[1] != 3:
+        raise ValueError(f"expected style patches [batch, 3, height, width], got {tuple(patches_rgb01.shape)}")
+
+    blurred = _box_blur(patches_rgb01, blur_radius)
+    rgb_mean = blurred.mean(dim=(-2, -1))
+    rgb_std = patches_rgb01.std(dim=(-2, -1), unbiased=False)
+
+    gray = (
+        0.299 * patches_rgb01[:, 0:1]
+        + 0.587 * patches_rgb01[:, 1:2]
+        + 0.114 * patches_rgb01[:, 2:3]
+    )
+    gray_blurred = _box_blur(gray, blur_radius)
+    contrast_std = gray_blurred.std(dim=(-2, -1), unbiased=False)
+
+    sobel_x = _SOBEL_X_KERNEL.to(device=patches_rgb01.device, dtype=patches_rgb01.dtype)
+    sobel_y = _SOBEL_Y_KERNEL.to(device=patches_rgb01.device, dtype=patches_rgb01.dtype)
+    grad_x = F.conv2d(gray_blurred, sobel_x, padding=1)
+    grad_y = F.conv2d(gray_blurred, sobel_y, padding=1)
+    grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+    grad_mean = grad_mag.mean(dim=(-2, -1))
+    grad_std = grad_mag.std(dim=(-2, -1), unbiased=False)
+
+    features = [rgb_mean, rgb_std, contrast_std, grad_mean, grad_std]
+    if lab_enabled:
+        lab = _rgb_to_lab(blurred)
+        features.append(lab.mean(dim=(-2, -1)))
+        features.append(lab.std(dim=(-2, -1), unbiased=False))
+
+    return torch.cat(features, dim=1)
+
+
+def _extract_image_patch_bank(
+    image_rgb01: torch.Tensor,
+    *,
+    patch_size: int,
+    max_patches: int = 256,
+) -> torch.Tensor:
+    if image_rgb01.ndim != 3 or image_rgb01.shape[0] != 3:
+        raise ValueError(f"expected style image tensor [3, height, width], got {tuple(image_rgb01.shape)}")
+
+    patch = max(1, int(patch_size))
+    image = image_rgb01.unsqueeze(0)
+    height = int(image.shape[-2])
+    width = int(image.shape[-1])
+    if height < patch or width < patch:
+        image = F.interpolate(
+            image,
+            size=(max(height, patch), max(width, patch)),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    stride = max(1, patch // 2)
+    unfolded = image.unfold(2, patch, stride).unfold(3, patch, stride)
+    if unfolded.numel() <= 0:
+        resized = F.interpolate(image, size=(patch, patch), mode="bilinear", align_corners=False)
+        return resized
+
+    patches = unfolded.permute(0, 2, 3, 1, 4, 5).reshape(-1, 3, patch, patch)
+    if patches.shape[0] > max_patches:
+        indices = torch.linspace(0, patches.shape[0] - 1, steps=max_patches).round().long()
+        patches = patches.index_select(0, indices.unique(sorted=True))
+    return patches
+
+
+def _deterministic_kmeans_prototypes(features: torch.Tensor, prototype_count: int, seed: int) -> torch.Tensor:
+    if features.ndim != 2:
+        raise ValueError(f"expected feature matrix [count, dims], got {tuple(features.shape)}")
+    if features.shape[0] <= 0:
+        raise ValueError("cannot cluster an empty feature matrix")
+
+    count = max(1, min(int(prototype_count), int(features.shape[0])))
+    if count == 1:
+        return features.mean(dim=0, keepdim=True)
+    if int(features.shape[0]) == count:
+        return features[:count]
+
+    order = torch.argsort(features[:, 0])
+    ordered = features.index_select(0, order)
+    start_offset = int(seed) % int(ordered.shape[0])
+    init_positions = torch.linspace(0, ordered.shape[0] - 1, steps=count).round().long()
+    init_positions = (init_positions + start_offset) % int(ordered.shape[0])
+    centers = ordered.index_select(0, init_positions)
+
+    for _ in range(8):
+        distances = torch.cdist(features, centers)
+        assignment = distances.argmin(dim=1)
+        next_centers = []
+        for center_index in range(count):
+            members = features[assignment == center_index]
+            if members.shape[0] <= 0:
+                next_centers.append(centers[center_index])
+            else:
+                next_centers.append(members.mean(dim=0))
+        centers = torch.stack(next_centers, dim=0)
+
+    return centers
+
+
+def _normalize_style_pool_entry_for_training(entry: object) -> Optional[Dict[str, object]]:
+    if not isinstance(entry, dict):
+        return None
+
+    edge_style_ids_raw = entry.get("edge_style_ids", {})
+    if isinstance(edge_style_ids_raw, dict):
+        edge_style_ids = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in edge_style_ids_raw.items()
+            if str(key).strip() and str(value).strip()
+        }
+    else:
+        edge_style_ids = {}
+
+    variant_paths_raw = entry.get("variant_image_paths", [])
+    if isinstance(variant_paths_raw, list):
+        variant_image_paths = [str(path).strip() for path in variant_paths_raw if str(path).strip()]
+    elif isinstance(variant_paths_raw, str) and variant_paths_raw.strip():
+        variant_image_paths = [variant_paths_raw.strip()]
+    else:
+        variant_image_paths = []
+
+    known_prompts_raw = entry.get("known_prompts", [])
+    if isinstance(known_prompts_raw, dict):
+        known_prompts = [str(value).strip() for value in known_prompts_raw.values() if str(value).strip()]
+    elif isinstance(known_prompts_raw, list):
+        known_prompts = [str(value).strip() for value in known_prompts_raw if str(value).strip()]
+    else:
+        known_prompts = []
+
+    sample_id = str(entry.get("sample_id", entry.get("image_name", ""))).strip()
+    style_family_id = str(entry.get("style_family_id", sample_id)).strip() or sample_id
+    interior_style_id = str(entry.get("interior_style_id", style_family_id)).strip() or style_family_id
+    return {
+        "sample_id": sample_id,
+        "style_family_id": style_family_id,
+        "reference_image_path": str(entry.get("reference_image_path", entry.get("image_path", ""))).strip(),
+        "variant_image_paths": variant_image_paths,
+        "edge_style_ids": edge_style_ids,
+        "interior_style_id": interior_style_id,
+        "known_prompts": known_prompts,
+        "original_reference_class": bool(entry.get("original_reference_class", False)),
+    }
+
+
+def _resolve_active_style_ids(style_entry: Dict[str, object]) -> List[str]:
+    edge_style_ids = style_entry.get("edge_style_ids", {}) if isinstance(style_entry.get("edge_style_ids", {}), dict) else {}
+    fallback_style_id = str(style_entry.get("style_family_id", style_entry.get("sample_id", ""))).strip()
+    interior_style_id = str(style_entry.get("interior_style_id", fallback_style_id)).strip() or fallback_style_id
+    ordered: List[str] = []
+    for edge_name in SEAM_ADAPTER_EDGE_NAMES:
+        style_id = str(edge_style_ids.get(edge_name, fallback_style_id)).strip() or fallback_style_id
+        if style_id and style_id not in ordered:
+            ordered.append(style_id)
+    if interior_style_id and interior_style_id not in ordered:
+        ordered.append(interior_style_id)
+    return ordered
+
+
+def _collect_style_image_paths(style_entry: Dict[str, object], style_id: str) -> List[str]:
+    style_family_id = str(style_entry.get("style_family_id", "")).strip()
+    sample_id = str(style_entry.get("sample_id", "")).strip()
+    reference_image_path = str(style_entry.get("reference_image_path", "")).strip()
+    variant_image_paths = style_entry.get("variant_image_paths", []) if isinstance(style_entry.get("variant_image_paths", []), list) else []
+
+    candidate_paths: List[str] = []
+    if style_id in {style_family_id, sample_id, "", None} and reference_image_path:
+        candidate_paths.append(reference_image_path)
+    if reference_image_path and not candidate_paths:
+        candidate_paths.append(reference_image_path)
+    for path in variant_image_paths:
+        normalized = str(path).strip()
+        if normalized and normalized not in candidate_paths:
+            candidate_paths.append(normalized)
+    return candidate_paths
+
+
+def _load_style_image_rgb01(image_path: str) -> torch.Tensor:
+    with Image.open(image_path) as handle:
+        rgb = handle.convert("RGB")
+        array = np.asarray(rgb, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def _style_cache_file_path(
+    feature_cache_dir: str,
+    *,
+    style_id: str,
+    patch_size: int,
+    prototype_count: int,
+    clustering_seed: int,
+    clustering_mode: str,
+    prompt_embedding_mode: str,
+    lab_enabled: bool,
+) -> str:
+    sanitized_style_id = re.sub(r"[^A-Za-z0-9._-]+", "_", str(style_id).strip() or "style")
+    filename = (
+        f"{sanitized_style_id}_p{int(patch_size)}_k{int(prototype_count)}"
+        f"_seed{int(clustering_seed)}_{str(clustering_mode)}_{str(prompt_embedding_mode)}"
+        f"_lab{int(bool(lab_enabled))}_v1.pt"
+    )
+    return os.path.join(feature_cache_dir, filename)
+
+
+def _load_or_build_style_prototypes(
+    *,
+    style_entry: Dict[str, object],
+    style_id: str,
+    patch_size: int,
+    style_pool_config: Dict[str, object],
+    style_ratio_config: Dict[str, object],
+    prototype_cache: Dict[Tuple[str, int, int, int, bool, str, str], Dict[str, object]],
+    prototype_cache_stats: Counter,
+) -> Dict[str, object]:
+    prototype_count = int(style_pool_config.get("prototype_count", 1))
+    clustering_seed = int(style_pool_config.get("clustering_seed", 1337))
+    clustering_mode = str(style_pool_config.get("clustering_mode", "kmeans") or "kmeans").strip().lower()
+    prompt_embedding_mode = str(style_pool_config.get("prompt_embedding_mode", "side_channel") or "side_channel").strip().lower()
+    lab_enabled = bool(style_ratio_config.get("lab_features_enabled", False))
+    cache_key = (
+        str(style_id),
+        int(patch_size),
+        prototype_count,
+        clustering_seed,
+        lab_enabled,
+        clustering_mode,
+        prompt_embedding_mode,
+    )
+    if cache_key in prototype_cache:
+        prototype_cache_stats["memory_hits"] += 1
+        return prototype_cache[cache_key]
+
+    feature_cache_dir = str(style_pool_config.get("feature_cache_dir", "") or "").strip()
+    cache_path = _style_cache_file_path(
+        feature_cache_dir,
+        style_id=str(style_id),
+        patch_size=int(patch_size),
+        prototype_count=prototype_count,
+        clustering_seed=clustering_seed,
+        clustering_mode=clustering_mode,
+        prompt_embedding_mode=prompt_embedding_mode,
+        lab_enabled=lab_enabled,
+    ) if feature_cache_dir else ""
+
+    if cache_path and os.path.isfile(cache_path):
+        payload = torch.load(cache_path, map_location="cpu")
+        if isinstance(payload, dict) and isinstance(payload.get("prototypes"), torch.Tensor):
+            prototype_cache_stats["disk_hits"] += 1
+            prototype_cache[cache_key] = payload
+            return payload
+
+    image_paths = _collect_style_image_paths(style_entry, str(style_id))
+    feature_banks: List[torch.Tensor] = []
+    for image_path in image_paths:
+        if not image_path or not os.path.isfile(image_path):
+            continue
+        image_rgb01 = _load_style_image_rgb01(image_path)
+        patches = _extract_image_patch_bank(image_rgb01, patch_size=int(patch_size))
+        patch_features = _compute_handcrafted_style_features(
+            patches,
+            blur_radius=int(style_ratio_config.get("low_frequency_blur_radius", 17)),
+            lab_enabled=lab_enabled,
+        )
+        feature_banks.append(patch_features.cpu())
+
+    if not feature_banks:
+        raise FileNotFoundError(
+            f"style prototypes for style_id='{style_id}' could not be built because no reference images were found"
+        )
+
+    feature_bank = torch.cat(feature_banks, dim=0)
+    prototypes = _deterministic_kmeans_prototypes(feature_bank, prototype_count=prototype_count, seed=clustering_seed).cpu()
+    payload = {
+        "prototypes": prototypes,
+        "style_id": str(style_id),
+        "patch_size": int(patch_size),
+        "feature_count": int(feature_bank.shape[0]),
+        "image_count": int(len(image_paths)),
+        "known_prompts": list(style_entry.get("known_prompts", [])),
+    }
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save(payload, cache_path)
+    prototype_cache_stats["misses"] += 1
+    prototype_cache[cache_key] = payload
+    return payload
+
+
+def _masked_mean_value(value_map: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weight = mask.to(dtype=value_map.dtype)
+    if float(weight.sum().detach().item()) <= 0.0:
+        return value_map.new_tensor(0.0)
+    return (value_map * weight).sum() / weight.sum().clamp_min(1e-6)
+
+
+def _compute_directional_seam_gradient_loss(
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    per_edge_mask: torch.Tensor,
+    *,
+    component: str,
+) -> Dict[str, torch.Tensor]:
+    sobel_x = _SOBEL_X_KERNEL.to(device=pred_rgb.device, dtype=pred_rgb.dtype).expand(3, 1, 3, 3)
+    sobel_y = _SOBEL_Y_KERNEL.to(device=pred_rgb.device, dtype=pred_rgb.dtype).expand(3, 1, 3, 3)
+
+    pred_grad_x = F.conv2d(pred_rgb, sobel_x, padding=1, groups=3)
+    pred_grad_y = F.conv2d(pred_rgb, sobel_y, padding=1, groups=3)
+    target_grad_x = F.conv2d(target_rgb, sobel_x, padding=1, groups=3)
+    target_grad_y = F.conv2d(target_rgb, sobel_y, padding=1, groups=3)
+
+    diff_x = (pred_grad_x - target_grad_x).abs().mean(dim=1, keepdim=True)
+    diff_y = (pred_grad_y - target_grad_y).abs().mean(dim=1, keepdim=True)
+
+    raw_sum = pred_rgb.new_tensor(0.0)
+    active_px = pred_rgb.new_tensor(0.0)
+    for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+        if component == "normal":
+            component_map = diff_y if edge_name in {"north", "south"} else diff_x
+        elif component == "tangent":
+            component_map = diff_x if edge_name in {"north", "south"} else diff_y
+        else:
+            raise ValueError(f"unsupported directional gradient component: {component}")
+        edge_mask = per_edge_mask[:, edge_index : edge_index + 1].to(dtype=component_map.dtype)
+        raw_sum = raw_sum + (component_map * edge_mask).sum()
+        active_px = active_px + edge_mask.sum()
+
+    loss = pred_rgb.new_tensor(0.0)
+    if float(active_px.detach().item()) > 0.0:
+        loss = raw_sum / active_px.clamp_min(1e-6)
+    return {"loss": loss, "raw_sum": raw_sum, "active_px": active_px}
+
+
+def _compute_masked_low_frequency_rgb_loss(
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    blur_radius: int,
+) -> Dict[str, torch.Tensor]:
+    pred_blur = _box_blur(pred_rgb, blur_radius)
+    target_blur = _box_blur(target_rgb, blur_radius)
+    diff_map = (pred_blur - target_blur).abs().mean(dim=1, keepdim=True)
+    weight = mask.to(dtype=diff_map.dtype)
+    raw_sum = (diff_map * weight).sum()
+    active_px = weight.sum()
+    loss = diff_map.new_tensor(0.0)
+    if float(active_px.detach().item()) > 0.0:
+        loss = raw_sum / active_px.clamp_min(1e-6)
+    return {"loss": loss, "raw_sum": raw_sum, "active_px": active_px}
+
+
+def _bucket_index(value: float, edges: List[float]) -> int:
+    if len(edges) < 2:
+        return -1
+    for index in range(len(edges) - 1):
+        lower = float(edges[index])
+        upper = float(edges[index + 1])
+        if value >= lower and value < upper:
+            return index
+    if value >= float(edges[-2]) and value <= float(edges[-1]):
+        return len(edges) - 2
+    return -1
+
+
+def _estimate_series_slope(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    xs = torch.arange(len(values), dtype=torch.float32)
+    ys = torch.tensor(values, dtype=torch.float32)
+    x_centered = xs - xs.mean()
+    denom = torch.sum(x_centered * x_centered).item()
+    if denom <= 0.0:
+        return 0.0
+    return float(torch.sum(x_centered * (ys - ys.mean())).item() / denom)
+
+
+def _resolve_style_ratio_gate(
+    *,
+    style_ratio_config: Dict[str, object],
+    step_since_resume: int,
+    near_normal_loss_value: float,
+    near_normal_history: List[float],
+) -> Dict[str, float]:
+    warmup_steps = max(0, int(style_ratio_config.get("ratio_warmup_steps", 0)))
+    ramp_steps = max(0, int(style_ratio_config.get("ratio_ramp_steps", 0)))
+    if step_since_resume <= warmup_steps:
+        schedule_scale = 0.0
+    elif ramp_steps <= 0:
+        schedule_scale = 1.0
+    else:
+        schedule_scale = min(1.0, float(step_since_resume - warmup_steps) / float(ramp_steps))
+
+    grad_threshold = float(style_ratio_config.get("ratio_gate_grad_threshold", 0.0))
+    slope_abs_max = float(style_ratio_config.get("ratio_gate_slope_abs_max", 0.0))
+    ema_window = max(2, int(style_ratio_config.get("ratio_gate_ema_window", 50)))
+    history_tail = near_normal_history[-ema_window:]
+    slope = _estimate_series_slope(history_tail)
+
+    grad_ready = True if grad_threshold <= 0.0 else (near_normal_loss_value <= grad_threshold)
+    slope_ready = True if slope_abs_max <= 0.0 else (len(history_tail) >= 2 and abs(slope) <= slope_abs_max)
+    gate_active = 1.0 if (schedule_scale > 0.0 and grad_ready and slope_ready) else 0.0
+    return {
+        "schedule_scale": float(schedule_scale),
+        "grad_ready": 1.0 if grad_ready else 0.0,
+        "slope_ready": 1.0 if slope_ready else 0.0,
+        "gate_active": float(gate_active),
+        "slope": float(slope),
+    }
+
+
+def _compute_style_ratio_losses(
+    *,
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    seam_maps: Dict[str, torch.Tensor],
+    style_entry: object,
+    style_pool_config: Dict[str, object],
+    style_ratio_config: Dict[str, object],
+    prototype_cache: Dict[Tuple[str, int, int, int, bool, str, str], Dict[str, object]],
+    prototype_cache_stats: Counter,
+    step_since_resume: int,
+    near_normal_history: List[float],
+) -> Dict[str, object]:
+    zero = pred_rgb.new_tensor(0.0)
+    result: Dict[str, object] = {
+        "enabled": 0.0,
+        "total_loss": zero,
+        "near_normal_loss": zero,
+        "near_tangent_loss": zero,
+        "near_lowfreq_loss": zero,
+        "overlap_normal_loss": zero,
+        "overlap_tangent_loss": zero,
+        "overlap_lowfreq_loss": zero,
+        "bucket_kl_loss": zero,
+        "entropy_loss": zero,
+        "effective_kl_scale": 0.0,
+        "ratio_gate_active": 0.0,
+        "ratio_schedule_scale": 0.0,
+        "ratio_gate_grad_ready": 0.0,
+        "ratio_gate_slope_ready": 0.0,
+        "ratio_gate_slope": 0.0,
+        "patch_count": 0.0,
+        "bucket_count": 0.0,
+        "neighbor_agreement_rate": 0.0,
+        "prototype_cache_memory_hits": 0.0,
+        "prototype_cache_disk_hits": 0.0,
+        "prototype_cache_misses": 0.0,
+        "active_style_count": 0.0,
+        "active_style_family_id": "",
+        "bucket_kl_json": "{}",
+        "bucket_patch_count_json": "{}",
+        "dominant_expected_map": None,
+        "dominant_predicted_map": None,
+        "bucket_assignment_map": None,
+        "entropy_map": None,
+        "kl_proxy_map": None,
+        "neighbor_agreement_map": None,
+        "patch_boxes": [],
+    }
+
+    normalized_entry = _normalize_style_pool_entry_for_training(style_entry)
+    if normalized_entry is None:
+        return result
+
+    near_per_edge = seam_maps.get("near_band_mask_per_edge")
+    overlap_per_edge = seam_maps.get("overlap_band_mask_per_edge")
+    overlap_mask = seam_maps.get("overlap_band_mask")
+    soft_field_mask = seam_maps.get("soft_field_mask")
+    ramp_mask = seam_maps.get("style_ratio_ramp_mask")
+    q_per_edge = seam_maps.get("soft_field_q_per_edge")
+    q_interior = seam_maps.get("soft_field_q_interior")
+    influence_c = seam_maps.get("soft_field_influence_c")
+    signed_distance_per_edge = seam_maps.get("source_signed_distance_per_edge")
+    if not all(isinstance(value, torch.Tensor) for value in (near_per_edge, overlap_per_edge, overlap_mask, soft_field_mask, ramp_mask, q_per_edge, q_interior, influence_c, signed_distance_per_edge)):
+        return result
+
+    weight_cfg = dict(style_ratio_config.get("loss_weights", {}) or {})
+    blur_radius = int(style_ratio_config.get("low_frequency_blur_radius", 17))
+    near_normal = _compute_directional_seam_gradient_loss(pred_rgb, target_rgb, near_per_edge, component="normal")
+    near_tangent = _compute_directional_seam_gradient_loss(pred_rgb, target_rgb, near_per_edge, component="tangent")
+    overlap_normal = _compute_directional_seam_gradient_loss(pred_rgb, target_rgb, overlap_per_edge, component="normal")
+    overlap_tangent = _compute_directional_seam_gradient_loss(pred_rgb, target_rgb, overlap_per_edge, component="tangent")
+    near_lowfreq = _compute_masked_low_frequency_rgb_loss(pred_rgb, target_rgb, near_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0), blur_radius=blur_radius)
+    overlap_lowfreq = _compute_masked_low_frequency_rgb_loss(pred_rgb, target_rgb, overlap_mask, blur_radius=blur_radius)
+
+    near_normal_history.append(float(near_normal["loss"].detach().item()))
+    gate_state = _resolve_style_ratio_gate(
+        style_ratio_config=style_ratio_config,
+        step_since_resume=step_since_resume,
+        near_normal_loss_value=float(near_normal["loss"].detach().item()),
+        near_normal_history=near_normal_history,
+    )
+
+    continuity_loss = (
+        float(weight_cfg.get("near_normal_grad_weight", 1.0)) * near_normal["loss"]
+        + float(weight_cfg.get("near_tangent_grad_weight", 0.25)) * near_tangent["loss"]
+        + float(weight_cfg.get("near_lowfreq_weight", 0.10)) * near_lowfreq["loss"]
+        + float(weight_cfg.get("overlap_normal_grad_weight", 0.75)) * overlap_normal["loss"]
+        + float(weight_cfg.get("overlap_tangent_grad_weight", 0.15)) * overlap_tangent["loss"]
+        + float(weight_cfg.get("overlap_lowfreq_weight", 0.08)) * overlap_lowfreq["loss"]
+    )
+
+    result.update(
+        {
+            "enabled": 1.0,
+            "near_normal_loss": near_normal["loss"],
+            "near_tangent_loss": near_tangent["loss"],
+            "near_lowfreq_loss": near_lowfreq["loss"],
+            "overlap_normal_loss": overlap_normal["loss"],
+            "overlap_tangent_loss": overlap_tangent["loss"],
+            "overlap_lowfreq_loss": overlap_lowfreq["loss"],
+            "ratio_gate_active": gate_state["gate_active"],
+            "ratio_schedule_scale": gate_state["schedule_scale"],
+            "ratio_gate_grad_ready": gate_state["grad_ready"],
+            "ratio_gate_slope_ready": gate_state["slope_ready"],
+            "ratio_gate_slope": gate_state["slope"],
+        }
+    )
+
+    active_style_ids = _resolve_active_style_ids(normalized_entry)
+    result["active_style_count"] = float(len(active_style_ids))
+    result["active_style_family_id"] = str(normalized_entry.get("style_family_id", ""))
+    if len(active_style_ids) <= 0:
+        result["total_loss"] = continuity_loss
+        return result
+
+    prototypes_by_style: Dict[str, torch.Tensor] = {}
+    for style_id in active_style_ids:
+        prototype_payload = _load_or_build_style_prototypes(
+            style_entry=normalized_entry,
+            style_id=style_id,
+            patch_size=int(style_ratio_config.get("patch_sizes", [32])[0]),
+            style_pool_config=style_pool_config,
+            style_ratio_config=style_ratio_config,
+            prototype_cache=prototype_cache,
+            prototype_cache_stats=prototype_cache_stats,
+        )
+        prototypes_by_style[style_id] = prototype_payload["prototypes"]
+
+    patch_sizes = [int(value) for value in style_ratio_config.get("patch_sizes", [32, 64])]
+    patch_sizes = sorted({max(1, value) for value in patch_sizes})
+    near_patch_size = patch_sizes[0]
+    far_patch_size = patch_sizes[-1]
+    distance_split_px = float(style_ratio_config.get("overlap_band_end_px", 96.0)) + (
+        float(style_ratio_config.get("soft_field_end_px", 400.0)) - float(style_ratio_config.get("overlap_band_end_px", 96.0))
+    ) * 0.5
+    positive_distance = torch.where(
+        signed_distance_per_edge >= 0.0,
+        signed_distance_per_edge,
+        torch.full_like(signed_distance_per_edge, float("inf")),
+    )
+    min_distance = positive_distance.amin(dim=1, keepdim=True)
+    min_distance = torch.where(torch.isinf(min_distance), torch.zeros_like(min_distance), min_distance)
+    style_support_mask = (overlap_mask + soft_field_mask).clamp(0.0, 1.0)
+
+    style_id_to_index = {style_id: index for index, style_id in enumerate(active_style_ids)}
+    style_q_maps = pred_rgb.new_zeros(pred_rgb.shape[0], len(active_style_ids), pred_rgb.shape[-2], pred_rgb.shape[-1])
+    edge_style_ids = normalized_entry.get("edge_style_ids", {}) if isinstance(normalized_entry.get("edge_style_ids", {}), dict) else {}
+    fallback_style_id = str(normalized_entry.get("style_family_id", normalized_entry.get("sample_id", ""))).strip()
+    for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
+        style_id = str(edge_style_ids.get(edge_name, fallback_style_id)).strip() or fallback_style_id
+        if style_id in style_id_to_index:
+            style_q_maps[:, style_id_to_index[style_id] : style_id_to_index[style_id] + 1] = (
+                style_q_maps[:, style_id_to_index[style_id] : style_id_to_index[style_id] + 1]
+                + q_per_edge[:, edge_index : edge_index + 1]
+            )
+    interior_style_id = str(normalized_entry.get("interior_style_id", fallback_style_id)).strip() or fallback_style_id
+    if interior_style_id in style_id_to_index:
+        style_q_maps[:, style_id_to_index[interior_style_id] : style_id_to_index[interior_style_id] + 1] = (
+            style_q_maps[:, style_id_to_index[interior_style_id] : style_id_to_index[interior_style_id] + 1]
+            + q_interior
+        )
+
+    dominant_expected_map = torch.zeros_like(style_support_mask)
+    dominant_predicted_map = torch.zeros_like(style_support_mask)
+    bucket_assignment_map = torch.zeros_like(style_support_mask)
+    entropy_map = torch.zeros_like(style_support_mask)
+    kl_proxy_map = torch.zeros_like(style_support_mask)
+    neighbor_agreement_map = torch.zeros_like(style_support_mask)
+
+    patch_features_list: List[torch.Tensor] = []
+    patch_metadata: List[Dict[str, object]] = []
+    for patch_size in {near_patch_size, far_patch_size}:
+        stride = max(1, patch_size // 2)
+        for y0 in range(0, max(1, pred_rgb.shape[-2] - patch_size + 1), stride):
+            for x0 in range(0, max(1, pred_rgb.shape[-1] - patch_size + 1), stride):
+                y1 = min(pred_rgb.shape[-2], y0 + patch_size)
+                x1 = min(pred_rgb.shape[-1], x0 + patch_size)
+                if (y1 - y0) != patch_size or (x1 - x0) != patch_size:
+                    continue
+                support_patch = style_support_mask[:, :, y0:y1, x0:x1]
+                if float(support_patch.mean().detach().item()) <= 0.05:
+                    continue
+                distance_patch = float(min_distance[:, :, y0:y1, x0:x1].mean().detach().item())
+                if patch_size == near_patch_size and distance_patch >= distance_split_px:
+                    continue
+                if patch_size == far_patch_size and distance_patch < distance_split_px:
+                    continue
+                q_patch = style_q_maps[:, :, y0:y1, x0:x1].mean(dim=(-2, -1))
+                q_patch_sum = q_patch.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                q_patch = q_patch / q_patch_sum
+                c_patch = float(influence_c[:, :, y0:y1, x0:x1].mean().detach().item())
+                ramp_patch = float(ramp_mask[:, :, y0:y1, x0:x1].mean().detach().item())
+                if float(soft_field_mask[:, :, y0:y1, x0:x1].mean().detach().item()) > 0.0:
+                    ratio_weight = float(weight_cfg.get("style_ratio_soft_weight", 1.0))
+                else:
+                    overlap_start = float(weight_cfg.get("style_ratio_overlap_weight_start", 0.0))
+                    overlap_end = float(weight_cfg.get("style_ratio_overlap_weight_end", 0.5))
+                    ratio_weight = overlap_start + (overlap_end - overlap_start) * ramp_patch
+                bucket_c = _bucket_index(c_patch, list(style_ratio_config.get("bucket_c_edges", [0.0, 1.01])))
+                bucket_d = _bucket_index(distance_patch, list(style_ratio_config.get("bucket_distance_edges_px", [0.0, 400.0])))
+                if bucket_c < 0 or bucket_d < 0:
+                    continue
+                pred_patch_rgb01 = ((pred_rgb[:, :, y0:y1, x0:x1].detach().float().clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+                patch_features = _compute_handcrafted_style_features(
+                    pred_patch_rgb01,
+                    blur_radius=blur_radius,
+                    lab_enabled=bool(style_ratio_config.get("lab_features_enabled", False)),
+                )
+                patch_features_list.append(patch_features)
+                patch_metadata.append(
+                    {
+                        "y0": y0,
+                        "y1": y1,
+                        "x0": x0,
+                        "x1": x1,
+                        "patch_size": patch_size,
+                        "distance": distance_patch,
+                        "c_value": c_patch,
+                        "ratio_weight": ratio_weight,
+                        "q_patch": q_patch[0],
+                        "bucket_key": f"c{bucket_c}_d{bucket_d}",
+                    }
+                )
+
+    if not patch_features_list:
+        result["total_loss"] = continuity_loss
+        result["prototype_cache_memory_hits"] = float(prototype_cache_stats.get("memory_hits", 0))
+        result["prototype_cache_disk_hits"] = float(prototype_cache_stats.get("disk_hits", 0))
+        result["prototype_cache_misses"] = float(prototype_cache_stats.get("misses", 0))
+        return result
+
+    patch_features_tensor = torch.cat(patch_features_list, dim=0)
+    probability_rows: List[torch.Tensor] = []
+    dominant_predicted_indices: List[int] = []
+    entropy_values: List[float] = []
+    kl_values: List[float] = []
+    bucket_accumulators: Dict[str, Dict[str, object]] = {}
+    max_patch_size = max(far_patch_size, near_patch_size)
+
+    for patch_index, metadata in enumerate(patch_metadata):
+        feature_row = patch_features_tensor[patch_index : patch_index + 1]
+        style_distances = []
+        for style_id in active_style_ids:
+            patch_size = int(metadata["patch_size"])
+            prototype_payload = _load_or_build_style_prototypes(
+                style_entry=normalized_entry,
+                style_id=style_id,
+                patch_size=patch_size,
+                style_pool_config=style_pool_config,
+                style_ratio_config=style_ratio_config,
+                prototype_cache=prototype_cache,
+                prototype_cache_stats=prototype_cache_stats,
+            )
+            prototypes = prototype_payload["prototypes"].to(device=feature_row.device, dtype=feature_row.dtype)
+            distances = torch.cdist(feature_row, prototypes)
+            style_distances.append(distances.min(dim=1).values)
+        distance_row = torch.stack(style_distances, dim=1)
+        probabilities = F.softmax(
+            -(distance_row / max(float(style_ratio_config.get("temperature", 0.25)), 1e-6)),
+            dim=1,
+        )[0]
+        probability_rows.append(probabilities)
+        dominant_predicted_indices.append(int(probabilities.argmax().item()))
+
+        q_patch = metadata["q_patch"].to(device=probabilities.device, dtype=probabilities.dtype)
+        q_patch = q_patch / q_patch.sum().clamp_min(1e-6)
+        entropy = -torch.sum(probabilities * torch.log(probabilities.clamp_min(1e-6)))
+        kl_value = torch.sum(q_patch * (torch.log(q_patch.clamp_min(1e-6)) - torch.log(probabilities.clamp_min(1e-6))))
+        entropy_values.append(float(entropy.detach().item()))
+        kl_values.append(float(kl_value.detach().item()))
+
+        bucket = bucket_accumulators.setdefault(
+            str(metadata["bucket_key"]),
+            {
+                "p_rows": [],
+                "q_rows": [],
+                "weights": [],
+                "count": 0,
+            },
+        )
+        bucket["p_rows"].append(probabilities.detach())
+        bucket["q_rows"].append(q_patch.detach())
+        bucket["weights"].append(float(metadata["ratio_weight"]))
+        bucket["count"] += 1
+
+        y0 = int(metadata["y0"])
+        y1 = int(metadata["y1"])
+        x0 = int(metadata["x0"])
+        x1 = int(metadata["x1"])
+        dominant_expected_map[:, :, y0:y1, x0:x1] = float(q_patch.argmax().item() + 1) / float(max(1, len(active_style_ids)))
+        dominant_predicted_map[:, :, y0:y1, x0:x1] = float(probabilities.argmax().item() + 1) / float(max(1, len(active_style_ids)))
+        bucket_assignment_map[:, :, y0:y1, x0:x1] = float(len(bucket_accumulators)) / float(max(1, len(style_ratio_config.get("bucket_c_edges", [0.0, 1.0])) * len(style_ratio_config.get("bucket_distance_edges_px", [0.0, 1.0]))))
+        entropy_map[:, :, y0:y1, x0:x1] = float(entropy.detach().item()) / math.log(max(2, len(active_style_ids)))
+        kl_proxy_map[:, :, y0:y1, x0:x1] = float(kl_value.detach().item())
+
+    bucket_kl_terms: List[torch.Tensor] = []
+    bucket_kl_json: Dict[str, float] = {}
+    bucket_patch_count_json: Dict[str, int] = {}
+    for bucket_key, bucket in bucket_accumulators.items():
+        p_bucket = torch.stack(bucket["p_rows"], dim=0).mean(dim=0)
+        q_bucket = torch.stack(bucket["q_rows"], dim=0).mean(dim=0)
+        q_bucket = q_bucket / q_bucket.sum().clamp_min(1e-6)
+        p_bucket = p_bucket / p_bucket.sum().clamp_min(1e-6)
+        bucket_kl = torch.sum(q_bucket * (torch.log(q_bucket.clamp_min(1e-6)) - torch.log(p_bucket.clamp_min(1e-6))))
+        weight = float(sum(bucket["weights"]) / max(1, len(bucket["weights"])))
+        bucket_kl_terms.append(bucket_kl * weight)
+        bucket_kl_json[bucket_key] = float(bucket_kl.detach().item())
+        bucket_patch_count_json[bucket_key] = int(bucket["count"])
+
+    bucket_kl_loss = torch.stack(bucket_kl_terms).sum() if bucket_kl_terms else zero
+    entropy_weighted = [
+        zero.new_tensor(float(metadata["ratio_weight"]) * float(metadata["c_value"]) * entropy_values[index])
+        for index, metadata in enumerate(patch_metadata)
+    ]
+    entropy_loss = torch.stack(entropy_weighted).mean() if entropy_weighted else zero
+    effective_kl_scale = float(weight_cfg.get("style_ratio_kl_weight_max", 0.10)) * float(gate_state["schedule_scale"]) * float(gate_state["gate_active"])
+    entropy_contribution = float(weight_cfg.get("entropy_weight", 0.003)) * entropy_loss
+    total_loss = continuity_loss + (effective_kl_scale * bucket_kl_loss) + entropy_contribution
+
+    grid_labels: Dict[Tuple[int, int, int], int] = {}
+    for patch_index, metadata in enumerate(patch_metadata):
+        key = (
+            int(metadata["patch_size"]),
+            int((int(metadata["y0"]) + int(metadata["y1"])) // 2),
+            int((int(metadata["x0"]) + int(metadata["x1"])) // 2),
+        )
+        grid_labels[key] = int(dominant_predicted_indices[patch_index])
+    agreement_total = 0
+    agreement_matches = 0
+    for (patch_size, center_y, center_x), label in grid_labels.items():
+        neighbors = [
+            (patch_size, center_y, center_x + (patch_size // 2)),
+            (patch_size, center_y + (patch_size // 2), center_x),
+        ]
+        for neighbor_key in neighbors:
+            if neighbor_key not in grid_labels:
+                continue
+            agreement_total += 1
+            if grid_labels[neighbor_key] == label:
+                agreement_matches += 1
+        neighbor_agreement_map[
+            :,
+            :,
+            max(0, center_y - (patch_size // 2)) : min(pred_rgb.shape[-2], center_y + (patch_size // 2)),
+            max(0, center_x - (patch_size // 2)) : min(pred_rgb.shape[-1], center_x + (patch_size // 2)),
+        ] = 1.0 if agreement_total > 0 and agreement_matches > 0 else 0.0
+
+    result.update(
+        {
+            "total_loss": total_loss,
+            "bucket_kl_loss": bucket_kl_loss,
+            "entropy_loss": entropy_loss,
+            "effective_kl_scale": effective_kl_scale,
+            "patch_count": float(len(patch_metadata)),
+            "bucket_count": float(len(bucket_accumulators)),
+            "neighbor_agreement_rate": float(agreement_matches / max(1, agreement_total)),
+            "prototype_cache_memory_hits": float(prototype_cache_stats.get("memory_hits", 0)),
+            "prototype_cache_disk_hits": float(prototype_cache_stats.get("disk_hits", 0)),
+            "prototype_cache_misses": float(prototype_cache_stats.get("misses", 0)),
+            "bucket_kl_json": json.dumps(bucket_kl_json, sort_keys=True),
+            "bucket_patch_count_json": json.dumps(bucket_patch_count_json, sort_keys=True),
+            "dominant_expected_map": dominant_expected_map,
+            "dominant_predicted_map": dominant_predicted_map,
+            "bucket_assignment_map": bucket_assignment_map,
+            "entropy_map": entropy_map.clamp(0.0, 1.0),
+            "kl_proxy_map": kl_proxy_map,
+            "neighbor_agreement_map": neighbor_agreement_map,
+            "patch_boxes": [
+                {
+                    "x0": int(metadata["x0"]),
+                    "x1": int(metadata["x1"]),
+                    "y0": int(metadata["y0"]),
+                    "y1": int(metadata["y1"]),
+                }
+                for metadata in patch_metadata
+            ],
+        }
+    )
+    return result
 
 
 def _build_corrupted_geometry_conditioning(
@@ -2482,7 +3844,12 @@ def _build_seam_region_maps(
     supervision_mask: torch.Tensor,
     seam_config: Dict[str, object],
     expanded_halo_px: int = 0,
+    source_sizes_hw: Optional[torch.Tensor] = None,
+    expanded_source_boxes: Optional[torch.Tensor] = None,
+    valid_expanded_source_mask: Optional[torch.Tensor] = None,
     continuation_valid_mask: Optional[torch.Tensor] = None,
+    style_support_valid_mask: Optional[torch.Tensor] = None,
+    style_ratio_config: Optional[Dict[str, object]] = None,
 ) -> Dict[str, torch.Tensor]:
     return shared_build_seam_region_maps(
         edge_band_masks=edge_band_masks,
@@ -2492,7 +3859,12 @@ def _build_seam_region_maps(
         supervision_mask=supervision_mask,
         seam_config=seam_config,
         expanded_halo_px=expanded_halo_px,
+        source_sizes_hw=source_sizes_hw,
+        expanded_source_boxes=expanded_source_boxes,
+        valid_expanded_source_mask=valid_expanded_source_mask,
         continuation_valid_mask=continuation_valid_mask,
+        style_support_valid_mask=style_support_valid_mask,
+        style_ratio_config=style_ratio_config,
     )
 
 
@@ -2801,6 +4173,18 @@ def _aggregate_weighted_seam_summaries(
     }
 
 
+def _detach_tensor_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_tensor_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_tensor_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_tensor_tree(item) for item in value)
+    return value
+
+
 def _save_seam_visual_debug(
     output_dir: str,
     step: int,
@@ -2808,17 +4192,201 @@ def _save_seam_visual_debug(
     target_rgb: torch.Tensor,
     supervision_mask: torch.Tensor,
     seam_maps: Dict[str, torch.Tensor],
+    full_target_rgb: Optional[torch.Tensor] = None,
+    full_seam_maps: Optional[Dict[str, torch.Tensor]] = None,
+    crop_box: Optional[Dict[str, int]] = None,
+    reference_target_rgb: Optional[torch.Tensor] = None,
+    source_sizes_hw: Optional[Tuple[int, int]] = None,
+    expanded_source_box: Optional[Tuple[float, float, float, float]] = None,
+    output_size_hw: Optional[Tuple[int, int]] = None,
+    style_ratio_debug: Optional[Dict[str, object]] = None,
 ) -> None:
     seam_dir = os.path.join(output_dir, "sanity", "seam_debug")
     os.makedirs(seam_dir, exist_ok=True)
 
-    pred0 = pred_rgb[0].detach().float().cpu()
-    target0 = target_rgb[0].detach().float().cpu()
-    supervision0 = supervision_mask[0, 0].detach().float().cpu().clamp(0.0, 1.0)
-    halo_mask0 = (seam_maps["margin_inner"][0, 0] + seam_maps["margin_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
-    interior_mask0 = (seam_maps["interior_inner"][0, 0] + seam_maps["interior_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
+    seam_maps_for_debug = full_seam_maps if full_seam_maps is not None else seam_maps
+    full_height = int(seam_maps_for_debug["margin_inner"].shape[-2])
+    full_width = int(seam_maps_for_debug["margin_inner"].shape[-1])
 
-    diff_map = (pred0 - target0).abs().mean(dim=0)
+    def _place_rgb_crop(rgb_crop: torch.Tensor) -> torch.Tensor:
+        canvas = torch.zeros((3, full_height, full_width), dtype=torch.float32)
+        if crop_box is None:
+            canvas[:, : rgb_crop.shape[-2], : rgb_crop.shape[-1]] = rgb_crop
+            return canvas
+        canvas[:, crop_box["pixel_y0"] : crop_box["pixel_y1"], crop_box["pixel_x0"] : crop_box["pixel_x1"]] = rgb_crop
+        return canvas
+
+    def _place_mask_crop(mask_crop: torch.Tensor) -> torch.Tensor:
+        canvas = torch.zeros((full_height, full_width), dtype=torch.float32)
+        if crop_box is None:
+            canvas[: mask_crop.shape[-2], : mask_crop.shape[-1]] = mask_crop
+            return canvas
+        canvas[crop_box["pixel_y0"] : crop_box["pixel_y1"], crop_box["pixel_x0"] : crop_box["pixel_x1"]] = mask_crop
+        return canvas
+
+    preview_source_size_hw: Optional[Tuple[int, int]] = None
+    if expanded_source_box is not None:
+        preview_source_size_hw = (int(round(float(expanded_source_box[3]))), int(round(float(expanded_source_box[2]))))
+    elif source_sizes_hw is not None:
+        preview_source_size_hw = (int(source_sizes_hw[0]), int(source_sizes_hw[1]))
+
+    preserve_full_canvas = expanded_source_box is not None
+
+    def _resolve_preview_crop_bounds() -> Optional[Tuple[int, int, int, int]]:
+        if not preserve_full_canvas:
+            return None
+
+        preview_support = torch.zeros((full_height, full_width), dtype=torch.float32)
+        if crop_box is not None:
+            preview_support[
+                crop_box["pixel_y0"] : crop_box["pixel_y1"],
+                crop_box["pixel_x0"] : crop_box["pixel_x1"],
+            ] = 1.0
+
+        for key in (
+            "seam_loss_support_mask",
+            "controlnet_conditioning_valid_mask",
+            "valid_style_support_mask",
+            "style_spatial_support_mask",
+            "seam_neighborhood_mask",
+        ):
+            value = seam_maps_for_debug.get(key)
+            if not isinstance(value, torch.Tensor) or value.ndim < 4:
+                continue
+            if tuple(value.shape[-2:]) != (full_height, full_width):
+                continue
+            preview_support = torch.maximum(
+                preview_support,
+                value[0, 0].detach().float().cpu().clamp(0.0, 1.0),
+            )
+
+        preview_indices = torch.nonzero(preview_support > 1e-6, as_tuple=False)
+        if preview_indices.numel() <= 0:
+            return None
+
+        y0 = max(0, int(preview_indices[:, 0].min().item()))
+        y1 = min(full_height, int(preview_indices[:, 0].max().item()) + 1)
+        x0 = max(0, int(preview_indices[:, 1].min().item()))
+        x1 = min(full_width, int(preview_indices[:, 1].max().item()) + 1)
+        return y0, y1, x0, x1
+
+    preview_crop_bounds = _resolve_preview_crop_bounds()
+
+    def _crop_to_preview_region(tensor: torch.Tensor) -> torch.Tensor:
+        if preview_crop_bounds is None:
+            return tensor
+        crop_y0, crop_y1, crop_x0, crop_x1 = preview_crop_bounds
+        if tensor.ndim == 3:
+            return tensor[:, crop_y0:crop_y1, crop_x0:crop_x1]
+        if tensor.ndim == 2:
+            return tensor[crop_y0:crop_y1, crop_x0:crop_x1]
+        raise ValueError(f"unsupported debug tensor rank for preview crop: {tensor.ndim}")
+
+    def _crop_to_reference_region(tensor: torch.Tensor) -> torch.Tensor:
+        if preserve_full_canvas or reference_target_rgb is None:
+            return tensor
+        ref_height = int(reference_target_rgb.shape[-2])
+        ref_width = int(reference_target_rgb.shape[-1])
+        current_height = int(tensor.shape[-2])
+        current_width = int(tensor.shape[-1])
+        if (current_height, current_width) == (ref_height, ref_width):
+            return tensor
+        if current_height < ref_height or current_width < ref_width:
+            return tensor
+        offset_y = max(0, (current_height - ref_height) // 2)
+        offset_x = max(0, (current_width - ref_width) // 2)
+        if tensor.ndim == 3:
+            return tensor[:, offset_y : offset_y + ref_height, offset_x : offset_x + ref_width]
+        if tensor.ndim == 2:
+            return tensor[offset_y : offset_y + ref_height, offset_x : offset_x + ref_width]
+        raise ValueError(f"unsupported debug tensor rank for crop: {tensor.ndim}")
+
+    def _prepare_preview_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if preview_crop_bounds is not None:
+            return _crop_to_preview_region(tensor)
+        return _crop_to_reference_region(tensor)
+
+    def _resolve_debug_output_size_hw() -> Optional[Tuple[int, int]]:
+        if preview_crop_bounds is not None:
+            preview_height = int(preview_crop_bounds[1] - preview_crop_bounds[0])
+            preview_width = int(preview_crop_bounds[3] - preview_crop_bounds[2])
+        elif preview_source_size_hw is not None:
+            preview_height = int(preview_source_size_hw[0])
+            preview_width = int(preview_source_size_hw[1])
+        elif output_size_hw is not None:
+            preview_height = int(output_size_hw[0])
+            preview_width = int(output_size_hw[1])
+        else:
+            return None
+
+        if preview_height <= 0 or preview_width <= 0:
+            return output_size_hw
+
+        if output_size_hw is None:
+            return preview_height, preview_width
+
+        limit_long_edge = max(int(output_size_hw[0]), int(output_size_hw[1]))
+        if limit_long_edge <= 0:
+            return preview_height, preview_width
+
+        scale = min(1.0, float(limit_long_edge) / float(max(preview_height, preview_width)))
+        resolved_height = max(1, int(round(float(preview_height) * scale)))
+        resolved_width = max(1, int(round(float(preview_width) * scale)))
+        return resolved_height, resolved_width
+
+    debug_output_size_hw = _resolve_debug_output_size_hw()
+
+    def _resize_rgb_to_output(tensor: torch.Tensor) -> torch.Tensor:
+        if debug_output_size_hw is None:
+            return tensor
+        output_height, output_width = int(debug_output_size_hw[0]), int(debug_output_size_hw[1])
+        if tuple(tensor.shape[-2:]) == (output_height, output_width):
+            return tensor
+        return F.interpolate(
+            tensor.unsqueeze(0),
+            size=(output_height, output_width),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+
+    def _resize_mask_to_output(tensor: torch.Tensor, *, nearest: bool = False) -> torch.Tensor:
+        if debug_output_size_hw is None:
+            return tensor
+        output_height, output_width = int(debug_output_size_hw[0]), int(debug_output_size_hw[1])
+        if tuple(tensor.shape[-2:]) == (output_height, output_width):
+            return tensor
+        if nearest:
+            return F.interpolate(
+                tensor.unsqueeze(0).unsqueeze(0),
+                size=(output_height, output_width),
+                mode="nearest",
+            )[0, 0]
+        return F.interpolate(
+            tensor.unsqueeze(0).unsqueeze(0),
+            size=(output_height, output_width),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+
+    pred0_crop = pred_rgb[0].detach().float().cpu()
+    target0_crop = target_rgb[0].detach().float().cpu()
+    supervision0_crop = supervision_mask[0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    pred0 = _place_rgb_crop(pred0_crop)
+    if full_target_rgb is not None:
+        target0 = full_target_rgb[0].detach().float().cpu()
+    else:
+        target0 = _place_rgb_crop(target0_crop)
+    supervision0 = _place_mask_crop(supervision0_crop)
+    halo_mask0 = (seam_maps_for_debug["margin_inner"][0, 0] + seam_maps_for_debug["margin_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
+    interior_mask0 = (seam_maps_for_debug["interior_inner"][0, 0] + seam_maps_for_debug["interior_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
+
+    diff_map = _place_mask_crop((pred0_crop - target0_crop).abs().mean(dim=0))
+    pred0 = _resize_rgb_to_output(_prepare_preview_tensor(pred0))
+    target0 = _resize_rgb_to_output(_prepare_preview_tensor(target0))
+    supervision0 = _resize_mask_to_output(_prepare_preview_tensor(supervision0), nearest=True)
+    halo_mask0 = _resize_mask_to_output(_prepare_preview_tensor(halo_mask0), nearest=True)
+    interior_mask0 = _resize_mask_to_output(_prepare_preview_tensor(interior_mask0), nearest=True)
+    diff_map = _resize_mask_to_output(_prepare_preview_tensor(diff_map))
     halo_diff = (diff_map * halo_mask0).clamp(0.0, 1.0)
     interior_diff = (diff_map * interior_mask0).clamp(0.0, 1.0)
 
@@ -2828,14 +4396,15 @@ def _save_seam_visual_debug(
     _tensor_to_image(pred0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_prediction.png"))
     _tensor_to_image(target0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_target.png"))
     _mask_to_image(supervision0).save(os.path.join(seam_dir, f"step_{step:06d}_supervision_mask.png"))
+    _mask_to_image(supervision0).save(os.path.join(seam_dir, f"step_{step:06d}_seam_loss_support_mask.png"))
     _mask_to_image(halo_norm).save(os.path.join(seam_dir, f"step_{step:06d}_halo_only_diff_heatmap.png"))
     _mask_to_image(interior_norm).save(os.path.join(seam_dir, f"step_{step:06d}_interior_band_diff.png"))
 
     region_overlay = torch.zeros((3, target0.shape[-2], target0.shape[-1]), dtype=torch.float32)
-    margin_inner = seam_maps["margin_inner"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
-    margin_outer = seam_maps["margin_outer"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
-    interior_inner = seam_maps["interior_inner"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
-    interior_outer = seam_maps["interior_outer"][0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    margin_inner = _resize_mask_to_output(_prepare_preview_tensor(seam_maps_for_debug["margin_inner"][0, 0].detach().float().cpu().clamp(0.0, 1.0)), nearest=True)
+    margin_outer = _resize_mask_to_output(_prepare_preview_tensor(seam_maps_for_debug["margin_outer"][0, 0].detach().float().cpu().clamp(0.0, 1.0)), nearest=True)
+    interior_inner = _resize_mask_to_output(_prepare_preview_tensor(seam_maps_for_debug["interior_inner"][0, 0].detach().float().cpu().clamp(0.0, 1.0)), nearest=True)
+    interior_outer = _resize_mask_to_output(_prepare_preview_tensor(seam_maps_for_debug["interior_outer"][0, 0].detach().float().cpu().clamp(0.0, 1.0)), nearest=True)
 
     # Color key: halo_inner=red, halo_outer=orange, interior_continuation=cyan, interior_core=blue.
     region_overlay[0] = torch.maximum(region_overlay[0], margin_inner)
@@ -2848,6 +4417,115 @@ def _save_seam_visual_debug(
     base01 = ((target0.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
     blended = (0.45 * base01) + (0.55 * region_overlay.clamp(0.0, 1.0))
     _tensor_to_image((blended * 2.0) - 1.0).save(os.path.join(seam_dir, f"step_{step:06d}_region_overlay.png"))
+
+    debug_mask_keys = (
+        "outer_halo_mask",
+        "inner_halo_mask",
+        "hard_band_mask",
+        "near_band_mask",
+        "overlap_band_mask",
+        "soft_field_mask",
+        "interior_mask",
+        "style_ratio_ramp_mask",
+        "controlnet_style_effect_mask",
+        "valid_expanded_source_mask",
+        "expanded_padding_invalid_mask",
+        "seam_loss_support_mask",
+        "controlnet_conditioning_valid_mask",
+        "seam_neighborhood_mask",
+        "seam_gap_mask",
+        "seam_overlap_mask",
+        "valid_style_support_mask",
+        "style_spatial_support_mask",
+        "soft_field_influence_c",
+        "soft_field_q_sum",
+        "soft_field_q_sum_raw",
+        "soft_field_q_mask_removed",
+        "soft_field_q_north",
+        "soft_field_q_south",
+        "soft_field_q_east",
+        "soft_field_q_west",
+        "soft_field_q_interior",
+        "soft_field_q_north_raw",
+        "soft_field_q_south_raw",
+        "soft_field_q_east_raw",
+        "soft_field_q_west_raw",
+        "soft_field_q_interior_raw",
+    )
+    for key in debug_mask_keys:
+        value = seam_maps_for_debug.get(key)
+        if not isinstance(value, torch.Tensor) or value.ndim < 4:
+            continue
+        debug_mask = value[0, 0].detach().float().cpu()
+        if debug_mask.numel() <= 0:
+            continue
+        debug_mask = _resize_mask_to_output(_prepare_preview_tensor(debug_mask), nearest=True)
+        debug_mask = debug_mask.clamp(0.0, 1.0)
+        _mask_to_image(debug_mask).save(os.path.join(seam_dir, f"step_{step:06d}_{key}.png"))
+
+    if isinstance(style_ratio_debug, dict):
+        style_crop_box = style_ratio_debug.get("crop_box") if isinstance(style_ratio_debug.get("crop_box"), dict) else crop_box
+
+        def _place_style_mask(mask_crop: torch.Tensor) -> torch.Tensor:
+            canvas = torch.zeros((full_height, full_width), dtype=torch.float32)
+            if style_crop_box is None:
+                canvas[: mask_crop.shape[-2], : mask_crop.shape[-1]] = mask_crop
+                return canvas
+            canvas[
+                int(style_crop_box["pixel_y0"]):int(style_crop_box["pixel_y1"]),
+                int(style_crop_box["pixel_x0"]):int(style_crop_box["pixel_x1"]),
+            ] = mask_crop
+            return canvas
+
+        style_map_keys = {
+            "dominant_expected_map": "style_dominant_expected",
+            "dominant_predicted_map": "style_dominant_predicted",
+            "bucket_assignment_map": "style_bucket_assignments",
+            "entropy_map": "style_patch_entropy",
+            "kl_proxy_map": "style_patch_kl_proxy",
+            "neighbor_agreement_map": "style_neighbor_agreement",
+        }
+        for key, stem in style_map_keys.items():
+            value = style_ratio_debug.get(key)
+            if not isinstance(value, torch.Tensor) or value.ndim < 4:
+                continue
+            debug_mask = _place_style_mask(value[0, 0].detach().float().cpu())
+            debug_mask = _resize_mask_to_output(_prepare_preview_tensor(debug_mask))
+            debug_mask = debug_mask.clamp(0.0, 1.0)
+            _mask_to_image(debug_mask).save(os.path.join(seam_dir, f"step_{step:06d}_{stem}.png"))
+
+        patch_grid = torch.zeros((full_height, full_width), dtype=torch.float32)
+        for patch_box in style_ratio_debug.get("patch_boxes", []) or []:
+            if not isinstance(patch_box, dict):
+                continue
+            local_y0 = int(patch_box.get("y0", 0))
+            local_y1 = int(patch_box.get("y1", 0))
+            local_x0 = int(patch_box.get("x0", 0))
+            local_x1 = int(patch_box.get("x1", 0))
+            if style_crop_box is not None:
+                local_y0 += int(style_crop_box["pixel_y0"])
+                local_y1 += int(style_crop_box["pixel_y0"])
+                local_x0 += int(style_crop_box["pixel_x0"])
+                local_x1 += int(style_crop_box["pixel_x0"])
+            local_y0 = max(0, min(full_height, local_y0))
+            local_y1 = max(0, min(full_height, local_y1))
+            local_x0 = max(0, min(full_width, local_x0))
+            local_x1 = max(0, min(full_width, local_x1))
+            if local_y1 <= local_y0 or local_x1 <= local_x0:
+                continue
+            patch_grid[local_y0:local_y1, local_x0] = 1.0
+            patch_grid[local_y0:local_y1, local_x1 - 1] = 1.0
+            patch_grid[local_y0, local_x0:local_x1] = 1.0
+            patch_grid[local_y1 - 1, local_x0:local_x1] = 1.0
+
+        if patch_grid.max().item() > 0.0:
+            patch_grid = _resize_mask_to_output(_prepare_preview_tensor(patch_grid), nearest=True)
+            _mask_to_image(patch_grid.clamp(0.0, 1.0)).save(os.path.join(seam_dir, f"step_{step:06d}_style_patch_grid.png"))
+
+            style_overlay = ((target0.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+            style_overlay[0] = torch.maximum(style_overlay[0], patch_grid)
+            style_overlay[1] = torch.maximum(style_overlay[1], patch_grid * 0.5)
+            _tensor_to_image((style_overlay * 2.0) - 1.0).save(os.path.join(seam_dir, f"step_{step:06d}_style_patch_grid_overlay.png"))
 
 
 def _terrain_mask_to_occupancy(mask: torch.Tensor, black_is_terrain: bool) -> torch.Tensor:
@@ -3026,7 +4704,6 @@ def _collect_module_param_counts(named_parameters) -> Tuple[int, int, Dict[str, 
 def _collect_trainable_module_stats(control_net: torch.nn.Module) -> Dict[str, Dict[str, float]]:
     stats = {
         "semantic_pre_stem": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
-        "seam_adapter": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_residual_blocks": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_mid_block": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "alpha_heads": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
@@ -3042,8 +4719,6 @@ def _collect_trainable_module_stats(control_net: torch.nn.Module) -> Dict[str, D
             bucket = "control_mid_block"
         elif "controlnet_alpha_heads" in name or "controlnet_alpha_baseline_heads" in name:
             bucket = "alpha_heads"
-        elif "controlnet_seam_adapter" in name:
-            bucket = "seam_adapter"
         elif "controlnet_cond_embedding" in name:
             bucket = "semantic_pre_stem"
         else:
@@ -3061,7 +4736,6 @@ def _collect_trainable_module_stats(control_net: torch.nn.Module) -> Dict[str, D
 def _collect_trainable_grad_stats(control_net: torch.nn.Module) -> Dict[str, Dict[str, float]]:
     stats = {
         "semantic_pre_stem": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
-        "seam_adapter": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_residual_blocks": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "control_mid_block": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
         "alpha_heads": {"l2": 0.0, "abs_sum": 0.0, "count": 0},
@@ -3077,8 +4751,6 @@ def _collect_trainable_grad_stats(control_net: torch.nn.Module) -> Dict[str, Dic
             bucket = "control_mid_block"
         elif "controlnet_alpha_heads" in name or "controlnet_alpha_baseline_heads" in name:
             bucket = "alpha_heads"
-        elif "controlnet_seam_adapter" in name:
-            bucket = "seam_adapter"
         elif "controlnet_cond_embedding" in name:
             bucket = "semantic_pre_stem"
         else:
@@ -3101,6 +4773,193 @@ def _compute_module_update_deltas(
     for key in before_stats.keys():
         deltas[key] = abs(after_stats[key]["abs_sum"] - before_stats[key]["abs_sum"])
     return deltas
+
+
+def _parameter_norm(parameter: Optional[torch.nn.Parameter]) -> float:
+    if parameter is None:
+        return 0.0
+    return float(parameter.detach().float().norm().item())
+
+
+def _parameter_grad_norm(parameter: Optional[torch.nn.Parameter]) -> float:
+    if parameter is None or parameter.grad is None:
+        return 0.0
+    return float(parameter.grad.detach().float().norm().item())
+
+
+def _parameter_abs_sum(parameter: Optional[torch.nn.Parameter]) -> float:
+    if parameter is None:
+        return 0.0
+    return float(torch.sum(torch.abs(parameter.detach().float())).item())
+
+
+def _optimizer_param_group_map(optimizer: torch.optim.Optimizer) -> Dict[int, Tuple[int, float]]:
+    mapping: Dict[int, Tuple[int, float]] = {}
+    for group_index, group in enumerate(optimizer.param_groups):
+        lr = float(group.get("lr", 0.0) or 0.0)
+        for parameter in group.get("params", []):
+            mapping[id(parameter)] = (group_index, lr)
+    return mapping
+
+
+def _optimizer_name_group_map(control_net: torch.nn.Module, optimizer: torch.optim.Optimizer) -> Dict[str, Tuple[int, float]]:
+    id_to_name = {id(parameter): name for name, parameter in control_net.named_parameters()}
+    mapping: Dict[str, Tuple[int, float]] = {}
+    for group_index, group in enumerate(optimizer.param_groups):
+        lr = float(group.get("lr", 0.0) or 0.0)
+        for parameter in group.get("params", []):
+            name = id_to_name.get(id(parameter))
+            if name is not None:
+                mapping[name] = (group_index, lr)
+    return mapping
+
+
+def _unwrap_optimizer_for_debug(optimizer: torch.optim.Optimizer) -> torch.optim.Optimizer:
+    return getattr(optimizer, "optimizer", optimizer)
+
+
+def _optimizer_state_value_norm(value: object) -> float:
+    if not isinstance(value, torch.Tensor):
+        return 0.0
+    return float(value.detach().float().norm().item())
+
+
+def _optimizer_state_step_value(value: object) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0.0
+        return float(value.detach().float().reshape(-1)[0].item())
+    if value is None:
+        return 0.0
+    return float(value)
+
+
+def _collect_parameter_optimizer_state(
+    parameter: Optional[torch.nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+    key_prefix: str,
+) -> Dict[str, float]:
+    default = {
+        f"{key_prefix}_state_present": 0.0,
+        f"{key_prefix}_state_step": 0.0,
+        f"{key_prefix}_exp_avg_norm": 0.0,
+        f"{key_prefix}_exp_avg_sq_norm": 0.0,
+    }
+    if parameter is None:
+        return default
+
+    raw_optimizer = _unwrap_optimizer_for_debug(optimizer)
+    state = getattr(raw_optimizer, "state", {}).get(parameter)
+    if not state:
+        return default
+
+    return {
+        f"{key_prefix}_state_present": 1.0,
+        f"{key_prefix}_state_step": _optimizer_state_step_value(state.get("step")),
+        f"{key_prefix}_exp_avg_norm": _optimizer_state_value_norm(state.get("exp_avg")),
+        f"{key_prefix}_exp_avg_sq_norm": _optimizer_state_value_norm(state.get("exp_avg_sq")),
+    }
+
+
+def _parameters_grad_norm(named_parameters: List[Tuple[str, torch.nn.Parameter]]) -> float:
+    total = 0.0
+    for _, parameter in named_parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().float()
+        total += float(torch.sum(grad * grad).item())
+    return math.sqrt(max(total, 0.0))
+
+
+def _collect_seam_adapter_runtime_diagnostics(
+    control_net: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    raw_control_net: Optional[torch.nn.Module] = None,
+) -> Dict[str, float]:
+    named_parameters = dict(control_net.named_parameters())
+    optimizer_map = _optimizer_param_group_map(optimizer)
+
+    proj_out_weight = named_parameters.get("controlnet_seam_adapter.proj_out.weight")
+    proj_out_bias = named_parameters.get("controlnet_seam_adapter.proj_out.bias")
+    block_head_parameters = [
+        (name, parameter)
+        for name, parameter in control_net.named_parameters()
+        if name.startswith("controlnet_seam_adapter_block_heads.")
+    ]
+    upstream_adapter_parameters = [
+        (name, parameter)
+        for name, parameter in control_net.named_parameters()
+        if name.startswith("controlnet_seam_adapter.") and not name.startswith("controlnet_seam_adapter.proj_out.")
+    ]
+
+    attr_source = raw_control_net if raw_control_net is not None else control_net
+    optimizer_name_map = getattr(attr_source, "_optimizer_name_group_runtime_debug", None)
+    if not optimizer_name_map:
+        optimizer_name_map = getattr(attr_source, "_optimizer_name_group_debug", {}) or {}
+    proj_out_weight_group = optimizer_name_map.get("controlnet_seam_adapter.proj_out.weight")
+    proj_out_bias_group = optimizer_name_map.get("controlnet_seam_adapter.proj_out.bias")
+    block_head_groups = [
+        optimizer_name_map[name]
+        for name, _ in block_head_parameters
+        if name in optimizer_name_map
+    ]
+
+    diagnostics = {
+        "seam_adapter_proj_out_weight_norm": _parameter_norm(proj_out_weight),
+        "seam_adapter_proj_out_bias_norm": _parameter_norm(proj_out_bias),
+        "seam_adapter_proj_out_weight_grad_norm": _parameter_grad_norm(proj_out_weight),
+        "seam_adapter_proj_out_bias_grad_norm": _parameter_grad_norm(proj_out_bias),
+        "seam_adapter_upstream_grad_norm": _parameters_grad_norm(upstream_adapter_parameters),
+        "seam_adapter_block_heads_grad_norm": _parameters_grad_norm(block_head_parameters),
+        "seam_adapter_proj_out_weight_requires_grad": 1.0 if proj_out_weight is not None and proj_out_weight.requires_grad else 0.0,
+        "seam_adapter_proj_out_bias_requires_grad": 1.0 if proj_out_bias is not None and proj_out_bias.requires_grad else 0.0,
+        "seam_adapter_block_heads_require_grad": 1.0 if any(parameter.requires_grad for _, parameter in block_head_parameters) else 0.0,
+        "seam_adapter_proj_out_weight_in_optimizer": 1.0 if proj_out_weight_group is not None else 0.0,
+        "seam_adapter_proj_out_bias_in_optimizer": 1.0 if proj_out_bias_group is not None else 0.0,
+        "seam_adapter_block_heads_in_optimizer": 1.0 if block_head_groups else 0.0,
+        "seam_adapter_proj_out_optimizer_lr": float(proj_out_weight_group[1]) if proj_out_weight_group is not None else 0.0,
+        "seam_adapter_block_heads_optimizer_lr": float(block_head_groups[0][1]) if block_head_groups else 0.0,
+        "seam_adapter_proj_out_optimizer_group": float(proj_out_weight_group[0]) if proj_out_weight_group is not None else -1.0,
+        "seam_adapter_block_heads_optimizer_group": float(block_head_groups[0][0]) if block_head_groups else -1.0,
+        "seam_adapter_multi_inject_enabled_runtime": 1.0 if bool(getattr(attr_source, "seam_adapter_multi_inject", False)) else 0.0,
+        "seam_adapter_scale_block0_runtime": float(getattr(attr_source, "seam_adapter_scale_block0", 0.0) or 0.0),
+        "seam_adapter_scale_block1_runtime": float(getattr(attr_source, "seam_adapter_scale_block1", 0.0) or 0.0),
+    }
+    diagnostics.update(
+        _collect_parameter_optimizer_state(proj_out_weight, optimizer, "seam_adapter_proj_out_weight_optimizer")
+    )
+    return diagnostics
+
+
+def _collect_seam_adapter_parameter_snapshot(control_net: torch.nn.Module) -> Dict[str, float]:
+    named_parameters = dict(control_net.named_parameters())
+    proj_out_weight = named_parameters.get("controlnet_seam_adapter.proj_out.weight")
+    proj_out_bias = named_parameters.get("controlnet_seam_adapter.proj_out.bias")
+    return {
+        "proj_out_weight_abs_sum": _parameter_abs_sum(proj_out_weight),
+        "proj_out_bias_abs_sum": _parameter_abs_sum(proj_out_bias),
+    }
+
+
+def _collect_seam_adapter_post_step_diagnostics(
+    control_net: torch.nn.Module,
+    before_snapshot: Dict[str, float],
+) -> Dict[str, float]:
+    named_parameters = dict(control_net.named_parameters())
+    proj_out_weight = named_parameters.get("controlnet_seam_adapter.proj_out.weight")
+    proj_out_bias = named_parameters.get("controlnet_seam_adapter.proj_out.bias")
+    proj_out_weight_abs_sum = _parameter_abs_sum(proj_out_weight)
+    proj_out_bias_abs_sum = _parameter_abs_sum(proj_out_bias)
+    return {
+        "seam_adapter_proj_out_weight_post_step_norm": _parameter_norm(proj_out_weight),
+        "seam_adapter_proj_out_bias_post_step_norm": _parameter_norm(proj_out_bias),
+        "seam_adapter_proj_out_weight_delta_abs_sum": abs(
+            proj_out_weight_abs_sum - float(before_snapshot.get("proj_out_weight_abs_sum", 0.0) or 0.0)
+        ),
+        "seam_adapter_proj_out_bias_delta_abs_sum": abs(
+            proj_out_bias_abs_sum - float(before_snapshot.get("proj_out_bias_abs_sum", 0.0) or 0.0)
+        ),
+    }
 
 
 def verify_optimizer_parameter_membership(
@@ -4192,6 +6051,68 @@ def run_startup_sanity_report(
     logger.info(
         f"[sanity/data] interpolation image={dataset.image_resize_mode} semantic={dataset.semantic_resize_mode} trusted_mask=area"
     )
+    target_aspect_ratio = float(dataset.train_size[1]) / float(dataset.train_size[0])
+    crop_aspect_ratios = [float(record["crop_box"][2]) / float(record["crop_box"][3]) for record in dataset.records]
+    aspect_ratio_tolerance = 0.01
+    mismatched_aspect_count = sum(
+        1 for ratio in crop_aspect_ratios if abs(ratio - target_aspect_ratio) > aspect_ratio_tolerance
+    )
+    max_anisotropic_scale = max(
+        max((ratio / target_aspect_ratio), (target_aspect_ratio / ratio)) for ratio in crop_aspect_ratios
+    )
+    logger.info(
+        "[sanity/data] crop_aspect_ratio_stats="
+        + f"target={target_aspect_ratio:.4f} "
+        + f"matched={len(crop_aspect_ratios) - mismatched_aspect_count} "
+        + f"mismatched={mismatched_aspect_count} "
+        + f"min={min(crop_aspect_ratios):.4f} "
+        + f"max={max(crop_aspect_ratios):.4f} "
+        + f"max_anisotropic_scale={max_anisotropic_scale:.4f}"
+    )
+    if mismatched_aspect_count > 0:
+        logger.warning(
+            "[sanity/data] train/eval tensors are normalized to fixed resolution even when source crop aspect differs; "
+            "seam debug exports are restored to source crop aspect for visualization only"
+        )
+
+    # Source->train scale conformance audit. The user-facing invariant is that the
+    # combined inner+outer halo always covers exactly `expanded_target_halo_px`
+    # SOURCE pixels. That is preserved exactly only when each manifest crop has
+    # size `train_size * source_to_train_scale` (per axis). Deviations cause
+    # anisotropic resampling into the fixed train tensor, which silently distorts
+    # source content (the halo width in source pixels is still correct, but the
+    # train-tensor depiction is squished). Warn loudly here so configs can be
+    # tightened before enabling style-ratio supervision.
+    canonical_scale = float(getattr(dataset, "source_to_train_scale", 1.0))
+    expected_crop_w = float(dataset.train_size[1]) * canonical_scale
+    expected_crop_h = float(dataset.train_size[0]) * canonical_scale
+    crop_size_tolerance = 0.02  # 2 percent
+    crop_size_violations = []
+    for record in dataset.records:
+        cw = float(record["crop_box"][2])
+        ch = float(record["crop_box"][3])
+        dw = abs(cw - expected_crop_w) / max(expected_crop_w, 1.0)
+        dh = abs(ch - expected_crop_h) / max(expected_crop_h, 1.0)
+        if dw > crop_size_tolerance or dh > crop_size_tolerance:
+            crop_size_violations.append((record.get("image_path", "<unknown>"), int(cw), int(ch), dw, dh))
+    logger.info(
+        "[sanity/data] source_to_train_scale="
+        + f"{canonical_scale:.4f} expected_crop_wxh=({int(expected_crop_w)}x{int(expected_crop_h)}) "
+        + f"crops_in_tolerance={len(dataset.records) - len(crop_size_violations)} "
+        + f"crops_out_of_tolerance={len(crop_size_violations)} (tolerance={crop_size_tolerance:.2%})"
+    )
+    if crop_size_violations:
+        sample_preview = crop_size_violations[:5]
+        logger.warning(
+            "[sanity/data] %d/%d manifest crops deviate from train_size * source_to_train_scale by >%.1f%%; "
+            "the %d source-pixel halo invariant holds, but source content is anisotropically resampled into the fixed train tensor. "
+            "First offenders: %s",
+            len(crop_size_violations),
+            len(dataset.records),
+            crop_size_tolerance * 100.0,
+            int(getattr(dataset, "expanded_target_halo_px", 0)),
+            ", ".join([f"{p} ({w}x{h}, dW={dw:.2%}, dH={dh:.2%})" for p, w, h, dw, dh in sample_preview]),
+        )
 
     max_samples = min(args.sanity_samples, len(dataset))
     decode_issue_count = 0
@@ -4271,7 +6192,18 @@ def train(args: argparse.Namespace) -> None:
     alpha_config = parse_alpha_config(semantic_config)
     verification_config = parse_verification_config(semantic_config)
     conditioning_config = parse_conditioning_config(semantic_config)
+    style_pool_config = parse_style_pool_config(semantic_config)
+    style_ratio_config = parse_style_ratio_config(semantic_config)
     seam_config = parse_seam_config(semantic_config)
+    style_ratio_plumbing_enabled = bool(style_ratio_config["enabled"] or style_ratio_config.get("plumbing_only", False))
+    if style_ratio_plumbing_enabled and not seam_config["enabled"]:
+        raise ValueError("style-ratio plumbing requires [seam].enabled=true")
+    if style_ratio_config["enabled"] and not style_pool_config["enabled"]:
+        raise ValueError("[style_ratio].enabled=true requires [style_pool].enabled=true")
+    if style_ratio_config["enabled"] and float(seam_config.get("rgb_recon_loss_weight", 0.0)) <= 0.0:
+        raise ValueError("style-ratio V1 requires seam.rgb_recon_loss_weight > 0 so the shared decode path is available")
+    if style_ratio_config["enabled"] and int(args.train_batch_size) != 1:
+        raise ValueError("style-ratio V1 currently supports train_batch_size=1")
     evaluation_config = parse_evaluation_config(semantic_config, alpha_config, args.output_name, args.max_train_steps)
     if args.eval_steps_csv:
         override_steps = [step for step in _parse_steps_csv(args.eval_steps_csv) if step > 0 and step <= int(args.max_train_steps)]
@@ -4317,7 +6249,14 @@ def train(args: argparse.Namespace) -> None:
     save_dtype = resolve_save_dtype(args.save_dtype)
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
-    dataset = build_dataset(args, semantic_config, alpha_config, seam_config=seam_config)
+    dataset = build_dataset(
+        args,
+        semantic_config,
+        alpha_config,
+        seam_config=seam_config,
+        style_pool_config=style_pool_config,
+        style_ratio_config=style_ratio_config,
+    )
     if bool(evaluation_config.get("expanded_prediction_enabled", False)) and int(evaluation_config.get("expanded_halo_px", 0)) > 0:
         logger.warning(
             "[seam/geometry] eval uses expanded prediction; training expanded supervision is "
@@ -4435,8 +6374,9 @@ def train(args: argparse.Namespace) -> None:
     )
     terrain_mask_index_for_baseline = _find_channel_index(dataset.channel_names, "terrain_mask") if alpha_config["enabled"] else 3
     seam_config["seam_adapter_conditioning_offset"] = len(dataset.channel_names) if seam_config["enabled"] else -1
+    full_conditioning_enabled = bool(seam_config["enabled"] or getattr(dataset, "style_ratio_enabled", False))
     control_net = SdxlControlNet(
-        conditioning_channels=dataset.full_conditioning_channels if seam_config["enabled"] else len(dataset.channel_names),
+        conditioning_channels=dataset.full_conditioning_channels if full_conditioning_enabled else len(dataset.channel_names),
         conditioning_pre_embed_channels=[32, 32],
         alpha_head_indices=selected_alpha_head_indices,
         alpha_baseline_mode=alpha_config["baseline_mode"] if alpha_config["enabled"] else "none",
@@ -4593,6 +6533,7 @@ def train(args: argparse.Namespace) -> None:
         optimizer_param_groups.append({"params": other_trainable_params, "lr": args.learning_rate})
 
     optimizer = torch.optim.AdamW(optimizer_param_groups, betas=(0.9, 0.999), weight_decay=1e-2)
+    setattr(control_net, "_optimizer_name_group_debug", _optimizer_name_group_map(control_net, optimizer))
     logger.info(
         f"[optimizer] cond_embedding_lr={cond_lr:.2e} (×{conditioning_config['cond_embedding_lr_multiplier']}) "
         f"seam_adapter_lr={seam_adapter_lr:.2e} (×{args.seam_adapter_lr_multiplier}) "
@@ -4635,7 +6576,18 @@ def train(args: argparse.Namespace) -> None:
             vae.enable_slicing()
         if hasattr(vae, "enable_tiling"):
             vae.enable_tiling()
-        logger.info("[sanity/latents] enabled VAE slicing+tiling for seam RGB reconstruction decode")
+        if hasattr(vae, "tile_sample_min_size"):
+            vae.tile_sample_min_size = min(int(vae.tile_sample_min_size), 64)
+        if hasattr(vae, "tile_latent_min_size"):
+            vae.tile_latent_min_size = min(int(vae.tile_latent_min_size), 8)
+        if hasattr(vae, "tile_overlap_factor"):
+            vae.tile_overlap_factor = 0.0
+        logger.info(
+            "[sanity/latents] enabled VAE slicing+tiling for seam RGB reconstruction decode sample_tile=%s latent_tile=%s overlap=%.3f",
+            getattr(vae, "tile_sample_min_size", "n/a"),
+            getattr(vae, "tile_latent_min_size", "n/a"),
+            float(getattr(vae, "tile_overlap_factor", 0.0)),
+        )
 
     if args.cache_latents:
         vae.to(accelerator.device, dtype=vae_dtype)
@@ -4793,7 +6745,15 @@ def train(args: argparse.Namespace) -> None:
         accelerator,
         use_ema,
         control_net_model=unwrap_model(accelerator, control_net),
-        optimizer=optimizer,
+    )
+    runtime_optimizer_name_map = _optimizer_name_group_map(control_net, optimizer)
+    setattr(control_net, "_optimizer_name_group_runtime_debug", runtime_optimizer_name_map)
+    setattr(unwrap_model(accelerator, control_net), "_optimizer_name_group_runtime_debug", runtime_optimizer_name_map)
+    logger.info(
+        "[verify/optimizer_runtime] proj_out_weight=%s proj_out_bias=%s block_head_count=%d",
+        runtime_optimizer_name_map.get("controlnet_seam_adapter.proj_out.weight"),
+        runtime_optimizer_name_map.get("controlnet_seam_adapter.proj_out.bias"),
+        sum(1 for name in runtime_optimizer_name_map if name.startswith("controlnet_seam_adapter_block_heads.")),
     )
     if resumed_ema_state is not None:
         ema_state = resumed_ema_state
@@ -4927,6 +6887,9 @@ def train(args: argparse.Namespace) -> None:
     loss_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
     seam_adapter_diag_trace: List[Dict[str, float]] = []
     seam_adapter_diag_path = os.path.join(args.output_dir, "sanity", "seam_adapter_diag.csv")
+    style_prototype_cache: Dict[Tuple[str, int, int, int, bool, str, str], Dict[str, object]] = {}
+    style_prototype_cache_stats: Counter = Counter()
+    style_ratio_near_normal_history = deque(maxlen=max(2, int(style_ratio_config.get("ratio_gate_ema_window", 50))))
     if resumed_step > 0 and os.path.exists(loss_trace_path):
         with open(loss_trace_path, "r", newline="", encoding="utf-8") as handle:
             loss_trace = list(csv.DictReader(handle))
@@ -4974,7 +6937,8 @@ def train(args: argparse.Namespace) -> None:
     while global_step < args.max_train_steps:
         for batch in dataloader:
             with accelerator.accumulate(control_net):
-                batch_images = batch["images"].to(accelerator.device, dtype=vae_dtype)
+                source_batch_images = batch["images"].to(accelerator.device, dtype=vae_dtype)
+                batch_images = source_batch_images
                 trusted_mask = batch["trusted_mask"].to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
                 alpha_target = batch["alpha_target"]
                 if alpha_target is not None:
@@ -5193,6 +7157,33 @@ def train(args: argparse.Namespace) -> None:
                 train_halo_min_y = -1.0
                 train_halo_max_y = -1.0
                 train_geometry_mode = "interior_only"
+                style_ratio_total_loss_value = 0.0
+                style_ratio_near_normal_loss_value = 0.0
+                style_ratio_near_tangent_loss_value = 0.0
+                style_ratio_near_lowfreq_loss_value = 0.0
+                style_ratio_overlap_normal_loss_value = 0.0
+                style_ratio_overlap_tangent_loss_value = 0.0
+                style_ratio_overlap_lowfreq_loss_value = 0.0
+                style_ratio_bucket_kl_loss_value = 0.0
+                style_ratio_entropy_loss_value = 0.0
+                style_ratio_effective_kl_scale_value = 0.0
+                style_ratio_gate_active_value = 0.0
+                style_ratio_schedule_scale_value = 0.0
+                style_ratio_gate_grad_ready_value = 0.0
+                style_ratio_gate_slope_ready_value = 0.0
+                style_ratio_gate_slope_value = 0.0
+                style_ratio_patch_count_value = 0.0
+                style_ratio_bucket_count_value = 0.0
+                style_ratio_neighbor_agreement_rate_value = 0.0
+                style_ratio_active_style_count_value = 0.0
+                style_ratio_active_style_family_id_value = ""
+                style_ratio_bucket_kl_json_value = "{}"
+                style_ratio_bucket_patch_count_json_value = "{}"
+                style_ratio_prototype_cache_memory_hits_value = 0.0
+                style_ratio_prototype_cache_disk_hits_value = 0.0
+                style_ratio_prototype_cache_misses_value = 0.0
+                style_ratio_aux_over_diffusion_ratio_value = 0.0
+                style_ratio_visual_debug = None
                 controlnet_diagnostics = None
                 grad_l2_alpha = 0.0
                 grad_l2_control_residual = 0.0
@@ -5375,6 +7366,10 @@ def train(args: argparse.Namespace) -> None:
                                 )
                             seam_decay_maps = batch["expanded_seam_decay_maps"].to(accelerator.device, dtype=weight_dtype)
                             edge_band_masks = batch["expanded_edge_band_masks"].to(accelerator.device, dtype=weight_dtype)
+                        expanded_valid_source_mask = None
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0 and batch.get("valid_expanded_source_mask") is not None:
+                            expanded_valid_source_mask = batch["valid_expanded_source_mask"].to(accelerator.device, dtype=weight_dtype).unsqueeze(1)
+
                         if terrain_mask_index >= 0:
                             continuation_valid_mask = _terrain_mask_to_occupancy(
                                 conditioning_images[:, terrain_mask_index : terrain_mask_index + 1],
@@ -5391,12 +7386,27 @@ def train(args: argparse.Namespace) -> None:
                                 int(training_expanded_halo_px),
                                 fill_value=0.0,
                             )
+                            if expanded_valid_source_mask is not None:
+                                continuation_valid_mask = continuation_valid_mask * expanded_valid_source_mask
+                        style_support_valid_mask = shared_build_style_support_valid_mask(
+                            conditioning_images=conditioning_images,
+                            alpha_target=alpha_target,
+                            halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            alpha_binary_threshold=float(alpha_config.get("binary_threshold", 0.5)),
+                            terrain_mask_channel_index=terrain_mask_index,
+                            terrain_mask_black_is_terrain=bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+                            style_ratio_config=style_ratio_config,
+                        ).to(device=accelerator.device, dtype=weight_dtype)
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0 and expanded_valid_source_mask is not None:
+                            style_support_valid_mask = style_support_valid_mask * expanded_valid_source_mask
                         seam_supervision_mask_pre = _build_seam_supervision_mask(
                             trusted_mask=trusted_mask.float(),
                             edge_band_masks=edge_band_masks,
                             edge_defined_flags=edge_defined,
                             seam_config=seam_config,
                         )
+                        if expanded_valid_source_mask is not None:
+                            seam_supervision_mask_pre = seam_supervision_mask_pre * expanded_valid_source_mask
                         seam_maps_candidate = _build_seam_region_maps(
                             edge_band_masks=edge_band_masks,
                             seam_decay_maps=seam_decay_maps,
@@ -5405,7 +7415,12 @@ def train(args: argparse.Namespace) -> None:
                             supervision_mask=seam_supervision_mask_pre,
                             seam_config=seam_config,
                             expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            source_sizes_hw=batch.get("original_sizes_hw").to(accelerator.device, dtype=weight_dtype) if batch.get("original_sizes_hw") is not None else None,
+                            expanded_source_boxes=batch.get("expanded_crop_box").to(accelerator.device, dtype=weight_dtype) if training_expanded_supervision_enabled and batch.get("expanded_crop_box") is not None else None,
+                            valid_expanded_source_mask=expanded_valid_source_mask,
                             continuation_valid_mask=continuation_valid_mask,
+                            style_support_valid_mask=style_support_valid_mask,
+                            style_ratio_config=style_ratio_config,
                         )
                         seam_edge_qualification = summarize_seam_edge_qualification(
                             seam_maps=seam_maps_candidate,
@@ -5443,6 +7458,8 @@ def train(args: argparse.Namespace) -> None:
                             edge_defined_flags=edge_defined,
                             seam_config=seam_config,
                         )
+                        if expanded_valid_source_mask is not None:
+                            seam_supervision_mask = seam_supervision_mask * expanded_valid_source_mask
                         seam_maps_supervised = _build_seam_region_maps(
                             edge_band_masks=edge_band_masks,
                             seam_decay_maps=seam_decay_maps,
@@ -5451,7 +7468,12 @@ def train(args: argparse.Namespace) -> None:
                             supervision_mask=seam_supervision_mask,
                             seam_config=seam_config,
                             expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            source_sizes_hw=batch.get("original_sizes_hw").to(accelerator.device, dtype=weight_dtype) if batch.get("original_sizes_hw") is not None else None,
+                            expanded_source_boxes=batch.get("expanded_crop_box").to(accelerator.device, dtype=weight_dtype) if training_expanded_supervision_enabled and batch.get("expanded_crop_box") is not None else None,
+                            valid_expanded_source_mask=expanded_valid_source_mask,
                             continuation_valid_mask=continuation_valid_mask,
+                            style_support_valid_mask=style_support_valid_mask,
+                            style_ratio_config=style_ratio_config,
                         )
                         seam_maps_raw = _build_seam_region_maps(
                             edge_band_masks=edge_band_masks,
@@ -5461,7 +7483,12 @@ def train(args: argparse.Namespace) -> None:
                             supervision_mask=torch.ones_like(trusted_mask.float()),
                             seam_config=seam_config,
                             expanded_halo_px=(int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0),
+                            source_sizes_hw=batch.get("original_sizes_hw").to(accelerator.device, dtype=weight_dtype) if batch.get("original_sizes_hw") is not None else None,
+                            expanded_source_boxes=batch.get("expanded_crop_box").to(accelerator.device, dtype=weight_dtype) if training_expanded_supervision_enabled and batch.get("expanded_crop_box") is not None else None,
+                            valid_expanded_source_mask=expanded_valid_source_mask,
                             continuation_valid_mask=continuation_valid_mask,
+                            style_support_valid_mask=style_support_valid_mask,
+                            style_ratio_config=style_ratio_config,
                         )
                         seam_margin_inner_coverage_px = float(seam_maps_supervised["margin_inner"].sum().detach().item())
                         seam_margin_inner_raw_px = float(seam_maps_raw["margin_inner"].sum().detach().item())
@@ -5536,6 +7563,7 @@ def train(args: argparse.Namespace) -> None:
                         sqrt_one_minus_alpha_t = (1.0 - alpha_t).clamp_min(0.0).sqrt()
                         pred_x0_latents = (noisy_latents - (sqrt_one_minus_alpha_t * noise_pred)) / sqrt_alpha_t
                         pred_x0_latents_for_decode = (pred_x0_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
+                        pred_x0_latents_for_decode_grad = None
 
                         region_weights = {
                             "halo_inner": float(seam_config.get("halo_inner_rgb_weight", 2.0)),
@@ -5564,10 +7592,32 @@ def train(args: argparse.Namespace) -> None:
                         halo_inner_16px_area = noisy_latents.new_tensor(0.0)
                         seam_halo_gradient_raw_sum = noisy_latents.new_tensor(0.0)
                         seam_halo_gradient_active_px = noisy_latents.new_tensor(0.0)
+                        save_seam_visual_debug_enabled = bool(verification_config.get("save_seam_visual_debug", False))
                         pred_rgb = None
                         target_rgb = None
                         seam_supervision_mask_rgb = None
                         seam_maps_rgb = None
+                        seam_maps_debug_full = None
+                        if save_seam_visual_debug_enabled:
+                            seam_maps_debug_full = {
+                                key: (value.detach().cpu() if isinstance(value, torch.Tensor) else value)
+                                for key, value in seam_maps_supervised.items()
+                            }
+                        target_rgb_full = batch_images.detach().cpu() if save_seam_visual_debug_enabled else None
+                        seam_debug_crop_box = None
+                        style_ratio_total_loss_tensor = noisy_latents.new_tensor(0.0)
+                        style_ratio_edge_count = 0
+                        rgb_recon_loss_weight = float(seam_config.get("rgb_recon_loss_weight", 0.0))
+                        seam_rgb_edge_plans: List[Dict[str, object]] = []
+                        seam_rgb_region_area_totals = {
+                            "halo_inner": noisy_latents.new_tensor(0.0),
+                            "halo_outer": noisy_latents.new_tensor(0.0),
+                            "interior_continuation": noisy_latents.new_tensor(0.0),
+                            "interior_core": noisy_latents.new_tensor(0.0),
+                        }
+                        seam_continuation_weight_sum_total = noisy_latents.new_tensor(0.0)
+                        seam_gradient_weight_sum_total = noisy_latents.new_tensor(0.0)
+                        style_ratio_edge_count_total = 0
                         for edge_index, edge_name in enumerate(SEAM_ADAPTER_EDGE_NAMES):
                             edge_seam_maps = _select_seam_maps_for_edge(seam_maps_supervised, edge_index)
                             seam_loss_support_terms = []
@@ -5577,8 +7627,6 @@ def train(args: argparse.Namespace) -> None:
                                 seam_loss_support_terms.append(edge_seam_maps["margin_outer"])
                             if region_weights["interior_continuation"] > 0.0:
                                 seam_loss_support_terms.append(edge_seam_maps["interior_inner"])
-                            if region_weights["interior_core"] > 0.0:
-                                seam_loss_support_terms.append(edge_seam_maps["interior_core"])
                             if seam_loss_support_terms:
                                 seam_loss_support_mask = torch.stack(seam_loss_support_terms, dim=0).sum(dim=0).clamp(0.0, 1.0)
                             else:
@@ -5592,6 +7640,33 @@ def train(args: argparse.Namespace) -> None:
                             if float(seam_loss_support_mask.sum().detach().item()) <= 0.0:
                                 continue
 
+                            seam_rgb_edge_plans.append(
+                                {
+                                    "edge_index": edge_index,
+                                    "edge_name": edge_name,
+                                    "seam_maps": edge_seam_maps,
+                                    "loss_support_mask": seam_loss_support_mask,
+                                }
+                            )
+                            seam_rgb_region_area_totals["halo_inner"] = seam_rgb_region_area_totals["halo_inner"] + edge_seam_maps["margin_inner"].sum().detach()
+                            seam_rgb_region_area_totals["halo_outer"] = seam_rgb_region_area_totals["halo_outer"] + edge_seam_maps["margin_outer"].sum().detach()
+                            seam_rgb_region_area_totals["interior_continuation"] = seam_rgb_region_area_totals["interior_continuation"] + edge_seam_maps["interior_inner"].sum().detach()
+                            seam_rgb_region_area_totals["interior_core"] = seam_rgb_region_area_totals["interior_core"] + edge_seam_maps["interior_core"].sum().detach()
+                            seam_continuation_weight_sum_total = seam_continuation_weight_sum_total + edge_seam_maps["continuation_distance_weighted"].sum().detach()
+                            seam_gradient_weight_sum_total = seam_gradient_weight_sum_total + edge_seam_maps["continuation_distance_weighted"].sum().detach()
+                            if style_ratio_config["enabled"]:
+                                edge_style_support_mask = (
+                                    edge_seam_maps["overlap_band_mask"] + edge_seam_maps["soft_field_mask"]
+                                ).clamp(0.0, 1.0)
+                                if float(edge_style_support_mask.sum().detach().item()) > 0.0:
+                                    style_ratio_edge_count_total += 1
+
+                        for edge_plan in seam_rgb_edge_plans:
+                            edge_index = int(edge_plan["edge_index"])
+                            edge_name = str(edge_plan["edge_name"])
+                            edge_seam_maps = edge_plan["seam_maps"]
+                            seam_loss_support_mask = edge_plan["loss_support_mask"]
+
                             decode_crop = _compute_seam_decode_crop(
                                 seam_loss_support_mask,
                                 full_height=int(batch_images.shape[-2]),
@@ -5600,12 +7675,16 @@ def train(args: argparse.Namespace) -> None:
                                 latent_width=int(pred_x0_latents_for_decode.shape[-1]),
                                 context_px=int(seam_config.get("rgb_decode_context_px", 64)),
                             )
+                            latent_x0 = decode_crop["pixel_x0"] // max(1, int(batch_images.shape[-1] // pred_x0_latents_for_decode.shape[-1]))
+                            latent_x1 = decode_crop["pixel_x1"] // max(1, int(batch_images.shape[-1] // pred_x0_latents_for_decode.shape[-1]))
+                            latent_y0 = decode_crop["pixel_y0"] // max(1, int(batch_images.shape[-2] // pred_x0_latents_for_decode.shape[-2]))
+                            latent_y1 = decode_crop["pixel_y1"] // max(1, int(batch_images.shape[-2] // pred_x0_latents_for_decode.shape[-2]))
                             edge_pred_x0_latents_for_decode = _crop_spatial_tensor(
                                 pred_x0_latents_for_decode,
-                                x0=decode_crop["pixel_x0"] // max(1, int(batch_images.shape[-1] // pred_x0_latents_for_decode.shape[-1])),
-                                x1=decode_crop["pixel_x1"] // max(1, int(batch_images.shape[-1] // pred_x0_latents_for_decode.shape[-1])),
-                                y0=decode_crop["pixel_y0"] // max(1, int(batch_images.shape[-2] // pred_x0_latents_for_decode.shape[-2])),
-                                y1=decode_crop["pixel_y1"] // max(1, int(batch_images.shape[-2] // pred_x0_latents_for_decode.shape[-2])),
+                                x0=latent_x0,
+                                x1=latent_x1,
+                                y0=latent_y0,
+                                y1=latent_y1,
                             )
                             edge_target_rgb = _crop_spatial_tensor(
                                 batch_images,
@@ -5631,20 +7710,21 @@ def train(args: argparse.Namespace) -> None:
                                 full_width=int(batch_images.shape[-1]),
                             )
 
-                            edge_pred_rgb = activation_checkpoint(
-                                _decode_seam_rgb,
-                                edge_pred_x0_latents_for_decode,
-                                use_reentrant=False,
-                            ).to(dtype=weight_dtype)
+                            edge_pred_rgb = _decode_seam_rgb(edge_pred_x0_latents_for_decode).to(dtype=weight_dtype)
                             expanded_rgb_mask = edge_seam_supervision_mask.expand(-1, edge_pred_rgb.shape[1], -1, -1)
                             assert edge_pred_rgb.shape == edge_target_rgb.shape == expanded_rgb_mask.shape, (
                                 f"seam RGB geometry mismatch edge={edge_name} pred={tuple(edge_pred_rgb.shape)} target={tuple(edge_target_rgb.shape)} mask={tuple(expanded_rgb_mask.shape)}"
                             )
                             if pred_rgb is None:
-                                pred_rgb = edge_pred_rgb
-                                target_rgb = edge_target_rgb
-                                seam_supervision_mask_rgb = edge_seam_supervision_mask
-                                seam_maps_rgb = edge_seam_maps
+                                if save_seam_visual_debug_enabled:
+                                    pred_rgb = edge_pred_rgb.detach().cpu()
+                                    target_rgb = edge_target_rgb.detach().cpu()
+                                    seam_supervision_mask_rgb = edge_seam_supervision_mask.detach().cpu()
+                                    seam_maps_rgb = {
+                                        key: (value.detach().cpu() if isinstance(value, torch.Tensor) else value)
+                                        for key, value in edge_seam_maps.items()
+                                    }
+                                    seam_debug_crop_box = dict(decode_crop)
                                 train_prediction_h = float(edge_pred_rgb.shape[-2])
                                 train_prediction_w = float(edge_pred_rgb.shape[-1])
                                 train_alpha_target_h = float(edge_target_rgb.shape[-2])
@@ -5652,7 +7732,99 @@ def train(args: argparse.Namespace) -> None:
                                 train_supervision_mask_h = float(expanded_rgb_mask.shape[-2])
                                 train_supervision_mask_w = float(expanded_rgb_mask.shape[-1])
 
-                            edge_rgb_l1_map = (edge_pred_rgb.float() - edge_target_rgb.float()).abs().mean(dim=1, keepdim=True)
+                            edge_style_ratio_total_loss = None
+                            if style_ratio_config["enabled"]:
+                                edge_style_support_mask = (
+                                    edge_seam_maps["overlap_band_mask"] + edge_seam_maps["soft_field_mask"]
+                                ).clamp(0.0, 1.0)
+                                if float(edge_style_support_mask.sum().detach().item()) > 0.0:
+                                    edge_style_ratio_result = _compute_style_ratio_losses(
+                                        pred_rgb=edge_pred_rgb,
+                                        target_rgb=edge_target_rgb,
+                                        seam_maps=edge_seam_maps,
+                                        style_entry=(batch.get("style_pool_entry") or [None])[0],
+                                        style_pool_config=style_pool_config,
+                                        style_ratio_config=style_ratio_config,
+                                        prototype_cache=style_prototype_cache,
+                                        prototype_cache_stats=style_prototype_cache_stats,
+                                        step_since_resume=max(0, int(step_for_logging - int(resumed_step))),
+                                        near_normal_history=list(style_ratio_near_normal_history),
+                                    )
+                                    edge_style_ratio_total_loss = edge_style_ratio_result.get(
+                                        "total_loss",
+                                        noisy_latents.new_tensor(0.0),
+                                    )
+                                    if isinstance(edge_style_ratio_total_loss, torch.Tensor):
+                                        style_ratio_total_loss_tensor = style_ratio_total_loss_tensor + edge_style_ratio_total_loss.detach()
+                                    style_ratio_edge_count += 1
+                                    style_ratio_near_normal_loss_value += float(
+                                        edge_style_ratio_result.get("near_normal_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("near_normal_loss"), torch.Tensor) else float(edge_style_ratio_result.get("near_normal_loss", 0.0) or 0.0)
+                                    style_ratio_near_tangent_loss_value += float(
+                                        edge_style_ratio_result.get("near_tangent_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("near_tangent_loss"), torch.Tensor) else float(edge_style_ratio_result.get("near_tangent_loss", 0.0) or 0.0)
+                                    style_ratio_near_lowfreq_loss_value += float(
+                                        edge_style_ratio_result.get("near_lowfreq_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("near_lowfreq_loss"), torch.Tensor) else float(edge_style_ratio_result.get("near_lowfreq_loss", 0.0) or 0.0)
+                                    style_ratio_overlap_normal_loss_value += float(
+                                        edge_style_ratio_result.get("overlap_normal_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("overlap_normal_loss"), torch.Tensor) else float(edge_style_ratio_result.get("overlap_normal_loss", 0.0) or 0.0)
+                                    style_ratio_overlap_tangent_loss_value += float(
+                                        edge_style_ratio_result.get("overlap_tangent_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("overlap_tangent_loss"), torch.Tensor) else float(edge_style_ratio_result.get("overlap_tangent_loss", 0.0) or 0.0)
+                                    style_ratio_overlap_lowfreq_loss_value += float(
+                                        edge_style_ratio_result.get("overlap_lowfreq_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("overlap_lowfreq_loss"), torch.Tensor) else float(edge_style_ratio_result.get("overlap_lowfreq_loss", 0.0) or 0.0)
+                                    style_ratio_bucket_kl_loss_value += float(
+                                        edge_style_ratio_result.get("bucket_kl_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("bucket_kl_loss"), torch.Tensor) else float(edge_style_ratio_result.get("bucket_kl_loss", 0.0) or 0.0)
+                                    style_ratio_entropy_loss_value += float(
+                                        edge_style_ratio_result.get("entropy_loss", noisy_latents.new_tensor(0.0)).detach().item()
+                                    ) if isinstance(edge_style_ratio_result.get("entropy_loss"), torch.Tensor) else float(edge_style_ratio_result.get("entropy_loss", 0.0) or 0.0)
+                                    style_ratio_effective_kl_scale_value += float(edge_style_ratio_result.get("effective_kl_scale", 0.0) or 0.0)
+                                    style_ratio_gate_active_value += float(edge_style_ratio_result.get("ratio_gate_active", 0.0) or 0.0)
+                                    style_ratio_schedule_scale_value += float(edge_style_ratio_result.get("ratio_schedule_scale", 0.0) or 0.0)
+                                    style_ratio_gate_grad_ready_value += float(edge_style_ratio_result.get("ratio_gate_grad_ready", 0.0) or 0.0)
+                                    style_ratio_gate_slope_ready_value += float(edge_style_ratio_result.get("ratio_gate_slope_ready", 0.0) or 0.0)
+                                    style_ratio_gate_slope_value += float(edge_style_ratio_result.get("ratio_gate_slope", 0.0) or 0.0)
+                                    style_ratio_patch_count_value += float(edge_style_ratio_result.get("patch_count", 0.0) or 0.0)
+                                    style_ratio_bucket_count_value += float(edge_style_ratio_result.get("bucket_count", 0.0) or 0.0)
+                                    style_ratio_neighbor_agreement_rate_value += float(edge_style_ratio_result.get("neighbor_agreement_rate", 0.0) or 0.0)
+                                    style_ratio_active_style_count_value += float(edge_style_ratio_result.get("active_style_count", 0.0) or 0.0)
+                                    if not style_ratio_active_style_family_id_value:
+                                        style_ratio_active_style_family_id_value = str(
+                                            edge_style_ratio_result.get("active_style_family_id", "") or ""
+                                        )
+                                    if style_ratio_bucket_kl_json_value == "{}":
+                                        style_ratio_bucket_kl_json_value = str(
+                                            edge_style_ratio_result.get("bucket_kl_json", "{}") or "{}"
+                                        )
+                                    if style_ratio_bucket_patch_count_json_value == "{}":
+                                        style_ratio_bucket_patch_count_json_value = str(
+                                            edge_style_ratio_result.get("bucket_patch_count_json", "{}") or "{}"
+                                        )
+                                    style_ratio_prototype_cache_memory_hits_value = float(
+                                        edge_style_ratio_result.get("prototype_cache_memory_hits", 0.0) or 0.0
+                                    )
+                                    style_ratio_prototype_cache_disk_hits_value = float(
+                                        edge_style_ratio_result.get("prototype_cache_disk_hits", 0.0) or 0.0
+                                    )
+                                    style_ratio_prototype_cache_misses_value = float(
+                                        edge_style_ratio_result.get("prototype_cache_misses", 0.0) or 0.0
+                                    )
+                                    if save_seam_visual_debug_enabled and style_ratio_visual_debug is None:
+                                        style_ratio_visual_debug = {
+                                            "crop_box": dict(decode_crop),
+                                            "dominant_expected_map": _detach_tensor_tree(edge_style_ratio_result.get("dominant_expected_map")),
+                                            "dominant_predicted_map": _detach_tensor_tree(edge_style_ratio_result.get("dominant_predicted_map")),
+                                            "bucket_assignment_map": _detach_tensor_tree(edge_style_ratio_result.get("bucket_assignment_map")),
+                                            "entropy_map": _detach_tensor_tree(edge_style_ratio_result.get("entropy_map")),
+                                            "kl_proxy_map": _detach_tensor_tree(edge_style_ratio_result.get("kl_proxy_map")),
+                                            "neighbor_agreement_map": _detach_tensor_tree(edge_style_ratio_result.get("neighbor_agreement_map")),
+                                            "patch_boxes": _detach_tensor_tree(edge_style_ratio_result.get("patch_boxes", [])),
+                                        }
+
+                            edge_rgb_l1_map = (edge_pred_rgb - edge_target_rgb).abs().mean(dim=1, keepdim=True)
                             edge_summary = _summarize_weighted_seam_regions(
                                 error_map=edge_rgb_l1_map,
                                 seam_maps=edge_seam_maps,
@@ -5661,10 +7833,12 @@ def train(args: argparse.Namespace) -> None:
                                 continuation_weighted_mask=edge_seam_maps["continuation_distance_weighted"],
                                 seam_config=seam_config,
                             )
+                            edge_backward_loss = noisy_latents.new_tensor(0.0)
                             if edge_summary["region_losses"]:
-                                seam_rgb_edge_summaries.append(edge_summary)
+                                seam_rgb_edge_summaries.append(_detach_tensor_tree(edge_summary))
+                                edge_rgb_l1_map_detached = edge_rgb_l1_map.detach()
                                 edge_halo_metrics = _compute_edge_halo_copy_metrics(
-                                    edge_rgb_l1_map,
+                                    edge_rgb_l1_map_detached,
                                     edge_name=edge_name,
                                     edge_seam_maps=edge_seam_maps,
                                     crop_x0=int(decode_crop["pixel_x0"]),
@@ -5685,23 +7859,83 @@ def train(args: argparse.Namespace) -> None:
                                 halo_inner_16px_raw_sum = halo_inner_16px_raw_sum + edge_halo_metrics["halo_inner_16px"]["raw_sum"]
                                 halo_inner_16px_area = halo_inner_16px_area + edge_halo_metrics["halo_inner_16px"]["area"]
                                 edge_gradient_summary = _compute_continuation_gradient_loss(
-                                    pred_rgb=edge_pred_rgb.float(),
-                                    target_rgb=edge_target_rgb.float(),
-                                    continuation_distance_weighted_mask=edge_seam_maps["continuation_distance_weighted"].float(),
+                                    pred_rgb=edge_pred_rgb,
+                                    target_rgb=edge_target_rgb,
+                                    continuation_distance_weighted_mask=edge_seam_maps["continuation_distance_weighted"].to(dtype=edge_pred_rgb.dtype),
                                     sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
                                 )
-                                seam_gradient_raw_sum = seam_gradient_raw_sum + edge_gradient_summary["raw_sum"]
-                                seam_gradient_active_px = seam_gradient_active_px + edge_gradient_summary["active_px"]
-                                seam_gradient_weighted_raw_sum = seam_gradient_weighted_raw_sum + edge_gradient_summary["weighted_raw_sum"]
-                                seam_gradient_weight_sum = seam_gradient_weight_sum + edge_gradient_summary["weight_sum"]
-                                edge_halo_gradient_summary = _compute_masked_rgb_gradient_loss(
-                                    pred_rgb=edge_pred_rgb.float(),
-                                    target_rgb=edge_target_rgb.float(),
-                                    weight_mask=(edge_seam_maps["margin_inner"] + edge_seam_maps["margin_outer"]).clamp(0.0, 1.0).float(),
-                                    sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
-                                )
+                                edge_gradient_summary_detached = _detach_tensor_tree(edge_gradient_summary)
+                                seam_gradient_raw_sum = seam_gradient_raw_sum + edge_gradient_summary_detached["raw_sum"]
+                                seam_gradient_active_px = seam_gradient_active_px + edge_gradient_summary_detached["active_px"]
+                                seam_gradient_weighted_raw_sum = seam_gradient_weighted_raw_sum + edge_gradient_summary_detached["weighted_raw_sum"]
+                                seam_gradient_weight_sum = seam_gradient_weight_sum + edge_gradient_summary_detached["weight_sum"]
+                                with torch.no_grad():
+                                    edge_halo_gradient_summary = _compute_masked_rgb_gradient_loss(
+                                        pred_rgb=edge_pred_rgb.detach().float(),
+                                        target_rgb=edge_target_rgb.detach().float(),
+                                        weight_mask=(edge_seam_maps["margin_inner"] + edge_seam_maps["margin_outer"]).clamp(0.0, 1.0).float(),
+                                        sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
+                                    )
                                 seam_halo_gradient_raw_sum = seam_halo_gradient_raw_sum + edge_halo_gradient_summary["raw_sum"]
                                 seam_halo_gradient_active_px = seam_halo_gradient_active_px + edge_halo_gradient_summary["active_px"]
+
+                                if rgb_recon_loss_weight > 0.0:
+                                    if region_weights["halo_inner"] > 0.0 and float(seam_rgb_region_area_totals["halo_inner"].item()) > 0.0:
+                                        edge_backward_loss = edge_backward_loss + (
+                                            rgb_recon_loss_weight
+                                            * float(region_weights["halo_inner"])
+                                            * edge_summary["region_raw_sums"]["halo_inner"]
+                                            / seam_rgb_region_area_totals["halo_inner"].clamp_min(1e-6)
+                                        )
+                                    if region_weights["halo_outer"] > 0.0 and float(seam_rgb_region_area_totals["halo_outer"].item()) > 0.0:
+                                        edge_backward_loss = edge_backward_loss + (
+                                            rgb_recon_loss_weight
+                                            * float(region_weights["halo_outer"])
+                                            * edge_summary["region_raw_sums"]["halo_outer"]
+                                            / seam_rgb_region_area_totals["halo_outer"].clamp_min(1e-6)
+                                        )
+                                    if region_weights["interior_continuation"] > 0.0 and float(seam_continuation_weight_sum_total.item()) > 0.0:
+                                        edge_backward_loss = edge_backward_loss + (
+                                            rgb_recon_loss_weight
+                                            * float(region_weights["interior_continuation"])
+                                            * edge_summary["continuation_weighted_raw_sum"]
+                                            / seam_continuation_weight_sum_total.clamp_min(1e-6)
+                                        )
+                                    if region_weights["interior_core"] > 0.0 and float(seam_rgb_region_area_totals["interior_core"].item()) > 0.0:
+                                        edge_backward_loss = edge_backward_loss + (
+                                            rgb_recon_loss_weight
+                                            * float(region_weights["interior_core"])
+                                            * edge_summary["region_raw_sums"]["interior_core"]
+                                            / seam_rgb_region_area_totals["interior_core"].clamp_min(1e-6)
+                                        )
+                                    if seam_continuation_gradient_loss_weight_value > 0.0 and float(seam_gradient_weight_sum_total.item()) > 0.0:
+                                        edge_backward_loss = edge_backward_loss + (
+                                            rgb_recon_loss_weight
+                                            * seam_continuation_gradient_loss_weight_value
+                                            * edge_gradient_summary["weighted_raw_sum"]
+                                            / seam_gradient_weight_sum_total.clamp_min(1e-6)
+                                        )
+
+                            if isinstance(edge_style_ratio_total_loss, torch.Tensor) and style_ratio_edge_count_total > 0:
+                                edge_backward_loss = edge_backward_loss + (
+                                    edge_style_ratio_total_loss / float(style_ratio_edge_count_total)
+                                )
+
+                            if edge_backward_loss.requires_grad:
+                                edge_latent_grad = torch.autograd.grad(
+                                    edge_backward_loss,
+                                    edge_pred_x0_latents_for_decode,
+                                    retain_graph=False,
+                                    create_graph=False,
+                                    allow_unused=False,
+                                )[0]
+                                if edge_latent_grad is not None:
+                                    if pred_x0_latents_for_decode_grad is None:
+                                        pred_x0_latents_for_decode_grad = torch.zeros_like(pred_x0_latents_for_decode)
+                                    pred_x0_latents_for_decode_grad[:, :, latent_y0:latent_y1, latent_x0:latent_x1] = (
+                                        pred_x0_latents_for_decode_grad[:, :, latent_y0:latent_y1, latent_x0:latent_x1]
+                                        + edge_latent_grad
+                                    )
 
                         halo_mask = (seam_maps_supervised["margin_inner"] + seam_maps_supervised["margin_outer"]).clamp(0.0, 1.0)
                         train_geometry_mode = "expanded" if training_expanded_supervision_enabled else "interior"
@@ -5731,7 +7965,7 @@ def train(args: argparse.Namespace) -> None:
                                 seam_continuation_gradient_loss_weight_value
                                 * seam_gradient_summary["weighted_loss"]
                             )
-                            loss = loss + (float(seam_config.get("rgb_recon_loss_weight", 0.0)) * seam_rgb_total_loss)
+                            loss = loss + (rgb_recon_loss_weight * seam_rgb_total_loss.detach())
                             seam_rgb_total_loss_value = float(seam_rgb_total_loss.detach().item())
                             seam_rgb_halo_loss_raw_value = float(seam_rgb_summary["halo_loss_raw"].detach().item())
                             seam_rgb_interior_loss_raw_value = float(seam_rgb_summary["interior_loss_raw"].detach().item())
@@ -5799,18 +8033,70 @@ def train(args: argparse.Namespace) -> None:
                                         + f"halo_supervised_px={seam_halo_supervised_px_value:.1f}"
                                     )
 
-                            if (
-                                verification_config.get("save_seam_visual_debug", False)
-                                and (step_for_logging - int(resumed_step)) <= int(verification_config.get("seam_visual_debug_max_steps", 2))
-                            ):
-                                _save_seam_visual_debug(
-                                    output_dir=args.output_dir,
-                                    step=step_for_logging,
-                                    pred_rgb=pred_rgb,
-                                    target_rgb=target_rgb,
-                                    supervision_mask=seam_supervision_mask_rgb,
-                                    seam_maps=seam_maps_rgb,
+                        if style_ratio_edge_count > 0:
+                            edge_count = float(style_ratio_edge_count)
+                            style_ratio_total_loss_tensor = style_ratio_total_loss_tensor / edge_count
+                            loss = loss + style_ratio_total_loss_tensor.detach()
+                            style_ratio_total_loss_value = float(style_ratio_total_loss_tensor.detach().item())
+                            style_ratio_near_normal_loss_value /= edge_count
+                            style_ratio_near_tangent_loss_value /= edge_count
+                            style_ratio_near_lowfreq_loss_value /= edge_count
+                            style_ratio_overlap_normal_loss_value /= edge_count
+                            style_ratio_overlap_tangent_loss_value /= edge_count
+                            style_ratio_overlap_lowfreq_loss_value /= edge_count
+                            style_ratio_bucket_kl_loss_value /= edge_count
+                            style_ratio_entropy_loss_value /= edge_count
+                            style_ratio_effective_kl_scale_value /= edge_count
+                            style_ratio_gate_active_value /= edge_count
+                            style_ratio_schedule_scale_value /= edge_count
+                            style_ratio_gate_grad_ready_value /= edge_count
+                            style_ratio_gate_slope_ready_value /= edge_count
+                            style_ratio_gate_slope_value /= edge_count
+                            style_ratio_neighbor_agreement_rate_value /= edge_count
+                            style_ratio_aux_over_diffusion_ratio_value = style_ratio_total_loss_value / max(diffusion_loss_value, 1e-6)
+                            style_ratio_near_normal_history.append(style_ratio_near_normal_loss_value)
+                            if verification_log_now and style_ratio_aux_over_diffusion_ratio_value >= 1.25:
+                                logger.warning(
+                                    "[style_ratio/dominance] step=%d style_aux_over_diffusion_ratio=%.4f near_normal=%.6f overlap_normal=%.6f kl=%.6f entropy=%.6f edges=%d",
+                                    step_for_logging,
+                                    style_ratio_aux_over_diffusion_ratio_value,
+                                    style_ratio_near_normal_loss_value,
+                                    style_ratio_overlap_normal_loss_value,
+                                    style_ratio_bucket_kl_loss_value,
+                                    style_ratio_entropy_loss_value,
+                                    int(style_ratio_edge_count),
                                 )
+
+                        if (
+                            save_seam_visual_debug_enabled
+                            and (step_for_logging - int(resumed_step)) <= int(verification_config.get("seam_visual_debug_max_steps", 2))
+                        ):
+                            _save_seam_visual_debug(
+                                output_dir=args.output_dir,
+                                step=step_for_logging,
+                                pred_rgb=pred_rgb,
+                                target_rgb=target_rgb,
+                                supervision_mask=seam_supervision_mask_rgb,
+                                seam_maps=seam_maps_rgb,
+                                full_target_rgb=target_rgb_full,
+                                full_seam_maps=seam_maps_debug_full,
+                                crop_box=seam_debug_crop_box,
+                                reference_target_rgb=source_batch_images,
+                                source_sizes_hw=(
+                                    int(batch["original_sizes_hw"][0][0].item()),
+                                    int(batch["original_sizes_hw"][0][1].item()),
+                                ),
+                                expanded_source_box=(
+                                    tuple(float(v) for v in batch["expanded_crop_box"][0].detach().cpu().tolist())
+                                    if training_expanded_supervision_enabled and batch.get("expanded_crop_box") is not None
+                                    else None
+                                ),
+                                output_size_hw=(
+                                    int(source_batch_images.shape[-2]),
+                                    int(source_batch_images.shape[-1]),
+                                ),
+                                style_ratio_debug=style_ratio_visual_debug,
+                            )
 
                         seam_rgb_margin_inner_loss_value = float(
                             seam_rgb_region_losses.get("margin_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
@@ -6249,14 +8535,60 @@ def train(args: argparse.Namespace) -> None:
                     if verification_log_now and accelerator.sync_gradients:
                         pre_step_param_stats = _collect_trainable_module_stats(control_net)
 
-                accelerator.backward(loss)
+                if pred_x0_latents_for_decode_grad is not None:
+                    accelerator.backward(loss, retain_graph=True)
+                    torch.autograd.backward((pred_x0_latents_for_decode,), (pred_x0_latents_for_decode_grad,))
+                else:
+                    accelerator.backward(loss)
                 grad_stats = None
+                seam_adapter_pre_step_snapshot = None
                 if verification_log_now and accelerator.sync_gradients:
                     grad_stats = _collect_trainable_grad_stats(control_net)
+                if controlnet_diagnostics is not None and accelerator.sync_gradients:
+                    controlnet_diagnostics = dict(controlnet_diagnostics)
+                    controlnet_diagnostics.update(
+                        _collect_seam_adapter_runtime_diagnostics(
+                            control_net,
+                            optimizer,
+                            raw_control_net=unwrap_model(accelerator, control_net),
+                        )
+                    )
+                    seam_adapter_pre_step_snapshot = _collect_seam_adapter_parameter_snapshot(control_net)
                 if accelerator.sync_gradients:
                     if args.max_grad_norm > 0.0:
                         accelerator.clip_grad_norm_(control_net.parameters(), args.max_grad_norm)
                 optimizer.step()
+                if controlnet_diagnostics is not None and accelerator.sync_gradients and seam_adapter_pre_step_snapshot is not None:
+                    controlnet_diagnostics.update(
+                        _collect_seam_adapter_post_step_diagnostics(control_net, seam_adapter_pre_step_snapshot)
+                    )
+                    proj_out_weight = dict(control_net.named_parameters()).get("controlnet_seam_adapter.proj_out.weight")
+                    controlnet_diagnostics.update(
+                        {
+                            "seam_adapter_optimizer_step_was_skipped": 1.0 if bool(getattr(optimizer, "step_was_skipped", False)) else 0.0,
+                            "seam_adapter_proj_out_weight_optimizer_state_step_post": 0.0,
+                            "seam_adapter_proj_out_weight_optimizer_exp_avg_norm_post": 0.0,
+                            "seam_adapter_proj_out_weight_optimizer_exp_avg_sq_norm_post": 0.0,
+                        }
+                    )
+                    post_step_optimizer_state = _collect_parameter_optimizer_state(
+                        proj_out_weight,
+                        optimizer,
+                        "seam_adapter_proj_out_weight_optimizer",
+                    )
+                    controlnet_diagnostics.update(
+                        {
+                            "seam_adapter_proj_out_weight_optimizer_state_step_post": post_step_optimizer_state.get(
+                                "seam_adapter_proj_out_weight_optimizer_state_step", 0.0
+                            ),
+                            "seam_adapter_proj_out_weight_optimizer_exp_avg_norm_post": post_step_optimizer_state.get(
+                                "seam_adapter_proj_out_weight_optimizer_exp_avg_norm", 0.0
+                            ),
+                            "seam_adapter_proj_out_weight_optimizer_exp_avg_sq_norm_post": post_step_optimizer_state.get(
+                                "seam_adapter_proj_out_weight_optimizer_exp_avg_sq_norm", 0.0
+                            ),
+                        }
+                    )
                 if ema_state is not None:
                     update_ema_state(unwrap_model(accelerator, control_net), ema_state, float(args.ema_decay))
                 post_step_param_stats = None
@@ -6418,6 +8750,45 @@ def train(args: argparse.Namespace) -> None:
                             "seam_edge_south_visible_l2": seam_diag.get("seam_edge_south_visible_l2", 0.0),
                             "seam_edge_east_visible_l2": seam_diag.get("seam_edge_east_visible_l2", 0.0),
                             "seam_edge_west_visible_l2": seam_diag.get("seam_edge_west_visible_l2", 0.0),
+                            "style_conditioning_enabled": seam_diag.get("style_conditioning_enabled", 0.0),
+                            "style_conditioning_channels": seam_diag.get("style_conditioning_channels", 0.0),
+                            "style_conditioning_l2": seam_diag.get("style_conditioning_l2", 0.0),
+                            "style_conditioning_ramp_mean": seam_diag.get("style_conditioning_ramp_mean", 0.0),
+                            "style_conditioning_influence_c_mean": seam_diag.get("style_conditioning_influence_c_mean", 0.0),
+                            "style_ratio_total_loss": style_ratio_total_loss_value,
+                            "style_ratio_near_normal_loss": style_ratio_near_normal_loss_value,
+                            "style_ratio_near_tangent_loss": style_ratio_near_tangent_loss_value,
+                            "style_ratio_near_lowfreq_loss": style_ratio_near_lowfreq_loss_value,
+                            "style_ratio_overlap_normal_loss": style_ratio_overlap_normal_loss_value,
+                            "style_ratio_overlap_tangent_loss": style_ratio_overlap_tangent_loss_value,
+                            "style_ratio_overlap_lowfreq_loss": style_ratio_overlap_lowfreq_loss_value,
+                            "style_ratio_bucket_kl_loss": style_ratio_bucket_kl_loss_value,
+                            "style_ratio_entropy_loss": style_ratio_entropy_loss_value,
+                            "style_ratio_kl_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("style_ratio_kl_weight_max", 0.0) or 0.0),
+                            "style_ratio_kl_weight_effective": style_ratio_effective_kl_scale_value,
+                            "style_ratio_entropy_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("entropy_weight", 0.0) or 0.0),
+                            "style_ratio_near_normal_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("near_normal_grad_weight", 0.0) or 0.0),
+                            "style_ratio_near_tangent_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("near_tangent_grad_weight", 0.0) or 0.0),
+                            "style_ratio_near_lowfreq_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("near_lowfreq_weight", 0.0) or 0.0),
+                            "style_ratio_overlap_normal_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("overlap_normal_grad_weight", 0.0) or 0.0),
+                            "style_ratio_overlap_tangent_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("overlap_tangent_grad_weight", 0.0) or 0.0),
+                            "style_ratio_overlap_lowfreq_weight_raw": float(style_ratio_config.get("loss_weights", {}).get("overlap_lowfreq_weight", 0.0) or 0.0),
+                            "style_ratio_gate_active": style_ratio_gate_active_value,
+                            "style_ratio_schedule_scale": style_ratio_schedule_scale_value,
+                            "style_ratio_gate_grad_ready": style_ratio_gate_grad_ready_value,
+                            "style_ratio_gate_slope_ready": style_ratio_gate_slope_ready_value,
+                            "style_ratio_gate_slope": style_ratio_gate_slope_value,
+                            "style_ratio_patch_count": style_ratio_patch_count_value,
+                            "style_ratio_bucket_count": style_ratio_bucket_count_value,
+                            "style_ratio_bucket_kl_json": style_ratio_bucket_kl_json_value,
+                            "style_ratio_bucket_patch_count_json": style_ratio_bucket_patch_count_json_value,
+                            "style_ratio_neighbor_agreement_rate": style_ratio_neighbor_agreement_rate_value,
+                            "style_ratio_active_style_count": style_ratio_active_style_count_value,
+                            "style_ratio_active_style_family_id": style_ratio_active_style_family_id_value,
+                            "style_ratio_prototype_cache_memory_hits": style_ratio_prototype_cache_memory_hits_value,
+                            "style_ratio_prototype_cache_disk_hits": style_ratio_prototype_cache_disk_hits_value,
+                            "style_ratio_prototype_cache_misses": style_ratio_prototype_cache_misses_value,
+                            "style_ratio_aux_over_diffusion_ratio": style_ratio_aux_over_diffusion_ratio_value,
                             "seam_total_edges_defined": seam_total_edges_defined,
                             "seam_valid_edges_for_loss_count": seam_valid_edges_for_loss_count,
                             "seam_valid_edge_ratio": seam_valid_edge_ratio,
@@ -6499,6 +8870,25 @@ def train(args: argparse.Namespace) -> None:
 
                 if verification_log_now:
                     _log_controlnet_diagnostics(global_step, controlnet_diagnostics)
+                    if controlnet_diagnostics is not None:
+                        logger.info(
+                            "[verify/seam_adapter_runtime] "
+                            + f"step={global_step} "
+                            + f"proj_out_weight_norm={float(controlnet_diagnostics.get('seam_adapter_proj_out_weight_norm', 0.0) or 0.0):.8e} "
+                            + f"proj_out_bias_norm={float(controlnet_diagnostics.get('seam_adapter_proj_out_bias_norm', 0.0) or 0.0):.8e} "
+                            + f"proj_out_weight_grad_norm={float(controlnet_diagnostics.get('seam_adapter_proj_out_weight_grad_norm', 0.0) or 0.0):.8e} "
+                            + f"proj_out_bias_grad_norm={float(controlnet_diagnostics.get('seam_adapter_proj_out_bias_grad_norm', 0.0) or 0.0):.8e} "
+                            + f"upstream_grad_norm={float(controlnet_diagnostics.get('seam_adapter_upstream_grad_norm', 0.0) or 0.0):.8e} "
+                            + f"block_heads_grad_norm={float(controlnet_diagnostics.get('seam_adapter_block_heads_grad_norm', 0.0) or 0.0):.8e} "
+                            + f"proj_out_req=({float(controlnet_diagnostics.get('seam_adapter_proj_out_weight_requires_grad', 0.0) or 0.0):.0f},{float(controlnet_diagnostics.get('seam_adapter_proj_out_bias_requires_grad', 0.0) or 0.0):.0f}) "
+                            + f"proj_out_opt=({float(controlnet_diagnostics.get('seam_adapter_proj_out_weight_in_optimizer', 0.0) or 0.0):.0f},{float(controlnet_diagnostics.get('seam_adapter_proj_out_bias_in_optimizer', 0.0) or 0.0):.0f}) "
+                            + f"proj_out_lr={float(controlnet_diagnostics.get('seam_adapter_proj_out_optimizer_lr', 0.0) or 0.0):.2e} "
+                            + f"block_heads_opt={float(controlnet_diagnostics.get('seam_adapter_block_heads_in_optimizer', 0.0) or 0.0):.0f} "
+                            + f"block_heads_lr={float(controlnet_diagnostics.get('seam_adapter_block_heads_optimizer_lr', 0.0) or 0.0):.2e} "
+                            + f"multi_inject={float(controlnet_diagnostics.get('seam_adapter_multi_inject_enabled_runtime', 0.0) or 0.0):.0f} "
+                            + f"scale_block0={float(controlnet_diagnostics.get('seam_adapter_scale_block0_runtime', 0.0) or 0.0):.6f} "
+                            + f"scale_block1={float(controlnet_diagnostics.get('seam_adapter_scale_block1_runtime', 0.0) or 0.0):.6f}"
+                        )
                     if grad_stats is not None:
                         grad_l2_alpha = float(grad_stats.get("alpha_heads", {}).get("l2", 0.0))
                         grad_l2_control_residual = float(grad_stats.get("control_residual_blocks", {}).get("l2", 0.0))
