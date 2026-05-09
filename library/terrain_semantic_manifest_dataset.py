@@ -558,6 +558,7 @@ def build_seam_region_maps(
     valid_expanded_source_mask: Optional[torch.Tensor] = None,
     continuation_valid_mask: Optional[torch.Tensor] = None,
     style_support_valid_mask: Optional[torch.Tensor] = None,
+    q_valid_support_mask: Optional[torch.Tensor] = None,
     sample_identifiers: Optional[Sequence[str]] = None,
     style_ratio_config: Optional[Dict[str, object]] = None,
 ) -> Dict[str, torch.Tensor]:
@@ -630,6 +631,17 @@ def build_seam_region_maps(
 
     supervision_mask = supervision_mask.to(device=device, dtype=dtype).clamp(0.0, 1.0)
     supervision_mask = supervision_mask * valid_expanded_source_mask
+
+    if q_valid_support_mask is None:
+        q_valid_support_mask = supervision_mask
+    else:
+        q_valid_support_mask = q_valid_support_mask.to(device=device, dtype=dtype)
+        if q_valid_support_mask.ndim != 4 or q_valid_support_mask.shape[1] != 1 or tuple(q_valid_support_mask.shape[-2:]) != (height, width):
+            raise ValueError(
+                "q_valid_support_mask must have shape [batch, 1, height, width]: "
+                + f"got {tuple(q_valid_support_mask.shape)} expected {(batch_size, 1, height, width)}"
+            )
+        q_valid_support_mask = q_valid_support_mask.clamp(0.0, 1.0) * valid_expanded_source_mask
 
     projection = _build_source_space_edge_distance_fields(
         batch_size=batch_size,
@@ -929,10 +941,6 @@ def build_seam_region_maps(
     soft_field_end_px = float(style_cfg.get("soft_field_end_px", 400.0))
     ramp_start_px = float(style_cfg.get("controlnet_style_ramp_start_px", near_band_end_px))
     ramp_end_px = float(style_cfg.get("controlnet_style_ramp_end_px", overlap_band_end_px))
-    knee_fraction = float(style_cfg.get("soft_field_knee_fraction", 0.22))
-    knee_value = float(style_cfg.get("soft_field_knee_value", 0.55))
-    tail_gamma = float(style_cfg.get("soft_field_tail_gamma", 2.0))
-
     style_region_support_per_edge = edge_defined * continuation_valid_per_edge * (signed_distance_per_edge >= 0.0).to(dtype=dtype)
     rectangular_style_support_per_edge = edge_defined.expand(-1, 4, height, width)
     rectangular_distance_px_per_edge = signed_distance_per_edge.clamp_min(0.0)
@@ -958,28 +966,97 @@ def build_seam_region_maps(
     ).clamp(0.0, 1.0) * style_region_support_per_edge
 
     soft_field_start_px = max(hard_band_end_px, 0.0)
-    influence_span_raw = max(soft_field_end_px - soft_field_start_px, 1e-6)
-    influence_t_raw = ((rectangular_distance_px_per_edge - soft_field_start_px) / influence_span_raw).clamp(0.0, 1.0)
-    safe_knee_fraction = min(max(knee_fraction, 1e-6), 0.999999)
-    early_t = (influence_t_raw / safe_knee_fraction).clamp(0.0, 1.0)
-    tail_t = ((influence_t_raw - safe_knee_fraction) / max(1.0 - safe_knee_fraction, 1e-6)).clamp(0.0, 1.0)
-    early_curve = 1.0 - ((1.0 - knee_value) * early_t)
-    tail_curve = knee_value * (1.0 - tail_t).pow(max(tail_gamma, 1e-6))
-    soft_field_strength_per_edge_raw = torch.where(influence_t_raw <= safe_knee_fraction, early_curve, tail_curve)
-    soft_field_strength_per_edge_raw = soft_field_strength_per_edge_raw * (
-        (rectangular_distance_px_per_edge >= soft_field_start_px) & (rectangular_distance_px_per_edge < soft_field_end_px)
-    ).to(dtype=dtype)
-    soft_field_strength_per_edge_raw = soft_field_strength_per_edge_raw * rectangular_style_support_per_edge
-
-    soft_field_strength_sum_raw = soft_field_strength_per_edge_raw.sum(dim=1, keepdim=True)
-    soft_field_influence_c_raw = soft_field_strength_sum_raw.clamp(0.0, 1.0)
-    soft_field_normalizer_raw = soft_field_strength_sum_raw.clamp_min(1e-6)
-    soft_field_q_per_edge_raw = torch.where(
-        soft_field_strength_sum_raw > 0.0,
-        soft_field_influence_c_raw * (soft_field_strength_per_edge_raw / soft_field_normalizer_raw),
-        torch.zeros_like(soft_field_strength_per_edge_raw),
+    q_edge_plateau_px = float(max(0.0, float(style_cfg.get("edge_plateau_px", 16.0))))
+    q_edge_sigma_px = float(max(1e-6, float(style_cfg.get("q_edge_sigma_px", style_cfg.get("q_edge_sigma", 180.0)))))
+    q_interior_sigma_px = float(max(1e-6, float(style_cfg.get("q_interior_sigma_px", q_edge_sigma_px))))
+    q_edge_radius_px = float(max(0.0, float(style_cfg.get("q_edge_radius_px", 0.0))))
+    q_normalize = bool(style_cfg.get("normalize_q", style_cfg.get("q_normalize", True)))
+    q_interior_floor = float(
+        min(
+            1.0,
+            max(
+                0.0,
+                float(style_cfg.get("q_interior_floor", style_cfg.get("q_floor", 0.0))),
+            ),
+        )
     )
-    soft_field_q_interior_raw = (1.0 - soft_field_influence_c_raw).clamp(0.0, 1.0)
+
+    q_distance_px_per_edge = signed_distance_per_edge
+    edge_active_mask = edge_defined.expand(-1, 4, height, width)
+    q_valid_support_per_edge = q_valid_support_mask.expand(-1, 4, -1, -1)
+
+    edge_distance_for_min = torch.where(
+        edge_active_mask > 0.0,
+        q_distance_px_per_edge,
+        torch.full_like(q_distance_px_per_edge, 1.0e9),
+    )
+    q_min_distance_px = edge_distance_for_min.min(dim=1, keepdim=True).values
+    has_active_edge = (edge_defined.sum(dim=1, keepdim=True).view(batch_size, 1, 1, 1) > 0.0)
+    q_min_distance_px = torch.where(has_active_edge, q_min_distance_px, torch.zeros_like(q_min_distance_px))
+
+    q_edge_falloff = torch.where(
+        q_distance_px_per_edge <= q_edge_plateau_px,
+        torch.ones_like(q_distance_px_per_edge),
+        torch.exp(-((q_distance_px_per_edge - q_edge_plateau_px).clamp_min(0.0) / q_edge_sigma_px)),
+    ).clamp(0.0, 1.0)
+    if q_edge_radius_px > 0.0:
+        q_edge_falloff = torch.where(
+            q_distance_px_per_edge <= q_edge_radius_px,
+            q_edge_falloff,
+            torch.zeros_like(q_edge_falloff),
+        )
+    q_inward_decay_per_edge = q_edge_falloff
+    q_edge_pre_mask = q_edge_falloff * edge_active_mask
+
+    q_interior_pre_mask = torch.where(
+        q_min_distance_px <= q_edge_plateau_px,
+        torch.zeros_like(q_min_distance_px),
+        1.0 - torch.exp(-((q_min_distance_px - q_edge_plateau_px).clamp_min(0.0) / q_interior_sigma_px)),
+    ).clamp(0.0, 1.0)
+    q_interior_pre_mask = torch.where(has_active_edge, q_interior_pre_mask, torch.ones_like(q_interior_pre_mask))
+    if q_interior_floor > 0.0:
+        q_interior_pre_mask = q_interior_floor + ((1.0 - q_interior_floor) * q_interior_pre_mask)
+
+    raw_edge_potential = q_edge_pre_mask * q_valid_support_per_edge
+    raw_interior_potential = q_interior_pre_mask * q_valid_support_mask
+
+    raw_edge_mass = raw_edge_potential.sum(dim=(-2, -1), keepdim=True)
+    raw_interior_mass = raw_interior_potential.sum(dim=(-2, -1), keepdim=True)
+    active_target_edges = raw_edge_mass * edge_defined.view(batch_size, 4, 1, 1).to(device=device, dtype=dtype)
+    north_south_active = edge_defined[:, 0:2].view(batch_size, 2, 1, 1).to(device=device, dtype=dtype)
+    north_south_count = north_south_active.sum(dim=1, keepdim=True)
+    north_south_mean = (active_target_edges[:, 0:2].sum(dim=1, keepdim=True) / north_south_count.clamp_min(1.0))
+    active_edge_count = edge_defined.sum(dim=1, keepdim=True).view(batch_size, 1, 1, 1).to(device=device, dtype=dtype)
+    active_edge_mean = active_target_edges.sum(dim=1, keepdim=True) / active_edge_count.clamp_min(1.0)
+    target_interior = torch.where(north_south_count > 0.0, north_south_mean, active_edge_mean)
+    target_total = (active_target_edges.sum(dim=1, keepdim=True) + target_interior).clamp_min(1e-6)
+    active_target_edges = active_target_edges / target_total
+    target_interior = target_interior / target_total
+    edge_amplitude = torch.where(
+        raw_edge_mass > 0.0,
+        active_target_edges / raw_edge_mass.clamp_min(1e-6),
+        torch.zeros_like(active_target_edges),
+    )
+    interior_amplitude = torch.where(
+        raw_interior_mass > 0.0,
+        target_interior / raw_interior_mass.clamp_min(1e-6),
+        torch.zeros_like(target_interior),
+    )
+
+    soft_field_q_per_edge_raw = raw_edge_potential * edge_amplitude
+    soft_field_q_interior_raw = raw_interior_potential * interior_amplitude
+
+    soft_field_q_sum_raw_pre_norm = (
+        soft_field_q_interior_raw + soft_field_q_per_edge_raw.sum(dim=1, keepdim=True)
+    ).clamp_min(1e-6)
+    if q_normalize:
+        soft_field_q_per_edge_raw = soft_field_q_per_edge_raw / soft_field_q_sum_raw_pre_norm
+        soft_field_q_interior_raw = soft_field_q_interior_raw / soft_field_q_sum_raw_pre_norm
+    max_edge_q_raw = q_edge_pre_mask.max(dim=1, keepdim=True).values.clamp(0.0, 1.0)
+
+    soft_field_strength_per_edge_raw = soft_field_q_per_edge_raw
+    soft_field_strength_sum_raw = soft_field_q_per_edge_raw.sum(dim=1, keepdim=True)
+    soft_field_influence_c_raw = soft_field_q_per_edge_raw.max(dim=1, keepdim=True).values.clamp(0.0, 1.0)
 
     valid_style_support_start_px = float(style_cfg.get("valid_style_support_start_px", soft_field_start_px))
     style_spatial_support_per_edge = (
@@ -987,14 +1064,23 @@ def build_seam_region_maps(
     ).to(dtype=dtype) * rectangular_style_support_per_edge
     valid_style_support_mask = style_spatial_support_per_edge.sum(dim=1, keepdim=True).clamp(0.0, 1.0)
     valid_style_support_mask = valid_style_support_mask * style_support_valid_mask
-    soft_field_strength_per_edge = soft_field_strength_per_edge_raw * valid_style_support_mask
-    soft_field_strength_sum = soft_field_strength_sum_raw * valid_style_support_mask
-    soft_field_influence_c = soft_field_influence_c_raw * valid_style_support_mask
-    soft_field_q_per_edge = soft_field_q_per_edge_raw * valid_style_support_mask
-    soft_field_q_interior = soft_field_q_interior_raw * valid_style_support_mask
+    soft_field_strength_per_edge = soft_field_strength_per_edge_raw
+    soft_field_strength_sum = soft_field_strength_sum_raw
+    soft_field_influence_c = soft_field_influence_c_raw
+    soft_field_q_per_edge = soft_field_q_per_edge_raw
+    soft_field_q_interior = soft_field_q_interior_raw
+    q_expanded_extension_mask = (valid_expanded_source_mask > 0.0) & (q_valid_support_mask <= 0.0)
+    if bool(q_expanded_extension_mask.any().item()):
+        q_halo_edge_raw = q_edge_pre_mask * edge_active_mask * q_expanded_extension_mask.to(dtype=dtype)
+        q_halo_interior_raw = torch.zeros_like(soft_field_q_interior)
+        q_halo_sum = (q_halo_edge_raw.sum(dim=1, keepdim=True) + q_halo_interior_raw).clamp_min(1e-6)
+        q_halo_edge = q_halo_edge_raw / q_halo_sum
+        q_halo_interior = q_halo_interior_raw / q_halo_sum
+        soft_field_q_per_edge = torch.where(q_expanded_extension_mask.expand_as(soft_field_q_per_edge), q_halo_edge, soft_field_q_per_edge)
+        soft_field_q_interior = torch.where(q_expanded_extension_mask, q_halo_interior, soft_field_q_interior)
     soft_field_q_sum = (
         soft_field_q_per_edge.sum(dim=1, keepdim=True) + soft_field_q_interior
-    ) * valid_style_support_mask
+    ) * valid_expanded_source_mask
     soft_field_q_sum_raw = soft_field_q_per_edge_raw.sum(dim=1, keepdim=True) + soft_field_q_interior_raw
     soft_field_q_mask_removed = ((soft_field_q_sum_raw > 0.0) & (soft_field_q_sum <= 0.0)).to(dtype=dtype)
 
@@ -1103,6 +1189,14 @@ def build_seam_region_maps(
         "soft_field_strength_per_edge_raw": soft_field_strength_per_edge_raw,
         "soft_field_q_per_edge": soft_field_q_per_edge,
         "soft_field_q_per_edge_raw": soft_field_q_per_edge_raw,
+        "q_distance_px_per_edge": q_distance_px_per_edge,
+        "q_inward_decay_per_edge": q_inward_decay_per_edge,
+        "q_edge_pre_mask_per_edge": q_edge_pre_mask,
+        "q_edge_post_mask_per_edge": soft_field_q_per_edge,
+        "q_max_edge": max_edge_q_raw,
+        "q_interior": soft_field_q_interior,
+        "q_interior_pre_mask": q_interior_pre_mask,
+        "q_sum": soft_field_q_sum,
         "soft_field_q_north": soft_field_q_per_edge[:, 0:1],
         "soft_field_q_south": soft_field_q_per_edge[:, 1:2],
         "soft_field_q_east": soft_field_q_per_edge[:, 2:3],
@@ -1345,6 +1439,7 @@ class TerrainSemanticManifestDataset(Dataset):
         boundary_consistency_error_max_px: float = 0.5,
         style_pool_config: Optional[Dict[str, object]] = None,
         style_ratio_config: Optional[Dict[str, object]] = None,
+        regional_loss_config: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
         self.root_dir = root_dir
@@ -1457,6 +1552,16 @@ class TerrainSemanticManifestDataset(Dataset):
         self._seam_edge_qualification_cache: Dict[Tuple[int, int], Dict[str, float]] = {}
         self._seam_record_eligibility_cache: Dict[int, bool] = {}
         self._cached_latents: List[Optional[torch.Tensor]] = [None] * len(self._records)
+
+        # Regional multi-target loss substrate (Phase 0).
+        self.regional_loss_config = dict(regional_loss_config or {})
+        self.regional_loss_enabled = bool(self.regional_loss_config.get("enabled", False))
+        self._regional_family_index: Dict[str, Dict[str, object]] = {}
+        if self.regional_loss_enabled:
+            self._regional_family_index = self._build_regenerated_family_index(self.regional_loss_config)
+        self._regional_rng = random.Random(int(self.regional_loss_config.get("sampling_seed", 4242)))
+        self._regional_audit_logged = 0
+        self._regional_audit_max = int(self.regional_loss_config.get("audit_first_n", 8))
         if self.latent_cache_dir:
             os.makedirs(self.latent_cache_dir, exist_ok=True)
         self._recursive_latent_cache_index = self._index_existing_latent_cache_files()
@@ -2141,6 +2246,262 @@ class TerrainSemanticManifestDataset(Dataset):
         alpha = torch.from_numpy(rgba[:, :, 3]).unsqueeze(0).contiguous().float()
         return torch.cat([rgb, alpha], dim=0)
 
+    # ------------------------------------------------------------------
+    # Regional multi-target loss substrate (Phase 0 of plan).
+    # ------------------------------------------------------------------
+
+    def _build_regenerated_family_index(
+        self, regional_cfg: Dict[str, object]
+    ) -> Dict[str, Dict[str, object]]:
+        run_tag = str(regional_cfg.get("regenerated_image_run_tag", "")).strip()
+        base_root = str(regional_cfg.get(
+            "regenerated_image_root",
+            os.path.join(self.root_dir, "images", "regenerated_training_images"),
+        )).strip()
+        if not run_tag:
+            raise ValueError("regional_loss_config.regenerated_image_run_tag is required when regional loss enabled")
+        run_root = base_root if os.path.basename(os.path.normpath(base_root)) == run_tag else os.path.join(base_root, run_tag)
+        if not os.path.isdir(run_root):
+            raise FileNotFoundError(f"regenerated_image_run_tag directory not found: {run_root}")
+        index: Dict[str, Dict[str, object]] = {}
+        for entry in sorted(os.listdir(run_root)):
+            family_dir = os.path.join(run_root, entry)
+            if not os.path.isdir(family_dir):
+                continue
+            original_path = os.path.join(family_dir, "original_rgba.png")
+            variants: List[Dict[str, str]] = []
+            full_image_set: List[str] = []
+            for fname in sorted(os.listdir(family_dir)):
+                fpath = os.path.join(family_dir, fname)
+                if not fname.endswith(".png"):
+                    continue
+                full_image_set.append(fpath)
+                if fname == "original_rgba.png":
+                    continue
+                if fname.startswith("variant_"):
+                    json_path = os.path.join(family_dir, fname[:-4] + ".json")
+                    if not os.path.isfile(json_path):
+                        continue
+                    try:
+                        with open(json_path, "r", encoding="utf-8") as fh:
+                            meta = json.load(fh)
+                    except Exception:
+                        continue
+                    prompt_text = str(meta.get("prompt", ""))
+                    if not prompt_text:
+                        continue
+                    variants.append({
+                        "path": fpath,
+                        "prompt": prompt_text,
+                        "negative_prompt": str(meta.get("negative_prompt", "")),
+                        "name": fname[:-4],
+                    })
+            if not variants:
+                # Family with no usable variant — skipped from index.
+                continue
+            family_record = {
+                "family_dir": family_dir,
+                "original_rgba": original_path if os.path.isfile(original_path) else None,
+                "variants": variants,
+                "full_image_set": full_image_set,
+            }
+            index[entry.lower()] = family_record
+            index[self._normalize_regional_family_key(entry)] = family_record
+        return index
+
+    @staticmethod
+    def _normalize_regional_family_key(name: str) -> str:
+        return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+    @staticmethod
+    def _candidate_path_key(path: str) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    @classmethod
+    def _unique_candidate_paths(cls, paths: Sequence[str]) -> List[str]:
+        unique_paths: List[str] = []
+        seen = set()
+        for path in paths:
+            key = cls._candidate_path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(str(path))
+        return unique_paths
+
+    def _resolve_family_for_image_name(self, image_name: str) -> Optional[Dict[str, object]]:
+        if not self._regional_family_index:
+            return None
+        return self._regional_family_index.get(image_name.lower()) or self._regional_family_index.get(
+            self._normalize_regional_family_key(image_name)
+        )
+
+    def _load_candidate_train_rgba(self, image_path: str, crop_box: Tuple[int, int, int, int]) -> torch.Tensor:
+        """Load a candidate image cropped at crop_box, resized to train_size, RGBA in [-1,1]/[0,1]."""
+        image = self._read_image(image_path)
+        cropped = self._crop_image(image, crop_box)
+        resized = cropped.resize(
+            (self.train_size[1], self.train_size[0]),
+            resample=_resolve_pil_resample(self.image_resize_mode),
+        ).convert("RGBA")
+        arr = np.asarray(resized, dtype=np.float32) / 255.0
+        rgb = torch.from_numpy(arr[:, :, :3]).permute(2, 0, 1).contiguous().float() * 2.0 - 1.0
+        alpha = torch.from_numpy(arr[:, :, 3]).unsqueeze(0).contiguous().float()
+        return torch.cat([rgb, alpha], dim=0)  # [4, H, W]
+
+    def _load_candidate_expanded_rgb(
+        self,
+        image_path: str,
+        crop_box: Tuple[int, int, int, int],
+        halo_px: int,
+    ) -> torch.Tensor:
+        """Load a candidate image at expanded crop, train-resampled, RGB in [-1,1] only."""
+        image = self._read_image(image_path).convert("RGBA")
+        expanded_extent = self._expanded_source_extent(crop_box, halo_px)
+        train_halo = self._train_halo_from_source(halo_px)
+        out_size = (
+            int(self.train_size[0] + (2 * train_halo)),
+            int(self.train_size[1] + (2 * train_halo)),
+        )
+        resampled = self._resample_image_extent(image, expanded_extent, out_size, self.image_resize_mode)
+        arr = np.asarray(resampled, dtype=np.float32) / 255.0
+        rgb = torch.from_numpy(arr[:, :, :3]).permute(2, 0, 1).contiguous().float() * 2.0 - 1.0
+        return rgb
+
+    def _compose_regional_candidates(
+        self,
+        index: int,
+        edge_defined_flags: Optional[torch.Tensor],
+    ) -> Optional[Dict[str, object]]:
+        """Return dict with candidate stacks. Returns None when family not found."""
+        if not self.regional_loss_enabled:
+            return None
+        record = self._records[index]
+        family = self._resolve_family_for_image_name(record["image_name"])
+        if family is None:
+            return None
+        crop_box = record["crop_box"]
+        T = 5  # interior + 4 edges (N, S, E, W) — matches edge_defined_flags ordering.
+        H = int(self.train_size[0])
+        W = int(self.train_size[1])
+        train_halo = self._train_halo_from_source(self.expanded_target_halo_px) if self.expanded_target_halo_px > 0 else 0
+        H_exp = H + (2 * train_halo)
+        W_exp = W + (2 * train_halo)
+
+        candidate_targets_rgb = torch.zeros((T, 3, H, W), dtype=torch.float32)
+        candidate_targets_rgba = torch.zeros((T, 4, H, W), dtype=torch.float32)
+        expanded_targets_rgb = torch.zeros((T, 3, H_exp, W_exp), dtype=torch.float32)
+        active_mask = torch.zeros((T,), dtype=torch.float32)
+        names = ["" for _ in range(T)]
+
+        # Slot 0: interior — uniform random over prompted variants.
+        variants = []
+        seen_variant_paths = set()
+        for variant in family["variants"]:
+            path_key = self._candidate_path_key(str(variant["path"]))
+            if path_key in seen_variant_paths:
+                continue
+            seen_variant_paths.add(path_key)
+            variants.append(variant)
+        chosen_variant = self._regional_rng.choice(variants)
+        used_candidate_paths = {self._candidate_path_key(str(chosen_variant["path"]))}
+        interior_rgba = self._load_candidate_train_rgba(chosen_variant["path"], crop_box)
+        candidate_targets_rgba[0] = interior_rgba
+        candidate_targets_rgb[0] = interior_rgba[:3]
+        if train_halo > 0:
+            expanded_targets_rgb[0] = self._load_candidate_expanded_rgb(
+                chosen_variant["path"], crop_box, self.expanded_target_halo_px
+            )
+        active_mask[0] = 1.0
+        names[0] = os.path.basename(chosen_variant["path"])
+        interior_prompt = chosen_variant["prompt"]
+
+        # Slots 1..4: per-edge — uniform random over family's full image set incl. original_rgba.
+        full_set = [
+            path
+            for path in self._unique_candidate_paths(family["full_image_set"])
+            if self._candidate_path_key(path) not in used_candidate_paths
+        ]
+        if edge_defined_flags is not None and len(full_set) > 0:
+            for k in range(4):
+                if float(edge_defined_flags[k].item()) < 0.5:
+                    continue
+                if not full_set:
+                    break
+                pick_index = self._regional_rng.randrange(len(full_set))
+                pick = full_set.pop(pick_index)
+                used_candidate_paths.add(self._candidate_path_key(pick))
+                edge_rgba = self._load_candidate_train_rgba(pick, crop_box)
+                candidate_targets_rgba[1 + k] = edge_rgba
+                candidate_targets_rgb[1 + k] = edge_rgba[:3]
+                if train_halo > 0:
+                    expanded_targets_rgb[1 + k] = self._load_candidate_expanded_rgb(
+                        pick, crop_box, self.expanded_target_halo_px
+                    )
+                active_mask[1 + k] = 1.0
+                names[1 + k] = os.path.basename(pick)
+
+        if self._regional_audit_logged < self._regional_audit_max:
+            try:
+                logger = __import__("logging").getLogger(__name__)
+                logger.info(
+                    "[regional/candidates] sample=%d image_name=%s interior=%s edges=[%s,%s,%s,%s] active=%s",
+                    index,
+                    record["image_name"],
+                    names[0],
+                    names[1], names[2], names[3], names[4],
+                    [float(active_mask[i].item()) for i in range(T)],
+                )
+            except Exception:
+                pass
+            self._regional_audit_logged += 1
+
+        return {
+            "candidate_targets_rgb": candidate_targets_rgb,
+            "candidate_targets_rgba_train": candidate_targets_rgba,  # used for seam_strip retargeting
+            "expanded_candidate_targets_rgb": expanded_targets_rgb if train_halo > 0 else torch.zeros(0),
+            "candidate_active_mask": active_mask,
+            "candidate_image_names": names,
+            "interior_prompt_override": interior_prompt,
+        }
+
+    def _retarget_seam_strip_per_edge(
+        self,
+        seam_features: Dict[str, object],
+        candidate_train_rgba: torch.Tensor,  # [T, 4, H, W]
+    ) -> None:
+        """In-place: replace seam_strip_tensor edge bands with per-edge candidate RGBA bands.
+
+        Slots 1..4 in candidate_train_rgba correspond to N/S/E/W. When a slot is zero
+        (inactive edge or no family) the existing seam_tensor band is preserved.
+        """
+        seam_tensor = seam_features.get("seam_strip_tensor")
+        if seam_tensor is None:
+            return
+        edge_defined = seam_features.get("edge_defined_flags")
+        if edge_defined is None:
+            return
+        H = seam_tensor.shape[1]
+        W = seam_tensor.shape[2]
+        # band width matches seam_strip_width_px clamped (already done in _build_seam_features).
+        band = int(seam_features["seam_strip_width_px"].item()) if isinstance(seam_features.get("seam_strip_width_px"), torch.Tensor) else int(seam_features["seam_strip_width_px"])
+        band = max(1, min(band, (min(H, W) - 1) // 2))
+        for k in range(4):
+            if float(edge_defined[k].item()) < 0.5:
+                continue
+            cand = candidate_train_rgba[1 + k]
+            if float(cand.abs().sum()) == 0.0:
+                continue
+            if k == 0:  # north
+                seam_tensor[0:4, :band, :] = cand[:, :band, :]
+            elif k == 1:  # south
+                seam_tensor[4:8, H - band:, :] = cand[:, H - band:, :]
+            elif k == 2:  # east
+                seam_tensor[8:12, :, W - band:] = cand[:, :, W - band:]
+            else:  # west
+                seam_tensor[12:16, :, :band] = cand[:, :, :band]
+        seam_features["seam_strip_tensor"] = seam_tensor
+
     def _build_seam_decay_maps(self, height: int, width: int, band_px: Optional[int] = None) -> torch.Tensor:
         raw_band = self.seam_strip_width_px if band_px is None else int(band_px)
         band = max(1, min(int(raw_band), (min(height, width) - 1) // 2))
@@ -2225,6 +2586,7 @@ class TerrainSemanticManifestDataset(Dataset):
         conditioning_images: Optional[torch.Tensor] = None,
         alpha_target: Optional[torch.Tensor] = None,
         trusted_mask: Optional[torch.Tensor] = None,
+        valid_expanded_source_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         record = self._records[index]
         edge_flags = edge_defined_flags.detach().float().cpu().view(4)
@@ -2237,6 +2599,18 @@ class TerrainSemanticManifestDataset(Dataset):
 
         expanded_halo_px = int(self.expanded_target_halo_px)
         source_sizes_hw = torch.tensor([[record["crop_box"][3], record["crop_box"][2]]], dtype=torch.float32)
+        expanded_valid_source_mask = None
+        if valid_expanded_source_mask is not None:
+            expanded_valid_source_mask = valid_expanded_source_mask.detach().float().cpu()
+            if expanded_valid_source_mask.ndim == 2:
+                expanded_valid_source_mask = expanded_valid_source_mask.unsqueeze(0).unsqueeze(0)
+            elif expanded_valid_source_mask.ndim == 3:
+                expanded_valid_source_mask = expanded_valid_source_mask.unsqueeze(0)
+            if expanded_valid_source_mask.ndim != 4 or expanded_valid_source_mask.shape[1] != 1:
+                raise ValueError(
+                    "valid_expanded_source_mask for seam qualification must be [1,H,W] or [1,1,H,W], "
+                    + f"got {tuple(expanded_valid_source_mask.shape)}"
+                )
         if expanded_halo_px > 0:
             expanded_source_box = torch.tensor(
                 [self._expanded_source_extent(record["crop_box"], expanded_halo_px)],
@@ -2251,6 +2625,13 @@ class TerrainSemanticManifestDataset(Dataset):
             seam_decay_maps = expanded_geometry["expanded_seam_decay_maps"].unsqueeze(0)
             seam_strip_width_px = torch.tensor([float(self.seam_strip_width_px)], dtype=torch.float32)
             supervision_mask_base = center_embed_spatial_tensor(trusted_mask.unsqueeze(0).unsqueeze(0), self._train_halo_from_source(expanded_halo_px), fill_value=0.0)
+            q_valid_support_mask = center_embed_spatial_tensor(
+                torch.ones((1, 1, trusted_mask.shape[-2], trusted_mask.shape[-1]), dtype=torch.float32),
+                self._train_halo_from_source(expanded_halo_px),
+                fill_value=0.0,
+            )
+            if expanded_valid_source_mask is not None:
+                q_valid_support_mask = q_valid_support_mask * expanded_valid_source_mask
         else:
             expanded_source_box = None
             geometry = self._build_seam_geometry_from_flags(edge_flags, source_sizes_hw=source_sizes_hw.squeeze(0))
@@ -2258,6 +2639,7 @@ class TerrainSemanticManifestDataset(Dataset):
             seam_decay_maps = geometry["seam_decay_maps"].unsqueeze(0)
             seam_strip_width_px = geometry["seam_strip_width_px"].view(1)
             supervision_mask_base = trusted_mask.unsqueeze(0).unsqueeze(0)
+            q_valid_support_mask = torch.ones_like(supervision_mask_base)
 
         continuation_valid_mask = self._build_continuation_valid_mask(
             conditioning_images=conditioning_images,
@@ -2271,7 +2653,7 @@ class TerrainSemanticManifestDataset(Dataset):
             alpha_binary_threshold=self.alpha_binary_threshold,
             terrain_mask_channel_index=self.terrain_mask_channel_index,
             terrain_mask_black_is_terrain=self.terrain_mask_black_is_terrain,
-            style_ratio_config=self.style_ratio_config,
+            style_ratio_config={**self.style_ratio_config, **self.regional_loss_config},
         )
         edge_defined_batch = edge_flags.unsqueeze(0)
         seam_supervision_mask = build_seam_supervision_mask(
@@ -2290,9 +2672,12 @@ class TerrainSemanticManifestDataset(Dataset):
             expanded_halo_px=expanded_halo_px,
             source_sizes_hw=source_sizes_hw,
             expanded_source_boxes=expanded_source_box,
+            valid_expanded_source_mask=expanded_valid_source_mask,
             continuation_valid_mask=continuation_valid_mask,
             style_support_valid_mask=style_support_valid_mask,
+            q_valid_support_mask=q_valid_support_mask,
             sample_identifiers=[str(self._records[index]["image_name"])],
+            style_ratio_config={**self.style_ratio_config, **self.regional_loss_config},
         )
         qualification = summarize_seam_edge_qualification(
             seam_maps=seam_maps,
@@ -2306,6 +2691,20 @@ class TerrainSemanticManifestDataset(Dataset):
             "seam_qualified_halo_outer_px": qualification["halo_outer_px"].squeeze(0).contiguous(),
             "seam_qualified_continuation_weight_sum": qualification["continuation_weight_sum"].squeeze(0).contiguous(),
             "seam_qualified_valid_edges_count": qualification["valid_edges_for_loss_count"].squeeze(0).contiguous(),
+            "seam_interior_edge_band_per_edge": seam_maps["hard_band_mask_per_edge"].squeeze(0).contiguous(),
+            "seam_halo_inner_band_per_edge": seam_maps["halo_inner_per_edge"].squeeze(0).contiguous(),
+            "seam_halo_outer_band_per_edge": seam_maps["halo_outer_per_edge"].squeeze(0).contiguous(),
+            "seam_halo_band_per_edge": (
+                seam_maps["halo_inner_per_edge"] + seam_maps["halo_outer_per_edge"]
+            ).clamp(0.0, 1.0).squeeze(0).contiguous(),
+            "hard_band_mask_per_edge": seam_maps["hard_band_mask_per_edge"].squeeze(0).contiguous(),
+            "q_distance_px_per_edge": seam_maps["q_distance_px_per_edge"].squeeze(0).contiguous(),
+            "q_inward_decay_per_edge": seam_maps["q_inward_decay_per_edge"].squeeze(0).contiguous(),
+            "q_edge_post_mask_per_edge": seam_maps["q_edge_post_mask_per_edge"].squeeze(0).contiguous(),
+            "q_max_edge": seam_maps["q_max_edge"].squeeze(0).contiguous(),
+            "q_interior": seam_maps["q_interior"].squeeze(0).contiguous(),
+            "soft_field_q_per_edge": seam_maps["soft_field_q_per_edge"].squeeze(0).contiguous(),
+            "soft_field_q_interior": seam_maps["soft_field_q_interior"].squeeze(0).contiguous(),
         }
 
     def _get_edge_qualification(self, index: int, edge_idx: int) -> Dict[str, float]:
@@ -2639,6 +3038,54 @@ class TerrainSemanticManifestDataset(Dataset):
 
         return seam_tensor.contiguous()
 
+    def _build_expanded_seam_strip_per_edge(
+        self,
+        expanded_rgb_by_slot: torch.Tensor,
+        edge_defined_flags: torch.Tensor,
+        halo_px: int,
+        exclude_corners: bool = True,
+    ) -> torch.Tensor:
+        """Build expanded seam strip from regional edge candidate slots.
+
+        Slot 1..4 corresponds to north/south/east/west. The RGB source for each
+        active edge is the same candidate used as that edge's regional target.
+        """
+        if expanded_rgb_by_slot.ndim != 4 or expanded_rgb_by_slot.shape[1] != 3:
+            raise ValueError(f"expected [T,3,H,W] expanded candidates, got {tuple(expanded_rgb_by_slot.shape)}")
+        exp_H = int(expanded_rgb_by_slot.shape[-2])
+        exp_W = int(expanded_rgb_by_slot.shape[-1])
+        halo_px = max(1, min(int(halo_px), (min(exp_H, exp_W) - 1) // 2))
+        seam_tensor = torch.zeros((16, exp_H, exp_W), dtype=torch.float32)
+
+        corner_mask = torch.ones((exp_H, exp_W), dtype=torch.float32)
+        if exclude_corners:
+            corner_mask[:halo_px, :halo_px] = 0.0
+            corner_mask[:halo_px, exp_W - halo_px :] = 0.0
+            corner_mask[exp_H - halo_px :, :halo_px] = 0.0
+            corner_mask[exp_H - halo_px :, exp_W - halo_px :] = 0.0
+
+        for edge_index in range(4):
+            if edge_defined_flags[edge_index] < 0.5:
+                continue
+            rgb = expanded_rgb_by_slot[1 + edge_index]
+            if float(rgb.abs().sum().item()) <= 0.0:
+                continue
+            rgba = torch.cat([rgb, torch.ones((1, exp_H, exp_W), dtype=rgb.dtype)], dim=0).float()
+            if edge_index == 0:
+                mask = corner_mask[:halo_px, :].unsqueeze(0)
+                seam_tensor[0:4, :halo_px, :] = rgba[:, :halo_px, :] * mask
+            elif edge_index == 1:
+                mask = corner_mask[exp_H - halo_px :, :].unsqueeze(0)
+                seam_tensor[4:8, exp_H - halo_px :, :] = rgba[:, exp_H - halo_px :, :] * mask
+            elif edge_index == 2:
+                mask = corner_mask[:, exp_W - halo_px :].unsqueeze(0)
+                seam_tensor[8:12, :, exp_W - halo_px :] = rgba[:, :, exp_W - halo_px :] * mask
+            else:
+                mask = corner_mask[:, :halo_px].unsqueeze(0)
+                seam_tensor[12:16, :, :halo_px] = rgba[:, :, :halo_px] * mask
+
+        return seam_tensor.contiguous()
+
     def build_expanded_target_diagnostic(self, index: int, edge_defined_flags: Sequence[float]) -> Dict[str, object]:
         flags = torch.tensor([float(v) for v in edge_defined_flags], dtype=torch.float32)
         if flags.numel() != 4:
@@ -2732,6 +3179,21 @@ class TerrainSemanticManifestDataset(Dataset):
         if self.seam_enabled:
             seam_features = self._build_seam_features(index)
 
+        # Phase 0: build regional multi-target candidate stacks (if enabled).
+        regional_extras: Optional[Dict[str, object]] = None
+        sample_prompt = self.prompt
+        sample_prompt2 = self.prompt2
+        if self.regional_loss_enabled:
+            edge_flags = seam_features.get("edge_defined_flags") if seam_features else None
+            regional_extras = self._compose_regional_candidates(index, edge_flags)
+            if regional_extras is not None:
+                self._retarget_seam_strip_per_edge(seam_features, regional_extras["candidate_targets_rgba_train"])
+                # Override the per-sample prompt with the chosen interior variant's prompt.
+                _override = regional_extras.get("interior_prompt_override")
+                if _override:
+                    sample_prompt = _override
+                    sample_prompt2 = _override
+
         expanded_images: Optional[torch.Tensor] = None
         expanded_alpha_target: Optional[torch.Tensor] = None
         expanded_trusted_mask: Optional[torch.Tensor] = None
@@ -2746,7 +3208,11 @@ class TerrainSemanticManifestDataset(Dataset):
                 index,
                 seam_features.get("edge_defined_flags"),
             )
-            expanded_trusted_mask = self._center_insert_tensor(trusted_mask, self._train_halo_from_source(self.expanded_target_halo_px), fill_value=0.0)
+            expanded_trusted_mask = self._center_insert_tensor(
+                trusted_mask,
+                self._train_halo_from_source(self.expanded_target_halo_px),
+                fill_value=0.0,
+            )
             expanded_target_sizes_hw = torch.tensor(
                 [self.train_size[0] + (2 * self._train_halo_from_source(self.expanded_target_halo_px)), self.train_size[1] + (2 * self._train_halo_from_source(self.expanded_target_halo_px))],
                 dtype=torch.long,
@@ -2782,12 +3248,20 @@ class TerrainSemanticManifestDataset(Dataset):
                         elif _exp_alpha.ndim == 3 and _exp_alpha.shape[0] != 1:
                             _exp_alpha = _exp_alpha[:1]
                     _expanded_rgba = torch.cat([expanded_images, _exp_alpha], dim=0)
-                    expanded_geometry["expanded_seam_strip_tensor"] = self._build_expanded_seam_strip(
-                        _expanded_rgba,
-                        seam_features["edge_defined_flags"],
-                        int(self.expanded_target_halo_px),
-                        exclude_corners=True,
-                    )
+                    if regional_extras is not None and isinstance(regional_extras.get("expanded_candidate_targets_rgb"), torch.Tensor):
+                        expanded_geometry["expanded_seam_strip_tensor"] = self._build_expanded_seam_strip_per_edge(
+                            regional_extras["expanded_candidate_targets_rgb"],
+                            seam_features["edge_defined_flags"],
+                            self._train_halo_from_source(self.expanded_target_halo_px),
+                            exclude_corners=True,
+                        )
+                    else:
+                        expanded_geometry["expanded_seam_strip_tensor"] = self._build_expanded_seam_strip(
+                            _expanded_rgba,
+                            seam_features["edge_defined_flags"],
+                            int(self.expanded_target_halo_px),
+                            exclude_corners=True,
+                        )
 
         seam_qualification: Dict[str, torch.Tensor] = {}
         if self.seam_enabled and seam_features.get("edge_defined_flags") is not None:
@@ -2797,6 +3271,7 @@ class TerrainSemanticManifestDataset(Dataset):
                 conditioning_images=conditioning_images,
                 alpha_target=alpha_target,
                 trusted_mask=trusted_mask,
+                valid_expanded_source_mask=valid_expanded_source_mask,
             )
 
         example: Dict[str, object] = {
@@ -2807,8 +3282,8 @@ class TerrainSemanticManifestDataset(Dataset):
             "conditioning_images": conditioning_images,
             "trusted_mask": trusted_mask,
             "latents": self._cached_latents[index],
-            "prompt": self.prompt,
-            "prompt2": self.prompt2,
+            "prompt": sample_prompt,
+            "prompt2": sample_prompt2,
             "original_sizes_hw": torch.tensor([crop_h, crop_w], dtype=torch.long),
             "crop_top_lefts": torch.tensor([0, 0], dtype=torch.long),
             "target_sizes_hw": torch.tensor([self.train_size[0], self.train_size[1]], dtype=torch.long),
@@ -2842,4 +3317,9 @@ class TerrainSemanticManifestDataset(Dataset):
         example.update(seam_features)
         example.update(expanded_geometry)
         example.update(seam_qualification)
+        if regional_extras is not None:
+            # Strip the helper-only RGBA tensor (used for seam_strip retargeting) before returning.
+            regional_extras.pop("candidate_targets_rgba_train", None)
+            regional_extras.pop("interior_prompt_override", None)
+            example.update(regional_extras)
         return example

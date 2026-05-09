@@ -6,8 +6,8 @@ import random
 import re
 import math
 from collections import Counter, deque
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import toml
@@ -50,8 +50,14 @@ from library.terrain_semantic_manifest_dataset import (
     summarize_seam_edge_qualification,
     terrain_mask_to_occupancy as shared_terrain_mask_to_occupancy,
 )
+from library import regional_multitarget_loss as regional_loss_lib
 from library.utils import setup_logging
 import networks.lora as lora_network
+
+try:
+    import lpips
+except Exception:
+    lpips = None
 
 
 init_ipex()
@@ -61,7 +67,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+_TEXTURE_COLLAPSE_LPIPS_MODEL = None
+_TEXTURE_COLLAPSE_LPIPS_DEVICE = None
+_TEXTURE_COLLAPSE_LPIPS_DISABLED = False
+
+
 STEP_STATE_RE = re.compile(r"step(\d+)-state$")
+
+
+def _disable_compile_capture(fn):
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "disable"):
+        return compiler.disable(fn)
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "disable"):
+        return dynamo.disable(fn)
+    return fn
 
 COMPACT_SEAM_LOSS_TRACE_FIELDS = (
     "step",
@@ -89,6 +110,714 @@ COMPACT_SEAM_LOSS_TRACE_FIELDS = (
     "halo_inner_px",
     "halo_outer_px",
     "halo_without_continuation_count_after_gate",
+    # --- regional multi-target diffusion loss (Phase 4 of plan) ---
+    "regional_diff_loss",
+    "regional_diff_loss_weighted",
+    "regional_diff_loss_unmasked",
+    "active_content_mask_mean",
+    "active_content_mask_sum",
+    "terrain_soft_mean",
+    "active_content_fraction",
+    "fraction_of_active_diffusion_pixels_kept",
+    "active_content_mask_fallback",
+    "q_regret_loss",
+    "q_regret_loss_weighted",
+    "q_regret_active_pair_fraction",
+    "q_regret_violation_mean",
+    "q_regret_violation_max",
+    "rho_q_route",
+    "q_route_u",
+    "gamma_boot",
+    "gamma_route",
+    "q_confidence_mean",
+    "q_confidence_max",
+    "q_confidence_threshold",
+    "q_confidence_mask_fraction",
+    "aux_ramp",
+    "lambda_q_regret_current",
+    "lambda_bind_current",
+    "combined_aux_regional_ratio",
+    "lambda_q_mix",
+    "q_mix_schedule_step",
+    "q_mix_weight",
+    "q_mix_added_mass",
+    "q_entropy_mean",
+    "q_entropy_normalized",
+    "q_boot_entropy_mean",
+    "q_boot_entropy_normalized",
+    "routing_entropy_mean",
+    "routing_entropy_normalized",
+    "routing_gate_l1_mean",
+    "routing_mass_mean",
+    "routing_mass_abs_error",
+    "rgb_aux_loss",
+    "rgb_aux_loss_weighted",
+    "gate_entropy_mean",
+    "gate_entropy_normalized",
+    "gate_score_gap_mean",
+    "gate_smoothness",
+    "q_winner_alignment",
+    "q_winner_alignment_all",
+    "q_mass_interior",
+    "q_mass_north",
+    "q_mass_south",
+    "q_mass_east",
+    "q_mass_west",
+    "q_raw_mass_interior",
+    "q_raw_mass_north",
+    "q_raw_mass_south",
+    "q_raw_mass_east",
+    "q_raw_mass_west",
+    "gate_share_interior",
+    "gate_share_north",
+    "gate_share_south",
+    "gate_share_east",
+    "gate_share_west",
+    "routing_share_interior",
+    "routing_share_north",
+    "routing_share_south",
+    "routing_share_east",
+    "routing_share_west",
+    "q_route_terrain_support_interior",
+    "q_route_terrain_support_north",
+    "q_route_terrain_support_south",
+    "q_route_terrain_support_east",
+    "q_route_terrain_support_west",
+    "regional_loss_contribution_interior",
+    "regional_loss_contribution_north",
+    "regional_loss_contribution_south",
+    "regional_loss_contribution_east",
+    "regional_loss_contribution_west",
+    "gate_q_ratio_interior",
+    "gate_q_ratio_north",
+    "gate_q_ratio_south",
+    "gate_q_ratio_east",
+    "gate_q_ratio_west",
+    "q_band_gate_interior",
+    "q_band_gate_north",
+    "q_band_gate_south",
+    "q_band_gate_east",
+    "q_band_gate_west",
+    "q_gate_corr_interior",
+    "q_gate_corr_north",
+    "q_gate_corr_south",
+    "q_gate_corr_east",
+    "q_gate_corr_west",
+    "q_routing_corr_interior",
+    "q_routing_corr_north",
+    "q_routing_corr_south",
+    "q_routing_corr_east",
+    "q_routing_corr_west",
+    "r_mean_interior",
+    "r_mean_north",
+    "r_mean_south",
+    "r_mean_east",
+    "r_mean_west",
+    "r_high_q_interior",
+    "r_high_q_north",
+    "r_high_q_south",
+    "r_high_q_east",
+    "r_high_q_west",
+    "r_low_q_interior",
+    "r_low_q_north",
+    "r_low_q_south",
+    "r_low_q_east",
+    "r_low_q_west",
+    "R_self_interior",
+    "R_self_north",
+    "R_self_south",
+    "R_self_east",
+    "R_self_west",
+    "R_comp_interior",
+    "R_comp_north",
+    "R_comp_south",
+    "R_comp_east",
+    "R_comp_west",
+    "in_region_advantage_interior",
+    "in_region_advantage_north",
+    "in_region_advantage_south",
+    "in_region_advantage_east",
+    "in_region_advantage_west",
+    "min_in_region_advantage",
+    "mean_in_region_advantage",
+    "winner_share_interior",
+    "winner_share_north",
+    "winner_share_south",
+    "winner_share_east",
+    "winner_share_west",
+    "winner_hard_band_share_north",
+    "winner_hard_band_share_south",
+    "winner_hard_band_share_east",
+    "winner_hard_band_share_west",
+    "phase1_exit_ready",
+    "phase1_exit_block_reason",
+    "tau_current",
+    "gamma_current",
+    "bind_loss",
+    "bind_loss_weighted",
+    "bind_ranking_gap",
+    "effective_bind_weight",
+    "alpha_loss",
+    "alpha_loss_weighted",
+    "hard_band_gradient_loss",
+)
+
+REGIONAL_LOSS_TRACE_FIELDS = (
+    "step",
+    "loss",
+    "total_loss",
+    "standard_base_diffusion_loss_raw",
+    "standard_base_diffusion_loss_weighted",
+    "alpha_loss_raw",
+    "loss_ema_20",
+    "loss_slope_20",
+    "prediction_norm",
+    "target_norm",
+    "pred_minus_target_norm",
+    "gradient_norm_total",
+    "gradient_norm_base_diffusion",
+    "gradient_norm_alpha",
+    "visible_terrain_rgb_mean",
+    "visible_terrain_rgb_std",
+    "visible_terrain_gradient_energy",
+    "visible_terrain_laplacian_energy",
+    "active_terrain_alpha_support_sum",
+    "nonfinite_or_nan_detected",
+    "regional_multitarget_enabled",
+    "regional_wrapper_called",
+    "standard_base_diffusion_only_mode",
+    "learned_routing_gate_enabled",
+    "diffusion_loss",
+    "regional_diff_loss",
+    "regional_diff_loss_weighted",
+    "base_diffusion_loss",
+    "regional_base_ownership_weight",
+    "base_diffusion_anchor_weight",
+    "teacher_preservation_enabled",
+    "teacher_preservation_loss",
+    "teacher_preservation_weight",
+    "q_blend_diffusion_enabled",
+    "q_blend_diffusion_space",
+    "q_blend_weight",
+    "q_blend_loss_raw",
+    "q_blend_loss_safe",
+    "q_blend_loss_weighted",
+    "individual_regional_weight",
+    "individual_regional_loss_raw",
+    "individual_regional_loss_safe",
+    "individual_regional_loss_weighted",
+    "competitive_regret_weight",
+    "q_blend_q_mass_abs_error",
+    "q_blend_invalid_candidate_leak",
+    "regional_loss_invalid_candidate_leak",
+    "invalid_candidate_loss_leak",
+    "q_valid_sum_deviation_from_1",
+    "q_blend_active_content_mask_sum",
+    "num_valid_directional_seams",
+    "valid_directional_seams_hist_0",
+    "valid_directional_seams_hist_1",
+    "valid_directional_seams_hist_2",
+    "valid_directional_seams_hist_gt2",
+    "no_valid_directional_seam_count",
+    "one_valid_directional_seam_count",
+    "two_valid_directional_seam_count",
+    "over_two_valid_directional_seam_count",
+    "top2_truncation_count",
+    "num_valid_directional_seams_raw",
+    "candidate_valid_interior_mean",
+    "candidate_valid_north_mean",
+    "candidate_valid_south_mean",
+    "candidate_valid_east_mean",
+    "candidate_valid_west_mean",
+    "valid_north_rate",
+    "valid_south_rate",
+    "valid_east_rate",
+    "valid_west_rate",
+    "seam_edge_support_fraction_north",
+    "seam_edge_support_fraction_south",
+    "seam_edge_support_fraction_east",
+    "seam_edge_support_fraction_west",
+    "halo_support_fraction_north",
+    "halo_support_fraction_south",
+    "halo_support_fraction_east",
+    "halo_support_fraction_west",
+    "seam_validity_score_north",
+    "seam_validity_score_south",
+    "seam_validity_score_east",
+    "seam_validity_score_west",
+    "invalid_edge_support_lt_3pct_count",
+    "invalid_halo_support_lt_5pct_count",
+    "missing_halo_count",
+    "missing_target_count",
+    "semantic_invalid_count",
+    "individual_loss_skipped_invalid_count",
+    "competition_skipped_invalid_count",
+    "q_regret_invalid_pair_count",
+    "valid_mean_in_region_advantage",
+    "valid_min_in_region_advantage",
+    "invalid_excluded_advantage_count",
+    "seam_validity_terrain_threshold",
+    "hard_routed_regional_diff_loss_raw",
+    "hard_routed_regional_diff_loss_safe",
+    "regional_use_fixed_q_route_for_ownership",
+    "regional_freeze_gate_routing_head",
+    "regional_detach_routing_from_regional_loss",
+    "regional_routing_protected_warmup_active",
+    "regional_freeze_gate_routing_head_during_warmup",
+    "regional_detach_routing_from_regional_loss_during_warmup",
+    "competitive_gate_enabled",
+    "competitive_gate_effective_weight",
+    "competitive_gate_neutralized_for_equivalence",
+    "base_weight_floor",
+    "competitive_surplus_weight",
+    "catchup_weight",
+    "regional_diff_loss_raw",
+    "regional_diff_loss_safe",
+    "regional_diff_loss_q_confident",
+    "regional_diff_loss_weighted_raw",
+    "regional_loss_raw_safe_ratio",
+    "regional_loss_spike",
+    "regional_loss_spike_threshold",
+    "regional_loss_rolling_median_200",
+    "regional_loss_rolling_median_20",
+    "regional_loss_initial_baseline",
+    "regional_loss_ratio_to_initial",
+    "regional_loss_ratio_to_rolling",
+    "regional_loss_spike_but_slope_improving",
+    "regional_loss_spike_debug_saved",
+    "spike_count_100",
+    "max_raw_regional_loss_100",
+    "log10_max_raw_regional_loss_100",
+    "regional_loss_denominator",
+    "regional_loss_min_denominator",
+    "regional_loss_per_sample_raw_max",
+    "regional_loss_per_sample_safe_max",
+    "max_pixel_loss_per_sample_max",
+    "mean_pixel_loss_per_sample_max",
+    "max_candidate_loss_per_sample_max",
+    "candidate_with_max_loss_max",
+    "pixel_max_candidate_max",
+    "pixel_max_y_max",
+    "pixel_max_x_max",
+    "target_eps_sigma_min_raw",
+    "target_eps_sigma_min_safe",
+    "timestep_min",
+    "timestep_max",
+    "sigma",
+    "sigma_min",
+    "sigma_max",
+    "snr",
+    "snr_min",
+    "snr_max",
+    "diffusion_loss_weight_t_raw_max",
+    "diffusion_loss_weight_t_safe_max",
+    "diffusion_loss_weight_t_max",
+    "regional_loss_sigma_weight_mean",
+    "regional_loss_sigma_weight_min",
+    "regional_loss_sigma_weight_max",
+    "regional_low_sigma_weight",
+    "regional_competition_skipped_low_sigma",
+    "regional_competition_skipped_low_sigma_count",
+    "candidate_competition_weight_mean",
+    "candidate_competition_weight_min",
+    "candidate_competition_weight_max",
+    "regional_nonfinite_detected",
+    "isfinite_pred_x0",
+    "isfinite_target_i",
+    "isfinite_R_i",
+    "isfinite_L_train_i",
+    "isfinite_L_train_i_safe",
+    "isfinite_routing",
+    "max_abs_pred_x0",
+    "max_abs_target_i",
+    "max_abs_pred_target_delta",
+    "max_abs_R_i",
+    "max_abs_L_train_i",
+    "max_abs_L_train_i_safe",
+    "active_content_mask_mean",
+    "active_content_mask_sum",
+    "active_content_mask_sum_latent",
+    "active_content_mask_sum_pooled",
+    "active_content_latent_mask_sum",
+    "active_content_pooled_mask_sum",
+    "terrain_soft_mean",
+    "terrain_soft_sum",
+    "terrain_soft_min",
+    "terrain_soft_max",
+    "terrain_empty_count",
+    "terrain_empty_sample_count",
+    "seam_boundary_content_mask_sum",
+    "active_content_fraction",
+    "fraction_of_active_diffusion_pixels_kept",
+    "active_content_fraction_raw_min",
+    "active_content_fraction_raw_max",
+    "active_content_fraction_min",
+    "active_content_fraction_max",
+    "active_content_mask_fallback",
+    "active_content_fallback_count",
+    "active_diffusion_mask_sum_min",
+    "active_content_mask_sum_min",
+    "ri_active_candidate_std_mean",
+    "ri_active_candidate_std_max",
+    "ri_active_pairwise_absdiff_mean",
+    "ri_active_pairwise_absdiff_max",
+    "ri_active_q_neg_r_corr_mean",
+    "ri_active_q_neg_r_corr_min",
+    "ri_unmasked_candidate_std_mean",
+    "ri_unmasked_candidate_std_max",
+    "ri_unmasked_pairwise_absdiff_mean",
+    "ri_unmasked_pairwise_absdiff_max",
+    "ri_unmasked_q_neg_r_corr_mean",
+    "ri_unmasked_q_neg_r_corr_min",
+    "q_regret_loss",
+    "q_regret_loss_weighted",
+    "q_regret_active_pair_fraction",
+    "q_regret_violation_mean",
+    "q_regret_violation_max",
+    "phase",
+    "rho_q_route",
+    "q_route_u",
+    "gamma_boot",
+    "gamma_route",
+    "q_confidence_mean",
+    "q_confidence_max",
+    "q_confidence_threshold",
+    "q_confidence_mask_fraction",
+    "aux_ramp",
+    "aux_strength",
+    "lambda_q_regret_current",
+    "lambda_bind_current",
+    "q_regret_weight_current",
+    "bind_weight_current",
+    "combined_aux_regional_ratio",
+    "regional_loss_slope",
+    "regional_loss_slope_raw_ema",
+    "regional_loss_log_slope_raw",
+    "regional_loss_log_slope_clipped",
+    "regional_loss_ema_raw",
+    "regional_diff_loss_100step_ema",
+    "guardrail_triggered",
+    "guardrail_reason",
+    "phase15_ready_streak",
+    "phase15_exit_ready",
+    "phase15_exit_block_reason",
+    "regional_guard_ma20",
+    "regional_guard_threshold",
+    "regional_guard_bad_streak",
+    "regional_guard_stop",
+    "regional_guard_baseline",
+    "q_regret_ratio",
+    "bind_ratio",
+    "hard_band_ratio",
+    "alpha_ratio",
+    "rgb_aux_ratio",
+    "lambda_q_mix",
+    "q_mix_schedule_step",
+    "q_mix_weight",
+    "q_mix_added_mass",
+    "q_entropy_mean",
+    "q_entropy_normalized",
+    "q_raw_entropy_mean",
+    "q_raw_entropy_normalized",
+    "q_route_entropy_mean",
+    "q_route_entropy_normalized",
+    "q_boot_entropy_mean",
+    "q_boot_entropy_normalized",
+    "q_boot_usage",
+    "routing_entropy_mean",
+    "routing_entropy_normalized",
+    "routing_gate_l1_mean",
+    "routing_q_l1_mean",
+    "routing_mass_mean",
+    "routing_mass_abs_error",
+    "rgb_aux_loss",
+    "rgb_aux_loss_weighted",
+    "rgb_aux_mask_sum",
+    "halo_inner_rgb_loss",
+    "halo_outer_rgb_loss",
+    "seam_continuation_rgb_loss_raw",
+    "seam_rgb_continuation_weighted_loss",
+    "seam_continuation_weight_sum",
+    "seam_continuation_distance_band_px_count",
+    "seam_valid_edges_for_loss_count",
+    "seam_valid_edge_ratio",
+    "halo_without_continuation_count_after_gate",
+    "seam_rgb_total_loss_weighted",
+    "seam_rgb_total_ratio",
+    "halo_inner_rgb_ratio",
+    "halo_outer_rgb_ratio",
+    "seam_loss_contribution_ratio",
+    "texture_collapse_cosine_similarity",
+    "texture_collapse_fft_energy_similarity",
+    "texture_collapse_cross_region_lpips",
+    "texture_collapse_pair_count",
+    "hard_band_gradient_loss",
+    "hard_band_gradient_loss_weighted",
+    "hard_band_valid_mask_sum",
+    "hard_band_current_scale",
+    "hard_band_weight_current",
+    "alpha_loss",
+    "alpha_loss_weighted",
+    "alpha_loss_mask_sum",
+    "bind_loss",
+    "bind_loss_weighted",
+    "bind_ranking_gap",
+    "effective_bind_weight",
+    "alpha_bce_loss",
+    "alpha_edge_loss",
+    "alpha_terrain_bce_loss",
+    "alpha_terrain_iou_loss",
+    "terrain_curriculum_factor",
+    "alpha_temperature",
+    "alpha_prior_weight",
+    "gate_entropy_mean",
+    "gate_entropy_normalized",
+    "gate_score_gap_mean",
+    "gate_smoothness",
+    "q_winner_alignment",
+    "q_winner_alignment_all",
+    "q_mass_interior",
+    "q_mass_north",
+    "q_mass_south",
+    "q_mass_east",
+    "q_mass_west",
+    "q_valid_mass_interior",
+    "q_valid_mass_north",
+    "q_valid_mass_south",
+    "q_valid_mass_east",
+    "q_valid_mass_west",
+    "q_raw_mass_interior",
+    "q_raw_mass_north",
+    "q_raw_mass_south",
+    "q_raw_mass_east",
+    "q_raw_mass_west",
+    "invalid_q_mass_interior",
+    "invalid_q_mass_north",
+    "invalid_q_mass_south",
+    "invalid_q_mass_east",
+    "invalid_q_mass_west",
+    "invalid_raw_q_mass_interior",
+    "invalid_raw_q_mass_north",
+    "invalid_raw_q_mass_south",
+    "invalid_raw_q_mass_east",
+    "invalid_raw_q_mass_west",
+    "q_route_mass_sum",
+    "gate_share_interior",
+    "gate_share_north",
+    "gate_share_south",
+    "gate_share_east",
+    "gate_share_west",
+    "routing_share_interior",
+    "routing_share_north",
+    "routing_share_south",
+    "routing_share_east",
+    "routing_share_west",
+    "invalid_routing_mass_interior",
+    "invalid_routing_mass_north",
+    "invalid_routing_mass_south",
+    "invalid_routing_mass_east",
+    "invalid_routing_mass_west",
+    "invalid_gate_mass_interior",
+    "invalid_gate_mass_north",
+    "invalid_gate_mass_south",
+    "invalid_gate_mass_east",
+    "invalid_gate_mass_west",
+    "invalid_winner_share_interior",
+    "invalid_winner_share_north",
+    "invalid_winner_share_south",
+    "invalid_winner_share_east",
+    "invalid_winner_share_west",
+    "q_route_terrain_support_interior",
+    "q_route_terrain_support_north",
+    "q_route_terrain_support_south",
+    "q_route_terrain_support_east",
+    "q_route_terrain_support_west",
+    "regional_loss_contribution_interior",
+    "regional_loss_contribution_north",
+    "regional_loss_contribution_south",
+    "regional_loss_contribution_east",
+    "regional_loss_contribution_west",
+    "gate_q_ratio_interior",
+    "gate_q_ratio_north",
+    "gate_q_ratio_south",
+    "gate_q_ratio_east",
+    "gate_q_ratio_west",
+    "q_band_gate_interior",
+    "q_band_gate_north",
+    "q_band_gate_south",
+    "q_band_gate_east",
+    "q_band_gate_west",
+    "q_gate_corr_interior",
+    "q_gate_corr_north",
+    "q_gate_corr_south",
+    "q_gate_corr_east",
+    "q_gate_corr_west",
+    "q_routing_corr_interior",
+    "q_routing_corr_north",
+    "q_routing_corr_south",
+    "q_routing_corr_east",
+    "q_routing_corr_west",
+    "r_mean_interior",
+    "r_mean_north",
+    "r_mean_south",
+    "r_mean_east",
+    "r_mean_west",
+    "r_high_q_interior",
+    "r_high_q_north",
+    "r_high_q_south",
+    "r_high_q_east",
+    "r_high_q_west",
+    "r_low_q_interior",
+    "r_low_q_north",
+    "r_low_q_south",
+    "r_low_q_east",
+    "r_low_q_west",
+    "specialization_advantage_interior",
+    "specialization_advantage_north",
+    "specialization_advantage_south",
+    "specialization_advantage_east",
+    "specialization_advantage_west",
+    "region_weight_sum_interior",
+    "region_weight_sum_north",
+    "region_weight_sum_south",
+    "region_weight_sum_east",
+    "region_weight_sum_west",
+    "R_self_interior",
+    "R_self_north",
+    "R_self_south",
+    "R_self_east",
+    "R_self_west",
+    "R_comp_interior",
+    "R_comp_north",
+    "R_comp_south",
+    "R_comp_east",
+    "R_comp_west",
+    "R_comp_mean_interior",
+    "R_comp_mean_north",
+    "R_comp_mean_south",
+    "R_comp_mean_east",
+    "R_comp_mean_west",
+    "R_comp_best_interior",
+    "R_comp_best_north",
+    "R_comp_best_south",
+    "R_comp_best_east",
+    "R_comp_best_west",
+    "in_region_advantage_interior",
+    "in_region_advantage_north",
+    "in_region_advantage_south",
+    "in_region_advantage_east",
+    "in_region_advantage_west",
+    "in_region_advantage_ema_interior",
+    "in_region_advantage_ema_north",
+    "in_region_advantage_ema_south",
+    "in_region_advantage_ema_east",
+    "in_region_advantage_ema_west",
+    "competitive_gate_interior",
+    "competitive_gate_north",
+    "competitive_gate_south",
+    "competitive_gate_east",
+    "competitive_gate_west",
+    "competitive_gate_raw_interior",
+    "competitive_gate_raw_north",
+    "competitive_gate_raw_south",
+    "competitive_gate_raw_east",
+    "competitive_gate_raw_west",
+    "competitive_gate_delta_interior",
+    "competitive_gate_delta_north",
+    "competitive_gate_delta_south",
+    "competitive_gate_delta_east",
+    "competitive_gate_delta_west",
+    "base_region_loss_interior",
+    "base_region_loss_north",
+    "base_region_loss_south",
+    "base_region_loss_east",
+    "base_region_loss_west",
+    "competitive_region_loss_interior",
+    "competitive_region_loss_north",
+    "competitive_region_loss_south",
+    "competitive_region_loss_east",
+    "competitive_region_loss_west",
+    "final_region_loss_interior",
+    "final_region_loss_north",
+    "final_region_loss_south",
+    "final_region_loss_east",
+    "final_region_loss_west",
+    "catchup_loss_interior",
+    "catchup_loss_north",
+    "catchup_loss_south",
+    "catchup_loss_east",
+    "catchup_loss_west",
+    "catchup_active_interior",
+    "catchup_active_north",
+    "catchup_active_south",
+    "catchup_active_east",
+    "catchup_active_west",
+    "would_hard_gate_suppress_interior",
+    "would_hard_gate_suppress_north",
+    "would_hard_gate_suppress_south",
+    "would_hard_gate_suppress_east",
+    "would_hard_gate_suppress_west",
+    "min_in_region_advantage",
+    "mean_in_region_advantage",
+    "worst_region_index",
+    "worst_region_slot",
+    "worst_region_name",
+    "worst_region_is_active",
+    "worst_region_advantage",
+    "worst_region_R_self",
+    "worst_region_R_comp",
+    "worst_region_q_route_mass",
+    "worst_region_q_raw_mass",
+    "worst_region_gate_share",
+    "worst_region_routing_share",
+    "worst_region_winner_share",
+    "ri_qboot_min_in_region_advantage",
+    "ri_qboot_mean_in_region_advantage",
+    "ri_qboot_R_self_interior",
+    "ri_qboot_R_self_north",
+    "ri_qboot_R_self_south",
+    "ri_qboot_R_self_east",
+    "ri_qboot_R_self_west",
+    "ri_qboot_R_comp_interior",
+    "ri_qboot_R_comp_north",
+    "ri_qboot_R_comp_south",
+    "ri_qboot_R_comp_east",
+    "ri_qboot_R_comp_west",
+    "ri_qboot_in_region_advantage_interior",
+    "ri_qboot_in_region_advantage_north",
+    "ri_qboot_in_region_advantage_south",
+    "ri_qboot_in_region_advantage_east",
+    "ri_qboot_in_region_advantage_west",
+    "ri_active_lowest_frac_interior",
+    "ri_active_lowest_frac_north",
+    "ri_active_lowest_frac_south",
+    "ri_active_lowest_frac_east",
+    "ri_active_lowest_frac_west",
+    "ri_active_q_neg_r_corr_interior",
+    "ri_active_q_neg_r_corr_north",
+    "ri_active_q_neg_r_corr_south",
+    "ri_active_q_neg_r_corr_east",
+    "ri_active_q_neg_r_corr_west",
+    "winner_share_interior",
+    "winner_share_north",
+    "winner_share_south",
+    "winner_share_east",
+    "winner_share_west",
+    "winner_hard_region_share_interior",
+    "winner_hard_band_share_north",
+    "winner_hard_band_share_south",
+    "winner_hard_band_share_east",
+    "winner_hard_band_share_west",
+    "phase1_exit_ready",
+    "phase1_exit_block_reason",
+    "q_raw_mass_sum",
+    "competitive_catchup_loss",
+    "canary_baseline_ready",
+    "canary_regional_loss_baseline",
+    "canary_baseline_sample_count",
+    "canary_regional_loss_ratio_to_baseline",
+    "tau_current",
+    "gamma_current",
 )
 
 SEAM_ADAPTER_DIAG_FIELDS = (
@@ -163,6 +892,7 @@ SEAM_ADAPTER_DIAG_FIELDS = (
 )
 
 SEAM_ADAPTER_EDGE_NAMES = ("north", "south", "east", "west")
+REGIONAL_SLOT_NAMES = ("interior", "north", "south", "east", "west")
 
 
 @dataclass(frozen=True)
@@ -192,6 +922,699 @@ class TrainingPromptSampler:
             if draw <= cumulative:
                 return prompt
         return self._prompts[-1]
+
+
+def _lerp_float(start: float, end: float, frac: float) -> float:
+    frac = max(0.0, min(1.0, float(frac)))
+    return float(start) + ((float(end) - float(start)) * frac)
+
+
+def _safe_list_mean(values: List[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def _safe_list_min(values: List[float]) -> float:
+    return float(min(values)) if values else 0.0
+
+
+def _safe_list_max(values: List[float]) -> float:
+    return float(max(values)) if values else 0.0
+
+
+def _safe_list_median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(float(v) for v in values)
+    mid = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return float(sorted_values[mid])
+    return float(0.5 * (sorted_values[mid - 1] + sorted_values[mid]))
+
+
+def _safe_list_percentile(values: List[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(float(v) for v in values)
+    rank = max(0.0, min(1.0, float(percentile))) * float(len(sorted_values) - 1)
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return float(sorted_values[lo])
+    frac = rank - float(lo)
+    return float(sorted_values[lo] + ((sorted_values[hi] - sorted_values[lo]) * frac))
+
+
+def _ratio_caps_for_phase(phase: float) -> Dict[str, Tuple[float, float]]:
+    phase = float(phase)
+    if phase <= 1.0:
+        return {
+            "q_regret": (0.0, 0.0),
+            "bind": (0.0, 0.0),
+            "hard_band": (0.05, 0.08),
+            "alpha": (0.01, 0.02),
+            "rgb_aux": (0.002, 0.005),
+            "seam_rgb": (0.0, 1.0),
+        }
+    if phase < 2.0:
+        return {
+            "q_regret": (0.01, 0.03),
+            "bind": (0.003, 0.01),
+            "hard_band": (0.05, 0.10),
+            "alpha": (0.01, 0.03),
+            "rgb_aux": (0.002, 0.008),
+            "seam_rgb": (0.01, 0.05),
+        }
+    if phase < 3.0:
+        return {
+            "q_regret": (0.03, 0.06),
+            "bind": (0.005, 0.02),
+            "hard_band": (0.05, 0.10),
+            "alpha": (0.01, 0.03),
+            "rgb_aux": (0.002, 0.008),
+            "seam_rgb": (0.0, 1.0),
+        }
+    return {
+        "q_regret": (0.02, 0.04),
+        "bind": (0.003, 0.01),
+        "hard_band": (0.05, 0.10),
+        "alpha": (0.01, 0.02),
+        "rgb_aux": (0.002, 0.005),
+        "seam_rgb": (0.0, 1.0),
+    }
+
+
+def _cap_weight_by_ratio(weight: float, raw_loss: float, regional_diff_weighted: float, ratio_cap: float) -> float:
+    weight = max(0.0, float(weight))
+    raw_loss = max(0.0, float(raw_loss))
+    regional_diff_weighted = max(0.0, float(regional_diff_weighted))
+    ratio_cap = max(0.0, float(ratio_cap))
+    if weight <= 0.0 or raw_loss <= 0.0:
+        return weight
+    if ratio_cap <= 0.0 or regional_diff_weighted <= 0.0:
+        return 0.0
+    return min(weight, (ratio_cap * regional_diff_weighted) / raw_loss)
+
+
+def _loss_ratio(weighted_loss: float, regional_diff_weighted: float) -> float:
+    regional_diff_weighted = max(0.0, float(regional_diff_weighted))
+    if regional_diff_weighted <= 0.0:
+        return 0.0
+    return max(0.0, float(weighted_loss)) / regional_diff_weighted
+
+
+def _require_nonnegative_loss(name: str, value: torch.Tensor, tolerance: float = 1e-7) -> torch.Tensor:
+    value_detached = value.detach().float()
+    if (not torch.isfinite(value_detached).all()) or float(value_detached.reshape(-1).amin().item()) < -float(tolerance):
+        raise RuntimeError(f"{name} must be finite and nonnegative, got {float(value_detached.reshape(-1)[0].item()):.8g}")
+    return value.clamp_min(0.0)
+
+
+def _tensor_scalar(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.numel() <= 0:
+            return float(default)
+        return float(value.detach().float().reshape(-1)[0].item())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _tensor_max_scalar(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, torch.Tensor) and value.numel() > 0:
+        return float(value.detach().float().reshape(-1).amax().item())
+    return _tensor_scalar(value, default)
+
+
+def _tensor_min_scalar(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, torch.Tensor) and value.numel() > 0:
+        return float(value.detach().float().reshape(-1).amin().item())
+    return _tensor_scalar(value, default)
+
+
+def _tensor_float_list(value: Any, limit: int = 16) -> List[float]:
+    if isinstance(value, torch.Tensor):
+        return [float(v) for v in value.detach().float().reshape(-1)[:limit].cpu().tolist()]
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value[:limit]:
+            try:
+                out.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return out
+    try:
+        return [float(value)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _recent_float_values(rows: List[Dict[str, object]], field: str, window: int) -> List[float]:
+    values: List[float] = []
+    for row in rows[-max(1, int(window)) :]:
+        try:
+            value = float(row.get(field, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            values.append(value)
+    return values
+
+
+def _write_regional_spike_debug(
+    output_dir: str,
+    step: int,
+    diagnostics: Dict[str, Any],
+    row_values: Dict[str, object],
+    timesteps: torch.Tensor,
+    sqrt_alpha_t: torch.Tensor,
+    sqrt_one_minus_alpha_t: torch.Tensor,
+) -> Optional[str]:
+    try:
+        spike_dir = os.path.join(output_dir, "monitors", "regional_spike_debug")
+        os.makedirs(spike_dir, exist_ok=True)
+        alpha = sqrt_alpha_t.detach().float().reshape(-1).pow(2)
+        sigma2 = sqrt_one_minus_alpha_t.detach().float().reshape(-1).pow(2).clamp_min(1e-12)
+        payload = {
+            "step": int(step),
+            "regional": {
+                key: row_values.get(key, 0.0)
+                for key in (
+                    "regional_diff_loss_raw",
+                    "regional_diff_loss_safe",
+                    "regional_diff_loss_weighted_raw",
+                    "regional_diff_loss_weighted",
+                    "regional_loss_raw_safe_ratio",
+                    "regional_loss_spike_threshold",
+                    "regional_loss_rolling_median_200",
+                    "regional_nonfinite_detected",
+                    "regional_loss_denominator",
+                    "regional_loss_min_denominator",
+                )
+            },
+            "timesteps": _tensor_float_list(timesteps, limit=32),
+            "sqrt_alpha_t": _tensor_float_list(sqrt_alpha_t, limit=32),
+            "sqrt_one_minus_alpha_t": _tensor_float_list(sqrt_one_minus_alpha_t, limit=32),
+            "snr": _tensor_float_list(alpha / sigma2, limit=32),
+            "per_sample": {
+                "regional_loss_raw": _tensor_float_list(diagnostics.get("regional_loss_per_sample_raw"), limit=32),
+                "regional_loss_safe": _tensor_float_list(diagnostics.get("regional_loss_per_sample_safe"), limit=32),
+                "denominator": _tensor_float_list(diagnostics.get("denominator_per_sample"), limit=32),
+                "active_diffusion_mask_sum": _tensor_float_list(diagnostics.get("active_diffusion_mask_sum_per_sample"), limit=32),
+                "active_content_mask_sum": _tensor_float_list(diagnostics.get("active_content_mask_sum_per_sample"), limit=32),
+                "active_content_fraction": _tensor_float_list(diagnostics.get("active_content_fraction_per_sample"), limit=32),
+                "fallback_active_mask_used": _tensor_float_list(diagnostics.get("fallback_active_mask_used_per_sample"), limit=32),
+                "max_pixel_loss": _tensor_float_list(diagnostics.get("max_pixel_loss_per_sample"), limit=32),
+                "mean_pixel_loss": _tensor_float_list(diagnostics.get("mean_pixel_loss_per_sample"), limit=32),
+                "max_candidate_loss": _tensor_float_list(diagnostics.get("max_candidate_loss_per_sample"), limit=32),
+                "candidate_with_max_loss": _tensor_float_list(diagnostics.get("candidate_with_max_loss"), limit=32),
+                "pixel_max_candidate": _tensor_float_list(diagnostics.get("pixel_max_candidate"), limit=32),
+                "pixel_max_y": _tensor_float_list(diagnostics.get("pixel_max_y"), limit=32),
+                "pixel_max_x": _tensor_float_list(diagnostics.get("pixel_max_x"), limit=32),
+                "target_eps_sigma_min_raw": _tensor_float_list(diagnostics.get("target_eps_sigma_min_raw"), limit=32),
+                "target_eps_sigma_min_safe": _tensor_float_list(diagnostics.get("target_eps_sigma_min_safe"), limit=32),
+                "candidate_competition_weight_t": _tensor_float_list(diagnostics.get("candidate_competition_weight_t"), limit=32),
+                "diffusion_loss_weight_t_raw": _tensor_float_list(diagnostics.get("diffusion_loss_weight_t_raw"), limit=32),
+                "diffusion_loss_weight_t_safe": _tensor_float_list(diagnostics.get("diffusion_loss_weight_t_safe"), limit=32),
+            },
+            "finite_flags": {
+                "isfinite_pred_x0": _tensor_scalar(diagnostics.get("isfinite_pred_x0"), 1.0),
+                "isfinite_target_i": _tensor_scalar(diagnostics.get("isfinite_target_i"), 1.0),
+                "isfinite_R_i": _tensor_scalar(diagnostics.get("isfinite_R_i"), 1.0),
+                "isfinite_L_train_i": _tensor_scalar(diagnostics.get("isfinite_L_train_i"), 1.0),
+                "isfinite_L_train_i_safe": _tensor_scalar(diagnostics.get("isfinite_L_train_i_safe"), 1.0),
+                "isfinite_routing": _tensor_scalar(diagnostics.get("isfinite_routing"), 1.0),
+            },
+            "ranges": {
+                "max_abs_pred_x0": _tensor_scalar(diagnostics.get("max_abs_pred_x0")),
+                "max_abs_target_i": _tensor_scalar(diagnostics.get("max_abs_target_i")),
+                "max_abs_pred_target_delta": _tensor_scalar(diagnostics.get("max_abs_pred_target_delta")),
+                "max_abs_R_i": _tensor_scalar(diagnostics.get("max_abs_R_i")),
+                "max_abs_L_train_i": _tensor_scalar(diagnostics.get("max_abs_L_train_i")),
+                "max_abs_L_train_i_safe": _tensor_scalar(diagnostics.get("max_abs_L_train_i_safe")),
+            },
+        }
+        path = os.path.join(spike_dir, f"step_{int(step):08d}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        return path
+    except Exception:
+        return None
+
+
+@dataclass
+class DynamicQRoutingControllerState:
+    phase: float = 1.0
+    rho_q_route: float = 1.0
+    phase_start_step: int = 0
+    last_rho_update_step: int = 0
+    freeze_until_step: int = -1
+    phase1_ready_streak: int = 0
+    phase15_ready_streak: int = 0
+    phase15_guardrail_streak: int = 0
+    phase2_ready_streak: int = 0
+    phase3_guard_streak: int = 0
+    recovery_mode: bool = False
+    ema: Dict[str, float] = field(default_factory=dict)
+    raw_log_slope_history: deque = field(default_factory=lambda: deque(maxlen=200))
+    robust_log_slope_history: deque = field(default_factory=lambda: deque(maxlen=50))
+    regional_loss_guard_history: deque = field(default_factory=lambda: deque(maxlen=20))
+    regional_loss_guard_bad_streak: int = 0
+    initialized: bool = False
+
+
+def _controller_ema_update(state: DynamicQRoutingControllerState, name: str, value: float, alpha: float) -> float:
+    if not state.initialized or name not in state.ema:
+        state.ema[name] = float(value)
+    else:
+        state.ema[name] = state.ema[name] + (alpha * (float(value) - state.ema[name]))
+    return float(state.ema[name])
+
+
+def _build_qrouting_control(state: DynamicQRoutingControllerState, cfg: Dict[str, object], step: int) -> Dict[str, float]:
+    rho_floor = max(0.0, min(1.0, float(cfg.get("rho_q_floor", 0.05))))
+    hard_band_phase1 = float(cfg.get("hard_band_phase1_scale", 0.50))
+    hard_band_phase3 = float(cfg.get("hard_band_phase3_scale", 1.00))
+    q_regret_base = float(cfg.get("q_regret_loss_weight", 0.03))
+    bind_base = float(cfg.get("bind_preference_weight", 0.015))
+    phase = float(state.phase)
+    if phase >= 1.0 and phase < 2.0:
+        ramp_steps = max(1, int(cfg.get("phase15_continuation_aux_ramp_steps", 100)))
+        ramp_u = max(0.0, min(1.0, float(step) / float(ramp_steps)))
+        q_regret_base *= _lerp_float(
+            float(cfg.get("phase15_q_regret_resume_multiplier_start", 1.0)),
+            float(cfg.get("phase15_q_regret_resume_multiplier_end", 1.0)),
+            ramp_u,
+        )
+        bind_base *= _lerp_float(
+            float(cfg.get("phase15_bind_resume_multiplier_start", 1.0)),
+            float(cfg.get("phase15_bind_resume_multiplier_end", 1.0)),
+            ramp_u,
+        )
+
+    if phase <= 1.0:
+        rho_q_route = 1.0
+        aux_strength = 0.0
+        q_regret_scale = 0.0
+        bind_scale = 0.0
+        hard_band_scale = hard_band_phase1
+    elif phase < 2.0:
+        phase15_rho_start = float(cfg.get("phase15_rho_start", 0.80))
+        phase15_rho_end = float(cfg.get("phase15_rho_end", 0.50))
+        rho_q_route = max(phase15_rho_end, min(float(cfg.get("phase15_recovery_rho_cap", 0.85)), float(state.rho_q_route)))
+        aux_strength = (phase15_rho_start - rho_q_route) / max(1e-6, phase15_rho_start - phase15_rho_end)
+        aux_strength = max(0.0, min(1.0, aux_strength))
+        q_regret_scale = _lerp_float(
+            float(cfg.get("phase15_q_regret_scale_start", 0.20)),
+            float(cfg.get("phase15_q_regret_scale_end", 0.50)),
+            aux_strength,
+        )
+        bind_scale = _lerp_float(
+            float(cfg.get("phase15_bind_scale_start", 0.15)),
+            float(cfg.get("phase15_bind_scale_end", 0.40)),
+            aux_strength,
+        )
+        hard_band_scale = float(cfg.get("phase15_hard_band_scale", hard_band_phase3))
+    elif phase < 3.0:
+        rho_q_route = max(rho_floor, min(1.0, float(state.rho_q_route)))
+        phase2_rho_start = float(cfg.get("phase2_rho_start", 0.50))
+        aux_strength = max(0.0, min(1.0, (phase2_rho_start - rho_q_route) / max(1e-6, phase2_rho_start - rho_floor)))
+        q_regret_scale = _lerp_float(
+            float(cfg.get("phase2_q_regret_scale_start", 0.50)),
+            float(cfg.get("phase2_q_regret_scale_end", 0.85)),
+            aux_strength,
+        )
+        bind_scale = _lerp_float(
+            float(cfg.get("phase2_bind_scale_start", 0.40)),
+            float(cfg.get("phase2_bind_scale_end", 0.65)),
+            aux_strength,
+        )
+        if state.recovery_mode:
+            recovery_cap = float(cfg.get("phase3_recovery_aux_scale", 0.50))
+            q_regret_scale = min(q_regret_scale, recovery_cap)
+            bind_scale = min(bind_scale, recovery_cap)
+        hard_band_scale = _lerp_float(float(cfg.get("phase15_hard_band_scale", hard_band_phase3)), hard_band_phase3, aux_strength)
+    else:
+        rho_q_route = rho_floor
+        aux_strength = max(0.0, min(1.0, 1.0 - rho_q_route))
+        q_regret_scale = float(cfg.get("q_regret_phase3_scale", 0.60))
+        bind_scale = float(cfg.get("bind_phase3_scale", 0.60))
+        hard_band_scale = hard_band_phase3
+
+    if step < int(state.freeze_until_step):
+        q_regret_scale *= 0.5
+        bind_scale *= 0.5
+
+    return {
+        "phase": phase,
+        "rho_q_route": float(rho_q_route),
+        "q_boot_usage": 1.0 if phase < 2.0 else 0.0,
+        "aux_strength": float(aux_strength),
+        "q_regret_weight": q_regret_base * q_regret_scale,
+        "bind_weight": bind_base * bind_scale,
+        "hard_band_scale": float(hard_band_scale),
+        "hard_band_weight": float(cfg.get("hard_band_gradient_loss_weight_base", 0.0)) * float(hard_band_scale),
+    }
+
+
+def _update_dynamic_qrouting_controller(
+    state: DynamicQRoutingControllerState,
+    cfg: Dict[str, object],
+    step: int,
+    metrics: Dict[str, object],
+) -> Dict[str, float]:
+    alpha = 2.0 / (max(2, int(cfg.get("q_route_metric_ema_window", 100))) + 1.0)
+    safe_regional_loss_metric = float(metrics.get("regional_diff_loss_weighted_safe", metrics.get("regional_diff_loss_weighted", 0.0)))
+    raw_regional_loss_metric = float(metrics.get("regional_diff_loss_weighted_raw", metrics.get("regional_diff_loss_weighted", safe_regional_loss_metric)))
+    safe_regional_loss_metric = max(0.0, safe_regional_loss_metric)
+    raw_regional_loss_metric = max(0.0, raw_regional_loss_metric)
+    prev_regional_loss_ema = float(state.ema.get("regional_diff_loss_weighted_safe", safe_regional_loss_metric))
+    prev_regret_violation_ema = float(state.ema.get("q_regret_violation_mean", float(metrics.get("q_regret_violation_mean", 0.0))))
+    prev_q_winner_alignment_ema = float(state.ema.get("q_winner_alignment", float(metrics.get("q_winner_alignment", 0.0))))
+
+    regional_loss_ema = _controller_ema_update(state, "regional_diff_loss_weighted_safe", safe_regional_loss_metric, alpha)
+    raw_regional_loss_ema = _controller_ema_update(state, "regional_diff_loss_weighted_raw", raw_regional_loss_metric, alpha)
+    raw_ema_reset_ratio = max(1.0, float(cfg.get("regional_loss_raw_ema_reset_ratio", 1000.0)))
+    raw_ema_reference = max(raw_regional_loss_metric, safe_regional_loss_metric, 1e-6)
+    if (not math.isfinite(raw_regional_loss_ema)) or raw_regional_loss_ema > (raw_ema_reset_ratio * raw_ema_reference):
+        state.ema["regional_diff_loss_weighted_raw"] = raw_regional_loss_metric
+        raw_regional_loss_ema = raw_regional_loss_metric
+    q_winner_alignment_ema = _controller_ema_update(state, "q_winner_alignment", float(metrics.get("q_winner_alignment", 0.0)), alpha)
+    gate_entropy_ema = _controller_ema_update(state, "gate_entropy_normalized", float(metrics.get("gate_entropy_normalized", 0.0)), alpha)
+    q_regret_violation_ema = _controller_ema_update(state, "q_regret_violation_mean", float(metrics.get("q_regret_violation_mean", 0.0)), alpha)
+    raw_regional_loss_slope = (regional_loss_ema - prev_regional_loss_ema) * 100.0
+    prev_log_loss = float(state.ema.get("regional_log_loss_prev", math.log(max(safe_regional_loss_metric, 1e-12))))
+    current_log_loss = math.log(max(safe_regional_loss_metric, 1e-12))
+    raw_log_slope = current_log_loss - prev_log_loss
+    state.ema["regional_log_loss_prev"] = current_log_loss
+    state.raw_log_slope_history.append(float(raw_log_slope))
+    if len(state.raw_log_slope_history) >= 10:
+        slope_floor = _safe_list_percentile(list(state.raw_log_slope_history), 0.01)
+        slope_ceiling = _safe_list_percentile(list(state.raw_log_slope_history), 0.99)
+        clipped_log_slope = max(slope_floor, min(slope_ceiling, float(raw_log_slope)))
+    else:
+        clipped_log_slope = float(raw_log_slope)
+    state.robust_log_slope_history.append(clipped_log_slope)
+    regional_loss_slope = _safe_list_median(list(state.robust_log_slope_history))
+    state.ema["regional_loss_slope"] = regional_loss_slope
+    state.ema["regional_loss_slope_raw_ema"] = raw_regional_loss_slope
+
+    q_routing_corr_ema: List[float] = []
+    q_gate_corr_ema: List[float] = []
+    in_region_adv_ema: List[float] = []
+    r_mean_ema: List[float] = []
+    winner_share_ema: List[float] = []
+    for slot_name, q_routing_corr, q_gate_corr, in_region_advantage, r_mean, winner_share in zip(
+        metrics.get("active_slot_names", []),
+        metrics.get("q_routing_corr", []),
+        metrics.get("q_gate_corr", []),
+        metrics.get("in_region_advantage", []),
+        metrics.get("r_mean", []),
+        metrics.get("winner_share", []),
+    ):
+        q_routing_corr_ema.append(_controller_ema_update(state, f"q_routing_corr_{slot_name}", float(q_routing_corr), alpha))
+        q_gate_corr_ema.append(_controller_ema_update(state, f"q_gate_corr_{slot_name}", float(q_gate_corr), alpha))
+        in_region_adv_ema.append(_controller_ema_update(state, f"in_region_advantage_{slot_name}", float(in_region_advantage), alpha))
+        r_mean_ema.append(_controller_ema_update(state, f"r_mean_{slot_name}", float(r_mean), alpha))
+        winner_share_ema.append(_controller_ema_update(state, f"winner_share_{slot_name}", float(winner_share), alpha))
+
+    mean_r_ema = max(1e-6, _safe_list_mean(r_mean_ema))
+    mean_in_region_adv_ema = _safe_list_mean(in_region_adv_ema)
+    min_in_region_adv_ema = _safe_list_min(in_region_adv_ema)
+    mean_q_gate_corr_ema = _safe_list_mean(q_gate_corr_ema)
+    min_q_gate_corr_ema = _safe_list_min(q_gate_corr_ema)
+    mean_q_routing_corr_ema = _safe_list_mean(q_routing_corr_ema)
+    min_q_routing_corr_ema = _safe_list_min(q_routing_corr_ema)
+    max_winner_share_ema = _safe_list_max(winner_share_ema)
+    q_entropy = float(metrics.get("q_entropy_mean", 0.0) or 0.0)
+    q_route_entropy = float(metrics.get("q_route_entropy_mean", metrics.get("q_boot_entropy_mean", q_entropy)) or 0.0)
+    routing_entropy = float(metrics.get("routing_entropy_mean", 0.0) or 0.0)
+    entropy_sharpening = 0.0 if abs(q_route_entropy) <= 1e-12 else (1.0 - (routing_entropy / max(abs(q_route_entropy), 1e-12)))
+    phase = float(state.phase)
+    small_positive_threshold = float(cfg.get("small_positive_threshold_ratio", 0.01))
+    adv_min = float(cfg.get("adv_min_ratio", cfg.get("spec_adv_min_ratio", 0.01))) * mean_r_ema
+    adv_mean_min = float(cfg.get("adv_mean_min_ratio", cfg.get("spec_adv_mean_ratio", 0.03))) * mean_r_ema
+    phase1_exit_ready = False
+    phase15_exit_ready = False
+    phase1_exit_block_reason = "not_checked"
+    regret_not_increasing = q_regret_violation_ema <= (prev_regret_violation_ema + 1e-6)
+    loss_spike = bool(metrics.get("regional_loss_spike", 0.0)) or raw_regional_loss_metric > (float(cfg.get("loss_spike_ratio", 2.0)) * max(abs(raw_regional_loss_ema), 1e-6))
+    if loss_spike:
+        state.freeze_until_step = max(int(state.freeze_until_step), int(step) + int(cfg.get("loss_spike_freeze_steps", 200)))
+
+    guardrail_triggered = False
+    guardrail_reason = "none"
+    regional_guard_ma = 0.0
+    regional_guard_threshold = 0.0
+    regional_guard_stop = False
+    regional_guard_baseline = float(cfg.get("resume_guard_regional_loss_baseline", 0.0) or 0.0)
+    if phase <= 1.0:
+        phase1_adv_peak = max(float(state.ema.get("phase1_adv_peak", mean_in_region_adv_ema)), mean_in_region_adv_ema)
+        state.ema["phase1_adv_peak"] = phase1_adv_peak
+        phase1_min_elapsed = int(step) - int(state.phase_start_step) >= int(cfg.get("phase1_min_steps", 1000))
+        if phase1_min_elapsed:
+            phase1_block_reasons = []
+            if min_q_routing_corr_ema <= float(cfg.get("phase1_q_routing_corr_min", 0.70)):
+                phase1_block_reasons.append("min_q_routing_corr")
+            if mean_q_routing_corr_ema <= float(cfg.get("phase1_q_routing_corr_mean_min", 0.80)):
+                phase1_block_reasons.append("mean_q_routing_corr")
+            if min_in_region_adv_ema <= adv_min:
+                phase1_block_reasons.append("min_in_region_advantage")
+            if mean_in_region_adv_ema <= adv_mean_min:
+                phase1_block_reasons.append("mean_in_region_advantage")
+            if regional_loss_slope > small_positive_threshold:
+                phase1_block_reasons.append("regional_loss_slope")
+            peak_stall_ready = (
+                bool(cfg.get("phase1_peak_stall_exit_enabled", True))
+                and mean_in_region_adv_ema > float(cfg.get("phase1_peak_stall_mean_adv_min", 0.008))
+                and phase1_adv_peak > 0.0
+                and mean_in_region_adv_ema < (float(cfg.get("phase1_peak_stall_peak_fraction", 0.70)) * phase1_adv_peak)
+                and entropy_sharpening > float(cfg.get("phase1_peak_stall_entropy_sharpening_min", 0.45))
+                and regional_loss_slope <= small_positive_threshold
+            )
+            phase1_ready = not phase1_block_reasons
+            state.phase1_ready_streak = (state.phase1_ready_streak + 1) if phase1_ready else 0
+            patience_steps = int(cfg.get("q_route_patience_steps", 100))
+            if phase1_ready and state.phase1_ready_streak < patience_steps:
+                phase1_block_reasons.append("patience_steps")
+            phase1_exit_ready = phase1_ready and state.phase1_ready_streak >= patience_steps
+            if peak_stall_ready and not phase1_exit_ready:
+                phase1_block_reasons = ["phase1_peak_stall_to_phase15"]
+                phase1_exit_ready = True
+            phase1_exit_block_reason = "ready" if phase1_exit_ready else ",".join(phase1_block_reasons or ["unknown"])
+            if phase1_exit_ready:
+                state.phase = 1.5 if peak_stall_ready else 2.0
+                state.rho_q_route = float(cfg.get("phase15_rho_start", 0.80)) if peak_stall_ready else 1.0
+                state.phase_start_step = int(step)
+                state.last_rho_update_step = int(step)
+                state.phase1_ready_streak = 0
+                state.phase15_ready_streak = 0
+                state.phase2_ready_streak = 0
+                state.recovery_mode = False
+        else:
+            phase1_exit_block_reason = "phase1_min_steps"
+    elif phase < 2.0:
+        phase1_exit_block_reason = "phase15_handoff"
+        if "phase15_resume_mean_advantage" not in state.ema:
+            state.ema["phase15_resume_mean_advantage"] = mean_in_region_adv_ema
+            state.ema["phase15_resume_min_advantage"] = min_in_region_adv_ema
+        resume_mean_adv = float(state.ema.get("phase15_resume_mean_advantage", mean_in_region_adv_ema))
+        resume_min_adv = float(state.ema.get("phase15_resume_min_advantage", min_in_region_adv_ema))
+        guard_reasons: List[str] = []
+        if resume_mean_adv > 0.0 and mean_in_region_adv_ema < float(cfg.get("phase15_mean_adv_drop_fraction", 0.70)) * resume_mean_adv:
+            guard_reasons.append("mean_in_region_advantage_drop")
+        if min_in_region_adv_ema < resume_min_adv - float(cfg.get("phase15_min_adv_worsen_abs", 0.02)):
+            guard_reasons.append("min_in_region_advantage_worse")
+        if loss_spike:
+            guard_reasons.append("regional_loss_spike")
+        if max_winner_share_ema > float(cfg.get("phase15_winner_share_max", 0.60)):
+            guard_reasons.append("winner_share_collapse")
+        if gate_entropy_ema < float(cfg.get("phase15_gate_entropy_min", 0.20)):
+            guard_reasons.append("gate_entropy_low")
+        guardrail_triggered = bool(guard_reasons)
+        guardrail_reason = ",".join(guard_reasons) if guard_reasons else "none"
+        if guardrail_triggered:
+            state.phase15_guardrail_streak += 1
+            state.phase15_ready_streak = 0
+            state.freeze_until_step = max(
+                int(state.freeze_until_step),
+                int(step) + int(cfg.get("phase15_guardrail_freeze_steps", 150)),
+            )
+            if state.phase15_guardrail_streak >= int(cfg.get("phase15_recovery_guardrail_streak", 2)):
+                state.rho_q_route = min(
+                    float(cfg.get("phase15_recovery_rho_cap", 0.85)),
+                    max(float(state.rho_q_route), float(state.rho_q_route) + float(cfg.get("phase15_recovery_rho_step", 0.05))),
+                )
+        else:
+            state.phase15_guardrail_streak = 0
+            if int(step) >= int(state.freeze_until_step):
+                handoff_steps = max(1, int(cfg.get("phase15_handoff_steps", 800)))
+                u = max(0.0, min(1.0, float(int(step) - int(state.phase_start_step)) / float(handoff_steps)))
+                rho_start = float(cfg.get("phase15_rho_start", 0.80))
+                rho_end = float(cfg.get("phase15_rho_end", 0.50))
+                state.rho_q_route = rho_end + (0.5 * (rho_start - rho_end) * (1.0 + math.cos(math.pi * u)))
+        if bool(cfg.get("resume_regional_loss_guard_enabled", False)) and regional_guard_baseline > 0.0:
+            guard_window = max(2, int(cfg.get("resume_guard_window_steps", 20)))
+            if state.regional_loss_guard_history.maxlen != guard_window:
+                state.regional_loss_guard_history = deque(list(state.regional_loss_guard_history)[-guard_window:], maxlen=guard_window)
+            state.regional_loss_guard_history.append(safe_regional_loss_metric)
+            regional_guard_ma = _safe_list_mean(list(state.regional_loss_guard_history))
+            regional_guard_threshold = regional_guard_baseline * float(cfg.get("resume_guard_regional_loss_threshold_ratio", 1.25))
+            guard_until_step = int(cfg.get("resume_guard_steps", 200))
+            guard_min_history = min(guard_window, max(1, int(cfg.get("resume_guard_min_history_steps", guard_window))))
+            guard_bad = (
+                int(step) <= guard_until_step
+                and len(state.regional_loss_guard_history) >= guard_min_history
+                and regional_guard_ma > regional_guard_threshold
+                and regional_loss_slope > float(cfg.get("resume_guard_positive_slope_threshold", small_positive_threshold))
+            )
+            state.regional_loss_guard_bad_streak = (state.regional_loss_guard_bad_streak + 1) if guard_bad else 0
+            if state.regional_loss_guard_bad_streak >= int(cfg.get("resume_guard_bad_streak_steps", 45)):
+                regional_guard_stop = True
+                guardrail_triggered = True
+                guardrail_reason = "resume_regional_loss_guard"
+
+        phase15_block_reasons: List[str] = []
+        if guardrail_triggered:
+            phase15_block_reasons.append(guardrail_reason)
+        if mean_in_region_adv_ema <= float(cfg.get("phase15_success_mean_adv_min", 0.006)):
+            phase15_block_reasons.append("mean_in_region_advantage")
+        if min_in_region_adv_ema <= float(cfg.get("phase15_success_min_adv_min", -0.05)):
+            phase15_block_reasons.append("min_in_region_advantage")
+        if min_in_region_adv_ema < resume_min_adv - float(cfg.get("phase15_success_min_adv_slack", 0.01)):
+            phase15_block_reasons.append("min_in_region_advantage_slack")
+        if min_q_routing_corr_ema <= float(cfg.get("phase15_success_q_routing_corr_min", 0.70)):
+            phase15_block_reasons.append("min_q_routing_corr")
+        if mean_q_routing_corr_ema <= float(cfg.get("phase15_success_q_routing_corr_mean_min", 0.05)):
+            phase15_block_reasons.append("mean_q_routing_corr")
+        if entropy_sharpening <= float(cfg.get("phase15_success_entropy_sharpening_min", 0.0)):
+            phase15_block_reasons.append("entropy_sharpening")
+        if q_winner_alignment_ema <= float(cfg.get("phase15_success_q_winner_alignment_min", 0.20)):
+            phase15_block_reasons.append("q_winner_alignment")
+        if q_winner_alignment_ema < prev_q_winner_alignment_ema - 1e-6:
+            phase15_block_reasons.append("q_winner_alignment_decreasing")
+        if mean_q_gate_corr_ema <= float(cfg.get("phase15_success_q_gate_corr_mean_min", 0.02)):
+            phase15_block_reasons.append("mean_q_gate_corr")
+        if max_winner_share_ema >= float(cfg.get("phase15_success_winner_share_max", 0.45)):
+            phase15_block_reasons.append("winner_share")
+        if gate_entropy_ema < float(cfg.get("phase15_success_gate_entropy_min", 0.20)):
+            phase15_block_reasons.append("gate_entropy_low")
+        if gate_entropy_ema > float(cfg.get("phase15_success_gate_entropy_max", 0.50)):
+            phase15_block_reasons.append("gate_entropy_high")
+        if regional_loss_slope > small_positive_threshold:
+            phase15_block_reasons.append("regional_loss_slope")
+        stable_phase15 = not phase15_block_reasons
+        state.phase15_ready_streak = (state.phase15_ready_streak + 1) if stable_phase15 else 0
+        phase1_exit_block_reason = "phase15_ready" if stable_phase15 else "phase15_wait:" + ",".join(phase15_block_reasons or ["unknown"])
+        phase15_exit_ready = state.phase15_ready_streak >= int(cfg.get("phase15_patience_steps", 200))
+        if phase15_exit_ready and not bool(cfg.get("phase15_allow_phase2_transition", True)):
+            phase15_exit_ready = False
+            phase1_exit_block_reason = "phase15_ready_phase2_blocked"
+        if phase15_exit_ready:
+            state.phase = 2.0
+            state.rho_q_route = float(cfg.get("phase15_rho_end", 0.50))
+            state.phase_start_step = int(step)
+            state.last_rho_update_step = int(step)
+            state.phase15_ready_streak = 0
+            state.phase2_ready_streak = 0
+            state.recovery_mode = False
+            phase1_exit_block_reason = "phase15_to_phase2"
+    elif phase < 3.0:
+        phase1_exit_ready = True
+        phase1_exit_block_reason = "already_exited"
+        rho_floor = max(0.0, min(1.0, float(cfg.get("rho_q_floor", 0.05))))
+        phase2_rho_start = float(cfg.get("phase2_rho_start", 0.50))
+        progress = (phase2_rho_start - float(state.rho_q_route)) / max(1e-6, phase2_rho_start - rho_floor)
+        gate_corr_target = _lerp_float(0.10, 0.35, progress)
+        winner_alignment_target = _lerp_float(0.20, 0.50, progress)
+        allowed_loss_increase = float(cfg.get("phase2_allowed_loss_increase_ratio", 0.02))
+        if (not loss_spike) and int(step) >= int(state.last_rho_update_step) + int(cfg.get("rho_update_interval", 50)) and int(step) >= int(state.freeze_until_step):
+            phase2_decay_steps = max(1, int(cfg.get("phase2_decay_steps", cfg.get("q_route_decay_steps", 3000))))
+            u2 = max(0.0, min(1.0, float(int(step) - int(state.phase_start_step)) / float(phase2_decay_steps)))
+            scheduled_rho = rho_floor + (0.5 * (phase2_rho_start - rho_floor) * (1.0 + math.cos(math.pi * u2)))
+            gate_ready = (
+                mean_q_gate_corr_ema > gate_corr_target
+                and q_winner_alignment_ema > winner_alignment_target
+                and regret_not_increasing
+                and regional_loss_slope <= allowed_loss_increase
+            )
+            if gate_ready:
+                state.rho_q_route = min(float(state.rho_q_route), max(rho_floor, scheduled_rho))
+                if state.recovery_mode:
+                    state.recovery_mode = False
+            else:
+                state.rho_q_route = min(1.0, float(state.rho_q_route) + float(cfg.get("rho_recovery_step", 0.01)))
+            state.last_rho_update_step = int(step)
+
+        if (not loss_spike) and int(step) - int(state.phase_start_step) >= int(cfg.get("phase2_min_steps", 500)):
+            phase2_ready = (
+                float(state.rho_q_route) <= (rho_floor + 0.02)
+                and mean_q_gate_corr_ema > float(cfg.get("phase2_gate_corr_mean_min", 0.30))
+                and min_q_gate_corr_ema > float(cfg.get("phase2_gate_corr_min", 0.10))
+                and q_winner_alignment_ema > float(cfg.get("phase2_winner_alignment_min", 0.45))
+                and regret_not_increasing
+                and regional_loss_slope <= small_positive_threshold
+            )
+            state.phase2_ready_streak = (state.phase2_ready_streak + 1) if phase2_ready else 0
+            if state.phase2_ready_streak >= int(cfg.get("q_route_patience_steps", 100)):
+                state.phase = 3.0
+                state.rho_q_route = rho_floor
+                state.phase_start_step = int(step)
+                state.phase2_ready_streak = 0
+                state.recovery_mode = False
+    else:
+        phase1_exit_ready = True
+        phase1_exit_block_reason = "already_exited"
+        phase3_degraded = (
+            mean_q_gate_corr_ema < float(cfg.get("phase3_gate_corr_mean_min", 0.20))
+            or q_winner_alignment_ema < float(cfg.get("phase3_winner_alignment_min", 0.35))
+            or max_winner_share_ema > float(cfg.get("phase3_winner_share_collapse_max", 0.60))
+        )
+        state.phase3_guard_streak = (state.phase3_guard_streak + 1) if phase3_degraded else 0
+        if state.phase3_guard_streak >= int(cfg.get("q_route_patience_steps", 100)):
+            state.phase = 2.0
+            state.rho_q_route = min(float(cfg.get("phase3_recovery_rho_cap", 0.50)), float(state.rho_q_route) + float(cfg.get("phase3_recovery_rho_bump", 0.20)))
+            state.phase_start_step = int(step)
+            state.last_rho_update_step = int(step)
+            state.phase3_guard_streak = 0
+            state.recovery_mode = True
+
+    state.initialized = True
+    return {
+        "regional_loss_ema": regional_loss_ema,
+        "regional_loss_slope": regional_loss_slope,
+        "regional_loss_slope_raw_ema": raw_regional_loss_slope,
+        "regional_loss_log_slope_raw": raw_log_slope,
+        "regional_loss_log_slope_clipped": clipped_log_slope,
+        "regional_loss_ema_raw": raw_regional_loss_ema,
+        "regional_diff_loss_100step_ema": regional_loss_ema,
+        "gate_entropy_normalized_ema": gate_entropy_ema,
+        "guardrail_triggered": 1.0 if guardrail_triggered else 0.0,
+        "guardrail_reason": guardrail_reason,
+        "phase15_ready_streak": float(state.phase15_ready_streak),
+        "phase15_exit_ready": 1.0 if phase15_exit_ready else 0.0,
+        "phase15_exit_block_reason": phase1_exit_block_reason,
+        "regional_guard_ma20": regional_guard_ma,
+        "regional_guard_threshold": regional_guard_threshold,
+        "regional_guard_bad_streak": float(state.regional_loss_guard_bad_streak),
+        "regional_guard_stop": 1.0 if regional_guard_stop else 0.0,
+        "regional_guard_baseline": regional_guard_baseline,
+        "phase15_resume_mean_advantage": float(state.ema.get("phase15_resume_mean_advantage", mean_in_region_adv_ema)),
+        "phase15_resume_min_advantage": float(state.ema.get("phase15_resume_min_advantage", min_in_region_adv_ema)),
+        "q_winner_alignment_ema": q_winner_alignment_ema,
+        "q_regret_violation_mean_ema": q_regret_violation_ema,
+        "mean_q_routing_corr_ema": mean_q_routing_corr_ema,
+        "min_q_routing_corr_ema": min_q_routing_corr_ema,
+        "mean_q_gate_corr_ema": mean_q_gate_corr_ema,
+        "min_q_gate_corr_ema": min_q_gate_corr_ema,
+        "mean_in_region_advantage_ema": mean_in_region_adv_ema,
+        "min_in_region_advantage_ema": min_in_region_adv_ema,
+        "max_winner_share_ema": max_winner_share_ema,
+        "entropy_sharpening": entropy_sharpening,
+        "phase1_exit_ready": 1.0 if phase1_exit_ready else 0.0,
+        "phase1_exit_block_reason": phase1_exit_block_reason,
+        "loss_spike_active": 1.0 if int(step) < int(state.freeze_until_step) else 0.0,
+    }
 
 
 def load_training_prompt_pool(config: Dict[str, object]) -> List[TrainingPromptSpec]:
@@ -438,10 +1861,13 @@ def load_extended_training_state(
                 f"resume fallback could not find model state in {args.resume}; expected model.safetensors or pytorch_model.bin"
             )
 
-        logger.warning(
-            "[resume] accelerator state restore failed; falling back to model/EMA compatible restore "
-            f"from {model_state_path}"
-        )
+        if bool(getattr(args, "resume_model_only", False)):
+            logger.info(f"[resume] model/EMA compatible restore from {model_state_path}")
+        else:
+            logger.warning(
+                "[resume] accelerator state restore failed; falling back to model/EMA compatible restore "
+                f"from {model_state_path}"
+            )
 
         raw_model = control_net_model
         target_state = {key: value.detach().to(device="cpu") for key, value in raw_model.state_dict().items()}
@@ -506,6 +1932,10 @@ def load_extended_training_state(
 
     if not getattr(args, "resume", None):
         return 0, None
+
+    if bool(getattr(args, "resume_model_only", False)):
+        logger.info(f"[resume] loading model/EMA only from {args.resume}; optimizer/scheduler/RNG state will be reset")
+        return _fallback_resume_with_model_only()
 
     logger.info(f"[resume] loading training state from {args.resume}")
     try:
@@ -607,6 +2037,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save_last_n_steps_state", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--resume_model_only",
+        action="store_true",
+        help="Load model weights and EMA from --resume but intentionally reset optimizer, scheduler, and RNG state.",
+    )
+    parser.add_argument("--lr_warmup_steps", type=int, default=0, help="Linearly warm optimizer learning rates after resume/start.")
+    parser.add_argument("--lr_warmup_start_factor", type=float, default=0.10)
     parser.add_argument("--sanity_samples", type=int, default=32)
     parser.add_argument("--debug_dump_samples", type=int, default=0)
     parser.add_argument("--skip_lora_sanity_check", action="store_true")
@@ -639,7 +2076,7 @@ def _parse_steps_csv(steps_csv: str) -> List[int]:
 
 def _normalize_loss_trace_mode(mode: object) -> str:
     normalized = str(mode or "full").strip().lower() or "full"
-    if normalized not in {"full", "compact_seam"}:
+    if normalized not in {"full", "compact_seam", "regional"}:
         raise ValueError(f"unsupported loss_trace_mode='{mode}'")
     return normalized
 
@@ -658,6 +2095,259 @@ def _format_loss_trace_row(row: Dict[str, object], mode: str) -> Dict[str, objec
     normalized_mode = _normalize_loss_trace_mode(mode)
     if normalized_mode == "full":
         return row
+
+    if normalized_mode == "regional":
+        regional_row = {
+            "step": float(row.get("step", 0.0) or 0.0),
+            "loss": float(row.get("loss", row.get("total_loss", 0.0)) or 0.0),
+            "total_loss": float(row.get("total_loss", row.get("loss", 0.0)) or 0.0),
+            "standard_base_diffusion_loss_raw": float(row.get("standard_base_diffusion_loss_raw", row.get("diffusion_loss", 0.0)) or 0.0),
+            "standard_base_diffusion_loss_weighted": float(row.get("standard_base_diffusion_loss_weighted", row.get("diffusion_loss", 0.0)) or 0.0),
+            "alpha_loss_raw": float(row.get("alpha_loss_raw", row.get("alpha_total_loss", row.get("alpha_loss", 0.0))) or 0.0),
+            "alpha_loss_weighted": float(row.get("alpha_loss_weighted", row.get("alpha_total_loss", row.get("alpha_loss", 0.0))) or 0.0),
+            "loss_ema_20": float(row.get("loss_ema_20", row.get("loss", 0.0)) or 0.0),
+            "loss_slope_20": float(row.get("loss_slope_20", 0.0) or 0.0),
+            "prediction_norm": float(row.get("prediction_norm", 0.0) or 0.0),
+            "target_norm": float(row.get("target_norm", 0.0) or 0.0),
+            "pred_minus_target_norm": float(row.get("pred_minus_target_norm", 0.0) or 0.0),
+            "gradient_norm_total": float(row.get("gradient_norm_total", 0.0) or 0.0),
+            "gradient_norm_base_diffusion": float(row.get("gradient_norm_base_diffusion", 0.0) or 0.0),
+            "gradient_norm_alpha": float(row.get("gradient_norm_alpha", 0.0) or 0.0),
+            "visible_terrain_rgb_mean": float(row.get("visible_terrain_rgb_mean", 0.0) or 0.0),
+            "visible_terrain_rgb_std": float(row.get("visible_terrain_rgb_std", 0.0) or 0.0),
+            "visible_terrain_gradient_energy": float(row.get("visible_terrain_gradient_energy", 0.0) or 0.0),
+            "visible_terrain_laplacian_energy": float(row.get("visible_terrain_laplacian_energy", 0.0) or 0.0),
+            "active_terrain_alpha_support_sum": float(row.get("active_terrain_alpha_support_sum", 0.0) or 0.0),
+            "nonfinite_or_nan_detected": float(row.get("nonfinite_or_nan_detected", 0.0) or 0.0),
+            "regional_multitarget_enabled": float(row.get("regional_multitarget_enabled", 0.0) or 0.0),
+            "regional_wrapper_called": float(row.get("regional_wrapper_called", 0.0) or 0.0),
+            "standard_base_diffusion_only_mode": float(row.get("standard_base_diffusion_only_mode", 0.0) or 0.0),
+            "learned_routing_gate_enabled": float(row.get("learned_routing_gate_enabled", 0.0) or 0.0),
+            "diffusion_loss": float(row.get("diffusion_loss", 0.0) or 0.0),
+            "regional_diff_loss": float(row.get("regional_diff_loss", 0.0) or 0.0),
+            "regional_diff_loss_weighted": float(row.get("regional_diff_loss_weighted", 0.0) or 0.0),
+            "regional_diff_loss_raw": float(row.get("regional_diff_loss_raw", row.get("regional_diff_loss", 0.0)) or 0.0),
+            "regional_diff_loss_safe": float(row.get("regional_diff_loss_safe", row.get("regional_diff_loss", 0.0)) or 0.0),
+            "regional_diff_loss_weighted_raw": float(row.get("regional_diff_loss_weighted_raw", row.get("regional_diff_loss_weighted", 0.0)) or 0.0),
+            "regional_loss_raw_safe_ratio": float(row.get("regional_loss_raw_safe_ratio", 0.0) or 0.0),
+            "regional_loss_spike": float(row.get("regional_loss_spike", 0.0) or 0.0),
+            "regional_loss_spike_threshold": float(row.get("regional_loss_spike_threshold", 0.0) or 0.0),
+            "regional_loss_rolling_median_200": float(row.get("regional_loss_rolling_median_200", 0.0) or 0.0),
+            "spike_count_100": float(row.get("spike_count_100", 0.0) or 0.0),
+            "max_raw_regional_loss_100": float(row.get("max_raw_regional_loss_100", 0.0) or 0.0),
+            "log10_max_raw_regional_loss_100": float(row.get("log10_max_raw_regional_loss_100", 0.0) or 0.0),
+            "regional_loss_denominator": float(row.get("regional_loss_denominator", 0.0) or 0.0),
+            "regional_loss_min_denominator": float(row.get("regional_loss_min_denominator", 0.0) or 0.0),
+            "regional_loss_per_sample_raw_max": float(row.get("regional_loss_per_sample_raw_max", 0.0) or 0.0),
+            "regional_loss_per_sample_safe_max": float(row.get("regional_loss_per_sample_safe_max", 0.0) or 0.0),
+            "max_pixel_loss_per_sample_max": float(row.get("max_pixel_loss_per_sample_max", 0.0) or 0.0),
+            "mean_pixel_loss_per_sample_max": float(row.get("mean_pixel_loss_per_sample_max", 0.0) or 0.0),
+            "max_candidate_loss_per_sample_max": float(row.get("max_candidate_loss_per_sample_max", 0.0) or 0.0),
+            "candidate_with_max_loss_max": float(row.get("candidate_with_max_loss_max", 0.0) or 0.0),
+            "pixel_max_candidate_max": float(row.get("pixel_max_candidate_max", 0.0) or 0.0),
+            "pixel_max_y_max": float(row.get("pixel_max_y_max", 0.0) or 0.0),
+            "pixel_max_x_max": float(row.get("pixel_max_x_max", 0.0) or 0.0),
+            "target_eps_sigma_min_raw": float(row.get("target_eps_sigma_min_raw", 0.0) or 0.0),
+            "target_eps_sigma_min_safe": float(row.get("target_eps_sigma_min_safe", 0.0) or 0.0),
+            "timestep_min": float(row.get("timestep_min", 0.0) or 0.0),
+            "timestep_max": float(row.get("timestep_max", 0.0) or 0.0),
+            "snr_min": float(row.get("snr_min", 0.0) or 0.0),
+            "snr_max": float(row.get("snr_max", 0.0) or 0.0),
+            "diffusion_loss_weight_t_raw_max": float(row.get("diffusion_loss_weight_t_raw_max", 0.0) or 0.0),
+            "diffusion_loss_weight_t_safe_max": float(row.get("diffusion_loss_weight_t_safe_max", 0.0) or 0.0),
+            "diffusion_loss_weight_t_max": float(row.get("diffusion_loss_weight_t_max", 0.0) or 0.0),
+            "candidate_competition_weight_mean": float(row.get("candidate_competition_weight_mean", 1.0) or 0.0),
+            "candidate_competition_weight_min": float(row.get("candidate_competition_weight_min", 1.0) or 0.0),
+            "candidate_competition_weight_max": float(row.get("candidate_competition_weight_max", 1.0) or 0.0),
+            "regional_nonfinite_detected": float(row.get("regional_nonfinite_detected", 0.0) or 0.0),
+            "isfinite_pred_x0": float(row.get("isfinite_pred_x0", 1.0) or 0.0),
+            "isfinite_target_i": float(row.get("isfinite_target_i", 1.0) or 0.0),
+            "isfinite_R_i": float(row.get("isfinite_R_i", 1.0) or 0.0),
+            "isfinite_L_train_i": float(row.get("isfinite_L_train_i", 1.0) or 0.0),
+            "isfinite_L_train_i_safe": float(row.get("isfinite_L_train_i_safe", 1.0) or 0.0),
+            "isfinite_routing": float(row.get("isfinite_routing", 1.0) or 0.0),
+            "max_abs_pred_x0": float(row.get("max_abs_pred_x0", 0.0) or 0.0),
+            "max_abs_target_i": float(row.get("max_abs_target_i", 0.0) or 0.0),
+            "max_abs_pred_target_delta": float(row.get("max_abs_pred_target_delta", 0.0) or 0.0),
+            "max_abs_R_i": float(row.get("max_abs_R_i", 0.0) or 0.0),
+            "max_abs_L_train_i": float(row.get("max_abs_L_train_i", 0.0) or 0.0),
+            "max_abs_L_train_i_safe": float(row.get("max_abs_L_train_i_safe", 0.0) or 0.0),
+            "active_content_mask_mean": float(row.get("active_content_mask_mean", 0.0) or 0.0),
+            "active_content_mask_sum": float(row.get("active_content_mask_sum", 0.0) or 0.0),
+            "terrain_soft_mean": float(row.get("terrain_soft_mean", 0.0) or 0.0),
+            "terrain_soft_min": float(row.get("terrain_soft_min", 0.0) or 0.0),
+            "terrain_soft_max": float(row.get("terrain_soft_max", 0.0) or 0.0),
+            "active_content_fraction": float(row.get("active_content_fraction", 0.0) or 0.0),
+            "active_content_fraction_min": float(row.get("active_content_fraction_min", 0.0) or 0.0),
+            "active_content_fraction_max": float(row.get("active_content_fraction_max", 0.0) or 0.0),
+            "active_content_mask_fallback": float(row.get("active_content_mask_fallback", 0.0) or 0.0),
+            "active_content_fallback_count": float(row.get("active_content_fallback_count", 0.0) or 0.0),
+            "active_diffusion_mask_sum_min": float(row.get("active_diffusion_mask_sum_min", 0.0) or 0.0),
+            "active_content_mask_sum_min": float(row.get("active_content_mask_sum_min", 0.0) or 0.0),
+            "q_regret_loss": float(row.get("q_regret_loss", 0.0) or 0.0),
+            "q_regret_loss_weighted": float(row.get("q_regret_loss_weighted", 0.0) or 0.0),
+            "q_regret_active_pair_fraction": float(row.get("q_regret_active_pair_fraction", 0.0) or 0.0),
+            "q_regret_violation_mean": float(row.get("q_regret_violation_mean", 0.0) or 0.0),
+            "q_regret_violation_max": float(row.get("q_regret_violation_max", 0.0) or 0.0),
+            "phase": float(row.get("phase", 1.0) or 1.0),
+            "rho_q_route": float(row.get("rho_q_route", 0.0) or 0.0),
+            "q_route_u": float(row.get("q_route_u", 0.0) or 0.0),
+            "gamma_boot": float(row.get("gamma_boot", 0.0) or 0.0),
+            "aux_ramp": float(row.get("aux_ramp", 0.0) or 0.0),
+            "aux_strength": float(row.get("aux_strength", 0.0) or 0.0),
+            "lambda_q_regret_current": float(row.get("lambda_q_regret_current", 0.0) or 0.0),
+            "lambda_bind_current": float(row.get("lambda_bind_current", row.get("effective_bind_weight", 0.0)) or 0.0),
+            "q_regret_weight_current": float(row.get("q_regret_weight_current", row.get("lambda_q_regret_current", 0.0)) or 0.0),
+            "bind_weight_current": float(row.get("bind_weight_current", row.get("lambda_bind_current", row.get("effective_bind_weight", 0.0))) or 0.0),
+            "combined_aux_regional_ratio": float(row.get("combined_aux_regional_ratio", 0.0) or 0.0),
+            "regional_loss_slope": float(row.get("regional_loss_slope", 0.0) or 0.0),
+            "regional_loss_slope_raw_ema": float(row.get("regional_loss_slope_raw_ema", 0.0) or 0.0),
+            "regional_loss_log_slope_raw": float(row.get("regional_loss_log_slope_raw", 0.0) or 0.0),
+            "regional_loss_log_slope_clipped": float(row.get("regional_loss_log_slope_clipped", 0.0) or 0.0),
+            "regional_loss_ema_raw": float(row.get("regional_loss_ema_raw", 0.0) or 0.0),
+            "regional_diff_loss_100step_ema": float(row.get("regional_diff_loss_100step_ema", 0.0) or 0.0),
+            "guardrail_triggered": float(row.get("guardrail_triggered", 0.0) or 0.0),
+            "guardrail_reason": str(row.get("guardrail_reason", "") or ""),
+            "phase15_ready_streak": float(row.get("phase15_ready_streak", 0.0) or 0.0),
+            "q_regret_ratio": float(row.get("q_regret_ratio", 0.0) or 0.0),
+            "bind_ratio": float(row.get("bind_ratio", 0.0) or 0.0),
+            "hard_band_ratio": float(row.get("hard_band_ratio", 0.0) or 0.0),
+            "alpha_ratio": float(row.get("alpha_ratio", 0.0) or 0.0),
+            "rgb_aux_ratio": float(row.get("rgb_aux_ratio", 0.0) or 0.0),
+            "lambda_q_mix": float(row.get("lambda_q_mix", row.get("q_mix_weight", 0.0)) or 0.0),
+            "q_mix_schedule_step": float(row.get("q_mix_schedule_step", 0.0) or 0.0),
+            "q_mix_weight": float(row.get("q_mix_weight", 0.0) or 0.0),
+            "q_mix_added_mass": float(row.get("q_mix_added_mass", 0.0) or 0.0),
+            "q_entropy_mean": float(row.get("q_entropy_mean", 0.0) or 0.0),
+            "q_entropy_normalized": float(row.get("q_entropy_normalized", 0.0) or 0.0),
+            "q_boot_entropy_mean": float(row.get("q_boot_entropy_mean", 0.0) or 0.0),
+            "q_boot_entropy_normalized": float(row.get("q_boot_entropy_normalized", 0.0) or 0.0),
+            "q_boot_usage": float(row.get("q_boot_usage", 0.0) or 0.0),
+            "routing_entropy_mean": float(row.get("routing_entropy_mean", 0.0) or 0.0),
+            "routing_entropy_normalized": float(row.get("routing_entropy_normalized", 0.0) or 0.0),
+            "routing_gate_l1_mean": float(row.get("routing_gate_l1_mean", 0.0) or 0.0),
+            "routing_q_l1_mean": float(row.get("routing_q_l1_mean", 0.0) or 0.0),
+            "routing_mass_mean": float(row.get("routing_mass_mean", 0.0) or 0.0),
+            "routing_mass_abs_error": float(row.get("routing_mass_abs_error", 0.0) or 0.0),
+            "rgb_aux_loss": float(row.get("rgb_aux_loss", 0.0) or 0.0),
+            "rgb_aux_loss_weighted": float(row.get("rgb_aux_loss_weighted", 0.0) or 0.0),
+            "halo_inner_rgb_loss": float(row.get("halo_inner_weighted_contribution", row.get("seam_rgb_halo_inner_loss_weighted", row.get("halo_inner_rgb_loss", 0.0))) or 0.0),
+            "halo_outer_rgb_loss": float(row.get("halo_outer_weighted_contribution", row.get("seam_rgb_halo_outer_loss_weighted", row.get("halo_outer_rgb_loss", 0.0))) or 0.0),
+            "seam_continuation_rgb_loss_raw": float(row.get("seam_continuation_rgb_loss_raw", 0.0) or 0.0),
+            "seam_rgb_continuation_weighted_loss": float(row.get("seam_rgb_continuation_weighted_loss", 0.0) or 0.0),
+            "seam_continuation_weight_sum": float(row.get("seam_continuation_weight_sum", 0.0) or 0.0),
+            "seam_continuation_distance_band_px_count": float(row.get("seam_continuation_distance_band_px_count", 0.0) or 0.0),
+            "seam_valid_edges_for_loss_count": float(row.get("seam_valid_edges_for_loss_count", 0.0) or 0.0),
+            "seam_valid_edge_ratio": float(row.get("seam_valid_edge_ratio", 0.0) or 0.0),
+            "halo_without_continuation_count_after_gate": float(row.get("halo_without_continuation_count_after_gate", 0.0) or 0.0),
+            "seam_rgb_total_loss_weighted": float(row.get("seam_rgb_total_loss_weighted", 0.0) or 0.0),
+            "seam_rgb_total_ratio": float(row.get("seam_rgb_total_ratio", 0.0) or 0.0),
+            "halo_inner_rgb_ratio": float(row.get("halo_inner_rgb_ratio", 0.0) or 0.0),
+            "halo_outer_rgb_ratio": float(row.get("halo_outer_rgb_ratio", 0.0) or 0.0),
+            "seam_loss_contribution_ratio": float(row.get("seam_loss_contribution_ratio", 0.0) or 0.0),
+            "hard_band_gradient_loss": float(row.get("hard_band_gradient_loss", 0.0) or 0.0),
+            "hard_band_gradient_loss_weighted": float(row.get("hard_band_gradient_loss_weighted", 0.0) or 0.0),
+            "hard_band_current_scale": float(row.get("hard_band_current_scale", 0.0) or 0.0),
+            "hard_band_weight_current": float(row.get("hard_band_weight_current", 0.0) or 0.0),
+            "alpha_loss": float(row.get("alpha_total_loss", row.get("alpha_loss", 0.0)) or 0.0),
+            "alpha_loss_weighted": float(row.get("alpha_total_loss", row.get("alpha_loss_weighted", 0.0)) or 0.0),
+            "bind_loss": float(row.get("bind_loss", 0.0) or 0.0),
+            "bind_loss_weighted": float(row.get("bind_loss_weighted", 0.0) or 0.0),
+            "bind_ranking_gap": float(row.get("bind_ranking_gap", 0.0) or 0.0),
+            "effective_bind_weight": float(row.get("effective_bind_weight", 0.0) or 0.0),
+            "gate_entropy_mean": float(row.get("gate_entropy_mean", 0.0) or 0.0),
+            "gate_entropy_normalized": float(row.get("gate_entropy_normalized", 0.0) or 0.0),
+            "gate_score_gap_mean": float(row.get("gate_score_gap_mean", 0.0) or 0.0),
+            "gate_smoothness": float(row.get("gate_smoothness", 0.0) or 0.0),
+            "q_winner_alignment": float(row.get("q_winner_alignment", 0.0) or 0.0),
+            "q_mass_interior": float(row.get("q_mass_interior", 0.0) or 0.0),
+            "q_mass_north": float(row.get("q_mass_north", 0.0) or 0.0),
+            "q_mass_south": float(row.get("q_mass_south", 0.0) or 0.0),
+            "q_mass_east": float(row.get("q_mass_east", 0.0) or 0.0),
+            "q_mass_west": float(row.get("q_mass_west", 0.0) or 0.0),
+            "gate_share_interior": float(row.get("gate_share_interior", 0.0) or 0.0),
+            "gate_share_north": float(row.get("gate_share_north", 0.0) or 0.0),
+            "gate_share_south": float(row.get("gate_share_south", 0.0) or 0.0),
+            "gate_share_east": float(row.get("gate_share_east", 0.0) or 0.0),
+            "gate_share_west": float(row.get("gate_share_west", 0.0) or 0.0),
+            "routing_share_interior": float(row.get("routing_share_interior", 0.0) or 0.0),
+            "routing_share_north": float(row.get("routing_share_north", 0.0) or 0.0),
+            "routing_share_south": float(row.get("routing_share_south", 0.0) or 0.0),
+            "routing_share_east": float(row.get("routing_share_east", 0.0) or 0.0),
+            "routing_share_west": float(row.get("routing_share_west", 0.0) or 0.0),
+            "gate_q_ratio_interior": float(row.get("gate_q_ratio_interior", 0.0) or 0.0),
+            "gate_q_ratio_north": float(row.get("gate_q_ratio_north", 0.0) or 0.0),
+            "gate_q_ratio_south": float(row.get("gate_q_ratio_south", 0.0) or 0.0),
+            "gate_q_ratio_east": float(row.get("gate_q_ratio_east", 0.0) or 0.0),
+            "gate_q_ratio_west": float(row.get("gate_q_ratio_west", 0.0) or 0.0),
+            "q_band_gate_interior": float(row.get("q_band_gate_interior", 0.0) or 0.0),
+            "q_band_gate_north": float(row.get("q_band_gate_north", 0.0) or 0.0),
+            "q_band_gate_south": float(row.get("q_band_gate_south", 0.0) or 0.0),
+            "q_band_gate_east": float(row.get("q_band_gate_east", 0.0) or 0.0),
+            "q_band_gate_west": float(row.get("q_band_gate_west", 0.0) or 0.0),
+            "q_gate_corr_interior": float(row.get("q_gate_corr_interior", 0.0) or 0.0),
+            "q_gate_corr_north": float(row.get("q_gate_corr_north", 0.0) or 0.0),
+            "q_gate_corr_south": float(row.get("q_gate_corr_south", 0.0) or 0.0),
+            "q_gate_corr_east": float(row.get("q_gate_corr_east", 0.0) or 0.0),
+            "q_gate_corr_west": float(row.get("q_gate_corr_west", 0.0) or 0.0),
+            "q_routing_corr_interior": float(row.get("q_routing_corr_interior", 0.0) or 0.0),
+            "q_routing_corr_north": float(row.get("q_routing_corr_north", 0.0) or 0.0),
+            "q_routing_corr_south": float(row.get("q_routing_corr_south", 0.0) or 0.0),
+            "q_routing_corr_east": float(row.get("q_routing_corr_east", 0.0) or 0.0),
+            "q_routing_corr_west": float(row.get("q_routing_corr_west", 0.0) or 0.0),
+            "r_mean_interior": float(row.get("r_mean_interior", 0.0) or 0.0),
+            "r_mean_north": float(row.get("r_mean_north", 0.0) or 0.0),
+            "r_mean_south": float(row.get("r_mean_south", 0.0) or 0.0),
+            "r_mean_east": float(row.get("r_mean_east", 0.0) or 0.0),
+            "r_mean_west": float(row.get("r_mean_west", 0.0) or 0.0),
+            "r_high_q_interior": float(row.get("r_high_q_interior", 0.0) or 0.0),
+            "r_high_q_north": float(row.get("r_high_q_north", 0.0) or 0.0),
+            "r_high_q_south": float(row.get("r_high_q_south", 0.0) or 0.0),
+            "r_high_q_east": float(row.get("r_high_q_east", 0.0) or 0.0),
+            "r_high_q_west": float(row.get("r_high_q_west", 0.0) or 0.0),
+            "r_low_q_interior": float(row.get("r_low_q_interior", 0.0) or 0.0),
+            "r_low_q_north": float(row.get("r_low_q_north", 0.0) or 0.0),
+            "r_low_q_south": float(row.get("r_low_q_south", 0.0) or 0.0),
+            "r_low_q_east": float(row.get("r_low_q_east", 0.0) or 0.0),
+            "r_low_q_west": float(row.get("r_low_q_west", 0.0) or 0.0),
+            "specialization_advantage_interior": float(row.get("specialization_advantage_interior", 0.0) or 0.0),
+            "specialization_advantage_north": float(row.get("specialization_advantage_north", 0.0) or 0.0),
+            "specialization_advantage_south": float(row.get("specialization_advantage_south", 0.0) or 0.0),
+            "specialization_advantage_east": float(row.get("specialization_advantage_east", 0.0) or 0.0),
+            "specialization_advantage_west": float(row.get("specialization_advantage_west", 0.0) or 0.0),
+            "R_self_interior": float(row.get("R_self_interior", 0.0) or 0.0),
+            "R_self_north": float(row.get("R_self_north", 0.0) or 0.0),
+            "R_self_south": float(row.get("R_self_south", 0.0) or 0.0),
+            "R_self_east": float(row.get("R_self_east", 0.0) or 0.0),
+            "R_self_west": float(row.get("R_self_west", 0.0) or 0.0),
+            "R_comp_interior": float(row.get("R_comp_interior", 0.0) or 0.0),
+            "R_comp_north": float(row.get("R_comp_north", 0.0) or 0.0),
+            "R_comp_south": float(row.get("R_comp_south", 0.0) or 0.0),
+            "R_comp_east": float(row.get("R_comp_east", 0.0) or 0.0),
+            "R_comp_west": float(row.get("R_comp_west", 0.0) or 0.0),
+            "in_region_advantage_interior": float(row.get("in_region_advantage_interior", 0.0) or 0.0),
+            "in_region_advantage_north": float(row.get("in_region_advantage_north", 0.0) or 0.0),
+            "in_region_advantage_south": float(row.get("in_region_advantage_south", 0.0) or 0.0),
+            "in_region_advantage_east": float(row.get("in_region_advantage_east", 0.0) or 0.0),
+            "in_region_advantage_west": float(row.get("in_region_advantage_west", 0.0) or 0.0),
+            "min_in_region_advantage": float(row.get("min_in_region_advantage", 0.0) or 0.0),
+            "mean_in_region_advantage": float(row.get("mean_in_region_advantage", 0.0) or 0.0),
+            "winner_share_interior": float(row.get("winner_share_interior", 0.0) or 0.0),
+            "winner_share_north": float(row.get("winner_share_north", 0.0) or 0.0),
+            "winner_share_south": float(row.get("winner_share_south", 0.0) or 0.0),
+            "winner_share_east": float(row.get("winner_share_east", 0.0) or 0.0),
+            "winner_share_west": float(row.get("winner_share_west", 0.0) or 0.0),
+            "winner_hard_region_share_interior": float(row.get("winner_hard_region_share_interior", 0.0) or 0.0),
+            "winner_hard_band_share_north": float(row.get("winner_hard_band_share_north", 0.0) or 0.0),
+            "winner_hard_band_share_south": float(row.get("winner_hard_band_share_south", 0.0) or 0.0),
+            "winner_hard_band_share_east": float(row.get("winner_hard_band_share_east", 0.0) or 0.0),
+            "winner_hard_band_share_west": float(row.get("winner_hard_band_share_west", 0.0) or 0.0),
+            "phase1_exit_ready": float(row.get("phase1_exit_ready", 0.0) or 0.0),
+            "phase1_exit_block_reason": str(row.get("phase1_exit_block_reason", "") or ""),
+            "tau_current": float(row.get("tau_current", 0.0) or 0.0),
+            "gamma_current": float(row.get("gamma_current", 0.0) or 0.0),
+        }
+        return {field: regional_row.get(field, row.get(field, 0.0)) for field in REGIONAL_LOSS_TRACE_FIELDS}
 
     continuation_px = _compact_edge_metric_sum(
         row,
@@ -1408,6 +3098,10 @@ def parse_verification_config(config: Dict[str, object]) -> Dict[str, object]:
         "train_expanded_halo_px": int(verification.get("train_expanded_halo_px", 0)),
         "save_seam_visual_debug": bool(verification.get("save_seam_visual_debug", False)),
         "seam_visual_debug_max_steps": int(verification.get("seam_visual_debug_max_steps", 2)),
+        "seam_visual_debug_every_n_steps": int(verification.get("seam_visual_debug_every_n_steps", 25)),
+        "save_regional_visual_debug": bool(verification.get("save_regional_visual_debug", verification.get("save_seam_visual_debug", False))),
+        "regional_visual_debug_max_steps": int(verification.get("regional_visual_debug_max_steps", verification.get("seam_visual_debug_max_steps", 2))),
+        "regional_visual_debug_every_n_steps": int(verification.get("regional_visual_debug_every_n_steps", verification.get("seam_visual_debug_every_n_steps", 25))),
         "loss_trace_mode": _normalize_loss_trace_mode(verification.get("loss_trace_mode", "full")),
     }
 
@@ -1622,6 +3316,7 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
     )
     interior_core_rgb_weight = _get_float(["interior_core_rgb_weight", "interior_core_weight", "interior_band_outer_weight"], 0.10)
     continuation_gradient_loss_weight = _get_float(["continuation_gradient_loss_weight"], 0.25)
+    hard_band_gradient_loss_weight = _get_float(["hard_band_gradient_loss_weight"], 0.0)
     continuation_gradient_loss_weight_schedule = _parse_step_value_schedule(
         seam.get("continuation_gradient_loss_weight_schedule"),
         "seam.continuation_gradient_loss_weight_schedule",
@@ -1701,6 +3396,7 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "continuation_tail_power": float(seam.get("continuation_tail_power", 1.5)),
         "interior_core_rgb_weight": interior_core_rgb_weight,
         "continuation_gradient_loss_weight": continuation_gradient_loss_weight,
+        "hard_band_gradient_loss_weight": hard_band_gradient_loss_weight,
         "continuation_gradient_loss_weight_schedule": continuation_gradient_loss_weight_schedule,
         "continuation_falloff_power": continuation_falloff_power,
         "continuation_rgb_weight_mode": continuation_rgb_weight_mode,
@@ -1735,6 +3431,331 @@ def parse_seam_config(config: Dict[str, object]) -> Dict[str, object]:
         "seam_adapter_inputs": seam_adapter_inputs,
         "seam_adapter_conditioning_offset": -1,
     }
+
+
+def parse_regional_loss_config(config: Dict[str, object]) -> Dict[str, object]:
+    """Parse [regional_loss] TOML section. Defaults match plan v1."""
+    raw = dict(config.get("regional_loss", {}) or {})
+    default_kernel_lat = int(raw.get("kernel_lat", max(1, int(round(float(raw.get("kernel_train_px", 64)) / 8.0)))))
+    out: Dict[str, object] = {
+        "enabled": bool(raw.get("enabled", False)),
+        "regional_diff_loss_weight": float(raw.get("regional_diff_loss_weight", 1.0)),
+        "kernel_train_px": int(raw.get("kernel_train_px", 64)),
+        "stride_train_px": int(raw.get("stride_train_px", 12)),
+        "kernel_lat": default_kernel_lat,
+        "stride_lat": int(raw.get("stride_lat", max(1, int(round(float(raw.get("stride_train_px", 12)) / 8.0))))),
+        "tau_start": float(raw.get("tau_start", 0.35)),
+        "tau_end": float(raw.get("tau_end", 0.20)),
+        "tau_anneal_steps": int(raw.get("tau_anneal_steps", 200)),
+        "behavior_hold_step": int(raw.get("behavior_hold_step", raw.get("tau_anneal_steps", 200))),
+        "gamma": float(raw.get("gamma", 1.0)),
+        "beta": float(raw.get("beta", 0.20)),
+        "score_normalize": bool(raw.get("score_normalize", True)),
+        "score_norm_eps": float(raw.get("score_norm_eps", 1e-4)),
+        "score_clamp_abs": float(raw.get("score_clamp_abs", 5.0)),
+        "gate_blur_sigma_pooled": float(raw.get("gate_blur_sigma_pooled", float(default_kernel_lat) / 4.0)),
+        "edge_plateau_px": float(raw.get("edge_plateau_px", 16.0)),
+        "edge_radius_fraction": float(raw.get("edge_radius_fraction", 0.75)),
+        "edge_sigma_fraction": float(raw.get("edge_sigma_fraction", 0.35)),
+        "q_edge_sigma_px": float(raw.get("q_edge_sigma_px", raw.get("q_edge_sigma", 180.0))),
+        "q_interior_sigma_px": float(raw.get("q_interior_sigma_px", raw.get("q_edge_sigma_px", raw.get("q_edge_sigma", 180.0)))),
+        "q_edge_radius_px": float(raw.get("q_edge_radius_px", 0.0)),
+        "normalize_q": bool(raw.get("normalize_q", raw.get("q_normalize", True))),
+        "q_floor": 0.0,
+        "q_regret_loss_weight": float(raw.get("q_regret_loss_weight", raw.get("lambda_q_regret", 0.03))),
+        "q_regret_q_tol": float(raw.get("q_regret_q_tol", 0.05)),
+        "q_regret_alpha": float(raw.get("q_regret_alpha", 0.50)),
+        "q_regret_power": float(raw.get("q_regret_power", 1.0)),
+        "q_regret_beta_q": float(raw.get("q_regret_beta_q", raw.get("beta", 0.20))),
+        "q_regret_huber_delta": float(raw.get("q_regret_huber_delta", 1.0)),
+        "q_mix_weight": float(raw.get("q_mix_weight", raw.get("lambda_q_mix", 0.0))),
+        "lambda_q_mix_start": float(raw.get("lambda_q_mix_start", raw.get("q_mix_start", 0.0))),
+        "lambda_q_mix_end": float(raw.get("lambda_q_mix_end", raw.get("q_mix_end", 0.0))),
+        "q_mix_hold_steps": int(raw.get("q_mix_hold_steps", 0)),
+        "q_mix_decay_steps": int(raw.get("q_mix_decay_steps", 0)),
+        "gamma_route": float(raw.get("gamma_route", raw.get("gamma_boot", 3.0))),
+        "gamma_boot": float(raw.get("gamma_boot", raw.get("gamma_route", 3.0))),
+        "q_confidence_threshold": float(raw.get("q_confidence_threshold", 0.20)),
+        "q_confidence_mask_q_regret": bool(raw.get("q_confidence_mask_q_regret", True)),
+        "q_confidence_mask_bind": bool(raw.get("q_confidence_mask_bind", True)),
+        "q_confidence_mask_phase_diagnostics": bool(raw.get("q_confidence_mask_phase_diagnostics", True)),
+        "q_route_hold_steps": int(raw.get("q_route_hold_steps", 1000)),
+        "q_route_decay_steps": int(raw.get("q_route_decay_steps", 3000)),
+        "rho_q_floor": float(raw.get("rho_q_floor", 0.05)),
+        "q_route_dynamic_enabled": bool(raw.get("q_route_dynamic_enabled", True)),
+        "q_route_initial_phase": float(raw.get("q_route_initial_phase", 1.0)),
+        "q_route_initial_rho": float(raw.get("q_route_initial_rho", 1.0)),
+        "q_route_metric_ema_window": int(raw.get("q_route_metric_ema_window", 100)),
+        "phase1_min_steps": int(raw.get("phase1_min_steps", 1000)),
+        "phase1_peak_stall_exit_enabled": bool(raw.get("phase1_peak_stall_exit_enabled", True)),
+        "phase1_peak_stall_mean_adv_min": float(raw.get("phase1_peak_stall_mean_adv_min", 0.008)),
+        "phase1_peak_stall_peak_fraction": float(raw.get("phase1_peak_stall_peak_fraction", 0.70)),
+        "phase1_peak_stall_entropy_sharpening_min": float(raw.get("phase1_peak_stall_entropy_sharpening_min", 0.45)),
+        "phase15_rho_start": float(raw.get("phase15_rho_start", 0.80)),
+        "phase15_rho_end": float(raw.get("phase15_rho_end", 0.50)),
+        "phase15_handoff_steps": int(raw.get("phase15_handoff_steps", 800)),
+        "phase15_q_regret_scale_start": float(raw.get("phase15_q_regret_scale_start", 0.20)),
+        "phase15_q_regret_scale_end": float(raw.get("phase15_q_regret_scale_end", 0.50)),
+        "phase15_bind_scale_start": float(raw.get("phase15_bind_scale_start", 0.15)),
+        "phase15_bind_scale_end": float(raw.get("phase15_bind_scale_end", 0.40)),
+        "phase15_continuation_aux_ramp_steps": int(raw.get("phase15_continuation_aux_ramp_steps", 100)),
+        "phase15_q_regret_resume_multiplier_start": float(raw.get("phase15_q_regret_resume_multiplier_start", 1.0)),
+        "phase15_q_regret_resume_multiplier_end": float(raw.get("phase15_q_regret_resume_multiplier_end", 1.0)),
+        "phase15_bind_resume_multiplier_start": float(raw.get("phase15_bind_resume_multiplier_start", 1.0)),
+        "phase15_bind_resume_multiplier_end": float(raw.get("phase15_bind_resume_multiplier_end", 1.0)),
+        "phase15_hard_band_scale": float(raw.get("phase15_hard_band_scale", 1.0)),
+        "phase15_guardrail_freeze_steps": int(raw.get("phase15_guardrail_freeze_steps", 150)),
+        "phase15_mean_adv_drop_fraction": float(raw.get("phase15_mean_adv_drop_fraction", 0.70)),
+        "phase15_min_adv_worsen_abs": float(raw.get("phase15_min_adv_worsen_abs", 0.02)),
+        "phase15_winner_share_max": float(raw.get("phase15_winner_share_max", 0.60)),
+        "phase15_gate_entropy_min": float(raw.get("phase15_gate_entropy_min", 0.20)),
+        "phase15_recovery_guardrail_streak": int(raw.get("phase15_recovery_guardrail_streak", 2)),
+        "phase15_recovery_rho_step": float(raw.get("phase15_recovery_rho_step", 0.05)),
+        "phase15_recovery_rho_cap": float(raw.get("phase15_recovery_rho_cap", 0.85)),
+        "phase15_allow_phase2_transition": bool(raw.get("phase15_allow_phase2_transition", True)),
+        "phase15_patience_steps": int(raw.get("phase15_patience_steps", 200)),
+        "phase15_success_mean_adv_min": float(raw.get("phase15_success_mean_adv_min", 0.006)),
+        "phase15_success_min_adv_min": float(raw.get("phase15_success_min_adv_min", -0.05)),
+        "phase15_success_min_adv_slack": float(raw.get("phase15_success_min_adv_slack", 0.01)),
+        "phase15_success_q_winner_alignment_min": float(raw.get("phase15_success_q_winner_alignment_min", 0.20)),
+        "phase15_success_q_gate_corr_mean_min": float(raw.get("phase15_success_q_gate_corr_mean_min", 0.02)),
+        "phase15_success_q_routing_corr_min": float(raw.get("phase15_success_q_routing_corr_min", 0.70)),
+        "phase15_success_q_routing_corr_mean_min": float(raw.get("phase15_success_q_routing_corr_mean_min", 0.05)),
+        "phase15_success_entropy_sharpening_min": float(raw.get("phase15_success_entropy_sharpening_min", 0.0)),
+        "phase15_success_winner_share_max": float(raw.get("phase15_success_winner_share_max", 0.45)),
+        "phase15_success_gate_entropy_min": float(raw.get("phase15_success_gate_entropy_min", 0.20)),
+        "phase15_success_gate_entropy_max": float(raw.get("phase15_success_gate_entropy_max", 0.50)),
+        "phase2_min_steps": int(raw.get("phase2_min_steps", 500)),
+        "phase2_decay_steps": int(raw.get("phase2_decay_steps", raw.get("q_route_decay_steps", 3000))),
+        "phase2_rho_start": float(raw.get("phase2_rho_start", 0.50)),
+        "phase2_q_regret_scale_start": float(raw.get("phase2_q_regret_scale_start", 0.50)),
+        "phase2_q_regret_scale_end": float(raw.get("phase2_q_regret_scale_end", 0.85)),
+        "phase2_bind_scale_start": float(raw.get("phase2_bind_scale_start", 0.40)),
+        "phase2_bind_scale_end": float(raw.get("phase2_bind_scale_end", 0.65)),
+        "q_route_patience_steps": int(raw.get("q_route_patience_steps", 100)),
+        "rho_update_interval": int(raw.get("rho_update_interval", 50)),
+        "rho_decay_step": float(raw.get("rho_decay_step", 0.025)),
+        "rho_recovery_step": float(raw.get("rho_recovery_step", 0.01)),
+        "q_high_threshold": float(raw.get("q_high_threshold", 0.35)),
+        "q_low_threshold": float(raw.get("q_low_threshold", 0.15)),
+        "adv_min_ratio": float(raw.get("adv_min_ratio", raw.get("spec_adv_min_ratio", 0.01))),
+        "adv_mean_min_ratio": float(raw.get("adv_mean_min_ratio", raw.get("spec_adv_mean_ratio", 0.03))),
+        "spec_adv_min_ratio": float(raw.get("spec_adv_min_ratio", raw.get("adv_min_ratio", 0.01))),
+        "spec_adv_mean_ratio": float(raw.get("spec_adv_mean_ratio", raw.get("adv_mean_min_ratio", 0.03))),
+        "small_positive_threshold_ratio": float(raw.get("small_positive_threshold_ratio", 0.01)),
+        "phase2_allowed_loss_increase_ratio": float(raw.get("phase2_allowed_loss_increase_ratio", 0.02)),
+        "loss_spike_ratio": float(raw.get("loss_spike_ratio", 2.0)),
+        "loss_spike_freeze_steps": int(raw.get("loss_spike_freeze_steps", 200)),
+        "phase2_gate_corr_mean_min": float(raw.get("phase2_gate_corr_mean_min", 0.30)),
+        "phase2_gate_corr_min": float(raw.get("phase2_gate_corr_min", 0.10)),
+        "phase2_winner_alignment_min": float(raw.get("phase2_winner_alignment_min", 0.45)),
+        "phase3_gate_corr_mean_min": float(raw.get("phase3_gate_corr_mean_min", 0.20)),
+        "phase3_winner_alignment_min": float(raw.get("phase3_winner_alignment_min", 0.35)),
+        "phase3_winner_share_collapse_max": float(raw.get("phase3_winner_share_collapse_max", 0.60)),
+        "phase3_recovery_rho_bump": float(raw.get("phase3_recovery_rho_bump", 0.20)),
+        "phase3_recovery_rho_cap": float(raw.get("phase3_recovery_rho_cap", 0.50)),
+        "resume_regional_loss_guard_enabled": bool(raw.get("resume_regional_loss_guard_enabled", False)),
+        "resume_guard_regional_loss_baseline": float(raw.get("resume_guard_regional_loss_baseline", 0.0)),
+        "resume_guard_regional_loss_threshold_ratio": float(raw.get("resume_guard_regional_loss_threshold_ratio", 1.25)),
+        "resume_guard_window_steps": int(raw.get("resume_guard_window_steps", 20)),
+        "resume_guard_min_history_steps": int(raw.get("resume_guard_min_history_steps", 20)),
+        "resume_guard_steps": int(raw.get("resume_guard_steps", 200)),
+        "resume_guard_bad_streak_steps": int(raw.get("resume_guard_bad_streak_steps", 45)),
+        "resume_guard_positive_slope_threshold": float(raw.get("resume_guard_positive_slope_threshold", raw.get("small_positive_threshold_ratio", 0.01))),
+        "regional_loss_raw_ema_reset_ratio": float(raw.get("regional_loss_raw_ema_reset_ratio", 1000.0)),
+        "phase3_recovery_aux_scale": float(raw.get("phase3_recovery_aux_scale", 0.50)),
+        "q_regret_phase3_scale": float(raw.get("q_regret_phase3_scale", 0.60)),
+        "rgb_aux_loss_weight": float(raw.get("rgb_aux_loss_weight", 0.01)),
+        "rgb_aux_confidence_weighted": bool(raw.get("rgb_aux_confidence_weighted", True)),
+        "rgb_aux_decode_scale": float(raw.get("rgb_aux_decode_scale", 0.25)),
+        "terrain_loss_mask_enabled": bool(raw.get("terrain_loss_mask_enabled", True)),
+        "terrain_alpha_threshold": float(raw.get("terrain_alpha_threshold", 0.05)),
+        "terrain_dilate_px": int(raw.get("terrain_dilate_px", 6)),
+        "terrain_blur_sigma": float(raw.get("terrain_blur_sigma", 3.0)),
+        "terrain_boundary_radius_px": int(raw.get("terrain_boundary_radius_px", 6)),
+        "seam_band_weight": float(raw.get("seam_band_weight", 1.0)),
+        "min_active_content_fraction": float(raw.get("min_active_content_fraction", 0.05)),
+        "min_terrain_soft_sum": float(raw.get("min_terrain_soft_sum", 1.0)),
+        "target_eps_sigma_floor": float(raw.get("target_eps_sigma_floor", 0.05)),
+        "robust_diffusion_loss_enabled": bool(raw.get("robust_diffusion_loss_enabled", True)),
+        "safe_pixel_loss_cap": float(raw.get("safe_pixel_loss_cap", 4.0)),
+        "regional_loss_sigma_ref": float(raw.get("regional_loss_sigma_ref", 0.20)),
+        "regional_loss_sigma_weight_power": float(raw.get("regional_loss_sigma_weight_power", 4.0)),
+        "regional_loss_sigma_weight_min": float(raw.get("regional_loss_sigma_weight_min", 0.02)),
+        "regional_competition_skip_sigma_threshold": float(raw.get("regional_competition_skip_sigma_threshold", 0.0)),
+        "regional_competition_skip_snr_threshold": float(raw.get("regional_competition_skip_snr_threshold", 0.0)),
+        "candidate_competition_sigma_ref": float(raw.get("candidate_competition_sigma_ref", 0.20)),
+        "candidate_competition_power": float(raw.get("candidate_competition_power", 2.0)),
+        "candidate_competition_min_weight": float(raw.get("candidate_competition_min_weight", 0.10)),
+        "regional_base_ownership_initial_weight": float(raw.get("regional_base_ownership_initial_weight", 1.0)),
+        "regional_base_ownership_target_weight": float(raw.get("regional_base_ownership_target_weight", 1.0)),
+        "regional_base_ownership_ramp_steps": int(raw.get("regional_base_ownership_ramp_steps", 0)),
+        "regional_competitive_surplus_initial_weight": float(raw.get("regional_competitive_surplus_initial_weight", 1.0)),
+        "regional_competitive_surplus_target_weight": float(raw.get("regional_competitive_surplus_target_weight", 1.0)),
+        "regional_competitive_surplus_ramp_steps": int(raw.get("regional_competitive_surplus_ramp_steps", 0)),
+        "regional_routing_protected_warmup_enabled": bool(raw.get("regional_routing_protected_warmup_enabled", False)),
+        "regional_routing_protected_warmup_steps": int(raw.get("regional_routing_protected_warmup_steps", 0)),
+        "regional_freeze_gate_routing_head_during_warmup": bool(raw.get("regional_freeze_gate_routing_head_during_warmup", False)),
+        "regional_detach_routing_from_regional_loss_during_warmup": bool(raw.get("regional_detach_routing_from_regional_loss_during_warmup", False)),
+        "teacher_preservation_enabled": bool(raw.get("teacher_preservation_enabled", False)),
+        "teacher_preservation_ramp_down_steps": int(raw.get("teacher_preservation_ramp_down_steps", 0)),
+        "q_blend_diffusion_enabled": bool(raw.get("q_blend_diffusion_enabled", False)),
+        "q_blend_diffusion_weight": float(raw.get("q_blend_diffusion_weight", 0.0)),
+        "individual_regional_weight_initial": float(raw.get("individual_regional_weight_initial", 1.0)),
+        "individual_regional_weight_target": float(raw.get("individual_regional_weight_target", 1.0)),
+        "individual_regional_ramp_steps": int(raw.get("individual_regional_ramp_steps", 0)),
+        "competitive_regret_weight": float(raw.get("competitive_regret_weight", 0.0)),
+        "regional_use_fixed_q_route_for_ownership": bool(raw.get("regional_use_fixed_q_route_for_ownership", False)),
+        "regional_freeze_gate_routing_head": bool(raw.get("regional_freeze_gate_routing_head", False)),
+        "regional_detach_routing_from_regional_loss": bool(raw.get("regional_detach_routing_from_regional_loss", False)),
+        "seam_edge_support_min_fraction": float(raw.get("seam_edge_support_min_fraction", 0.03)),
+        "seam_halo_support_min_fraction": float(raw.get("seam_halo_support_min_fraction", 0.05)),
+        "seam_validity_use_expanded_region_terrain_mask": bool(raw.get("seam_validity_use_expanded_region_terrain_mask", True)),
+        "seam_validity_max_directional_seams": int(raw.get("seam_validity_max_directional_seams", 2)),
+        "seam_validity_over_max_policy": str(raw.get("seam_validity_over_max_policy", "fail_fast") or "fail_fast").strip().lower(),
+        "seam_validity_terrain_threshold": float(raw.get("seam_validity_terrain_threshold", 0.0)),
+        "competitive_gate_enabled": bool(raw.get("competitive_gate_enabled", True)),
+        "competitive_gate_beta": float(raw.get("competitive_gate_beta", 0.90)),
+        "competitive_gate_tolerance": float(raw.get("competitive_gate_tolerance", 0.005)),
+        "competitive_gate_scale": float(raw.get("competitive_gate_scale", 0.03)),
+        "competitive_gate_max_delta_per_step": float(raw.get("competitive_gate_max_delta_per_step", 0.05)),
+        "competitive_gate_min_region_support": float(raw.get("competitive_gate_min_region_support", 1.0)),
+        "competitive_gate_base_weight_floor": float(raw.get("competitive_gate_base_weight_floor", 0.70)),
+        "competitive_gate_competitor_mode": str(raw.get("competitive_gate_competitor_mode", "mean") or "mean").strip().lower(),
+        "competitive_catchup_enabled": bool(raw.get("competitive_catchup_enabled", True)),
+        "competitive_catchup_weight": float(raw.get("competitive_catchup_weight", 0.02)),
+        "competitive_catchup_margin": float(raw.get("competitive_catchup_margin", 0.0)),
+        "regional_loss_spike_median_window": int(raw.get("regional_loss_spike_median_window", 200)),
+        "regional_loss_spike_threshold_ratio": float(raw.get("regional_loss_spike_threshold_ratio", 10.0)),
+        "save_regional_spike_debug": bool(raw.get("save_regional_spike_debug", False)),
+        "regenerated_image_run_tag": str(raw.get("regenerated_image_run_tag", "")).strip(),
+        "regenerated_image_root": str(raw.get("regenerated_image_root", "")).strip(),
+        "encode_groups": int(raw.get("encode_groups", 1)),
+        "target_encode_vae_tiling": bool(raw.get("target_encode_vae_tiling", True)),
+        "target_encode_tile_sample_min_size": int(raw.get("target_encode_tile_sample_min_size", 512)),
+        "target_encode_tile_overlap_factor": float(raw.get("target_encode_tile_overlap_factor", 0.0)),
+        "audit_first_n": int(raw.get("audit_first_n", 8)),
+        "sampling_seed": int(raw.get("sampling_seed", 4242)),
+        # Binding section
+        "bind_loss_enabled": bool(raw.get("bind_loss_enabled", True)),
+        "bind_margin": float(raw.get("bind_margin", 0.02)),
+        "bind_preference_weight": float(raw.get("bind_preference_weight", 0.015)),
+        "bind_phase3_scale": float(raw.get("bind_phase3_scale", 0.60)),
+        "hard_band_phase1_scale": float(raw.get("hard_band_phase1_scale", 0.50)),
+        "hard_band_phase3_scale": float(raw.get("hard_band_phase3_scale", 1.00)),
+        "bind_activation_step": int(raw.get("bind_activation_step", 100)),
+        "bind_ramp_steps": int(raw.get("bind_ramp_steps", 30)),
+    }
+    if out["enabled"] and not out["regenerated_image_run_tag"]:
+        raise ValueError("[regional_loss].regenerated_image_run_tag is required when enabled=true")
+    return out
+
+
+def _compute_seam_candidate_validity(
+    *,
+    cand_active: torch.Tensor,
+    seam_interior_edge_band: Optional[torch.Tensor],
+    seam_halo_band: Optional[torch.Tensor],
+    expanded_region_terrain_mask: torch.Tensor,
+    regional_loss_config: Dict[str, object],
+    step_for_logging: int,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Build [B,5] candidate_valid from expanded terrain support over per-edge bands."""
+    if cand_active.dim() != 2 or cand_active.shape[1] < 5:
+        raise RuntimeError(f"candidate validity requires cand_active [B,5], got {tuple(cand_active.shape)}")
+    if seam_interior_edge_band is None or seam_halo_band is None:
+        raise RuntimeError("seam-valid regional training requires seam_interior_edge_band_per_edge and seam_halo_band_per_edge tensors")
+    B = cand_active.shape[0]
+    device = cand_active.device
+    dtype = cand_active.dtype
+    edge_min = float(regional_loss_config.get("seam_edge_support_min_fraction", 0.03))
+    halo_min = float(regional_loss_config.get("seam_halo_support_min_fraction", 0.05))
+    max_directional = int(regional_loss_config.get("seam_validity_max_directional_seams", 2))
+    over_max_policy = str(regional_loss_config.get("seam_validity_over_max_policy", "fail_fast") or "fail_fast").strip().lower()
+    terrain_threshold = float(regional_loss_config.get("seam_validity_terrain_threshold", 0.0))
+
+    edge_band = seam_interior_edge_band.to(device=device, dtype=dtype)
+    halo_band = seam_halo_band.to(device=device, dtype=dtype)
+    if edge_band.dim() == 5 and edge_band.shape[2] == 1:
+        edge_band = edge_band.squeeze(2)
+    if halo_band.dim() == 5 and halo_band.shape[2] == 1:
+        halo_band = halo_band.squeeze(2)
+    if edge_band.dim() != 4 or edge_band.shape[1] != 4:
+        raise RuntimeError(f"seam interior edge band must be [B,4,H,W], got {tuple(edge_band.shape)}")
+    if halo_band.dim() != 4 or halo_band.shape[1] != 4:
+        raise RuntimeError(f"seam halo band must be [B,4,H,W], got {tuple(halo_band.shape)}")
+    terrain_mask = expanded_region_terrain_mask.to(device=device, dtype=dtype)
+    if terrain_mask.dim() == 3:
+        terrain_mask = terrain_mask.unsqueeze(1)
+    if terrain_mask.dim() != 4 or terrain_mask.shape[1] != 1:
+        raise RuntimeError(f"expanded region terrain mask must be [B,1,H,W], got {tuple(terrain_mask.shape)}")
+    if terrain_mask.shape[-2:] != edge_band.shape[-2:]:
+        terrain_mask = F.interpolate(terrain_mask, size=edge_band.shape[-2:], mode="area")
+    if halo_band.shape[-2:] != edge_band.shape[-2:]:
+        halo_band = F.interpolate(halo_band, size=edge_band.shape[-2:], mode="area")
+    terrain_support = (terrain_mask > terrain_threshold).to(dtype=dtype)
+    edge_band = (edge_band > 0.0).to(dtype=dtype)
+    halo_band = (halo_band > 0.0).to(dtype=dtype)
+
+    edge_den_raw = edge_band.sum(dim=(-2, -1))
+    halo_den_raw = halo_band.sum(dim=(-2, -1))
+    edge_den = edge_den_raw.clamp_min(1e-6)
+    halo_den = halo_den_raw.clamp_min(1e-6)
+    edge_support_fraction = (terrain_support * edge_band).sum(dim=(-2, -1)) / edge_den
+    halo_support_fraction = (terrain_support * halo_band).sum(dim=(-2, -1)) / halo_den
+    edge_valid = edge_support_fraction >= edge_min
+    halo_valid = halo_support_fraction >= halo_min
+    directional_valid = (edge_valid & halo_valid).to(dtype=dtype) * cand_active[:, 1:5].clamp(0.0, 1.0)
+    validity_score = torch.minimum(
+        edge_support_fraction / max(edge_min, 1e-6),
+        halo_support_fraction / max(halo_min, 1e-6),
+    )
+    initial_num_valid = directional_valid.sum(dim=1)
+    top2_truncation = torch.zeros((B,), device=device, dtype=dtype)
+    if max_directional >= 0 and bool((initial_num_valid > max_directional).any().detach().item()):
+        if over_max_policy in {"top2", "top_2", "truncate", "truncate_top2"}:
+            keep_k = max(0, min(max_directional, 4))
+            keep = torch.zeros_like(directional_valid)
+            if keep_k > 0:
+                masked_score = torch.where(directional_valid > 0.0, validity_score, torch.full_like(validity_score, -1.0))
+                top_idx = torch.topk(masked_score, k=keep_k, dim=1).indices
+                keep.scatter_(1, top_idx, 1.0)
+                keep = keep * directional_valid
+            top2_truncation = (initial_num_valid > keep_k).to(dtype=dtype)
+            directional_valid = keep
+        else:
+            offending = torch.nonzero(initial_num_valid > max_directional, as_tuple=False).reshape(-1).detach().cpu().tolist()
+            raise RuntimeError(
+                "seam-validity over-max violation: "
+                f"step={step_for_logging} max_directional={max_directional} offending_batch_indices={offending} "
+                f"num_valid={initial_num_valid.detach().cpu().tolist()} "
+                f"edge_support={edge_support_fraction.detach().cpu().tolist()} "
+                f"halo_support={halo_support_fraction.detach().cpu().tolist()}"
+            )
+    final_num_valid = directional_valid.sum(dim=1)
+    candidate_valid = torch.zeros_like(cand_active)
+    candidate_valid[:, 0] = 1.0
+    candidate_valid[:, 1:5] = directional_valid
+    candidate_valid = (candidate_valid * cand_active.clamp(0.0, 1.0)).detach()
+    candidate_valid[:, 0] = cand_active[:, 0].clamp(0.0, 1.0)
+
+    edge_names = ("north", "south", "east", "west")
+    diagnostics: Dict[str, torch.Tensor] = {
+        "seam_validity_terrain_threshold": torch.tensor(terrain_threshold, device=device, dtype=dtype),
+        "top2_truncation_count": top2_truncation.sum().detach(),
+        "num_valid_directional_seams_raw": initial_num_valid.mean().detach(),
+        "invalid_edge_support_lt_3pct_count": ((edge_support_fraction < edge_min).to(dtype=dtype) * cand_active[:, 1:5]).sum().detach(),
+        "invalid_halo_support_lt_5pct_count": ((halo_support_fraction < halo_min).to(dtype=dtype) * cand_active[:, 1:5]).sum().detach(),
+        "missing_halo_count": ((halo_den_raw <= 1e-6).to(dtype=dtype) * cand_active[:, 1:5]).sum().detach(),
+        "missing_target_count": torch.zeros((), device=device, dtype=dtype),
+        "semantic_invalid_count": torch.zeros((), device=device, dtype=dtype),
+        "num_valid_directional_seams_final": final_num_valid.mean().detach(),
+    }
+    for edge_idx, edge_name in enumerate(edge_names):
+        diagnostics[f"seam_edge_support_fraction_{edge_name}"] = edge_support_fraction[:, edge_idx].mean().detach()
+        diagnostics[f"halo_support_fraction_{edge_name}"] = halo_support_fraction[:, edge_idx].mean().detach()
+        diagnostics[f"seam_validity_score_{edge_name}"] = validity_score[:, edge_idx].mean().detach()
+    return candidate_valid.detach(), diagnostics
 
 
 def parse_evaluation_config(
@@ -1872,6 +3893,7 @@ def build_dataset(
     seam_config: Optional[Dict[str, object]] = None,
     style_pool_config: Optional[Dict[str, object]] = None,
     style_ratio_config: Optional[Dict[str, object]] = None,
+    regional_loss_config: Optional[Dict[str, object]] = None,
 ) -> TerrainSemanticManifestDataset:
     training = semantic_config["training"]
     verification = semantic_config.get("verification", {})
@@ -1923,6 +3945,7 @@ def build_dataset(
         source_to_train_scale=float(training.get("source_to_train_scale", 1.0)),
         style_pool_config=dict(style_pool_config or {}),
         style_ratio_config=dict(style_ratio_config or {}),
+        regional_loss_config=dict(regional_loss_config or {}),
     )
 
 
@@ -1967,9 +3990,28 @@ def semantic_collate(samples: List[Dict[str, object]]) -> Dict[str, object]:
         "seam_qualified_halo_outer_px",
         "seam_qualified_continuation_weight_sum",
         "seam_qualified_valid_edges_count",
+        "seam_interior_edge_band_per_edge",
+        "seam_halo_inner_band_per_edge",
+        "seam_halo_outer_band_per_edge",
+        "seam_halo_band_per_edge",
+        "hard_band_mask_per_edge",
+        "q_distance_px_per_edge",
+        "q_inward_decay_per_edge",
+        "q_edge_post_mask_per_edge",
+        "q_max_edge",
+        "q_interior",
+        "soft_field_q_per_edge",
+        "soft_field_q_interior",
         "boundary_alignment_error",
         "boundary_consistency_error",
     }
+    optional_tensor_keys.update(
+        {
+            "candidate_targets_rgb",
+            "expanded_candidate_targets_rgb",
+            "candidate_active_mask",
+        }
+    )
 
     for key in tensor_keys:
         batch[key] = torch.stack([sample[key] for sample in samples], dim=0)
@@ -1993,6 +4035,8 @@ def semantic_collate(samples: List[Dict[str, object]]) -> Dict[str, object]:
     batch["channel_names"] = samples[0]["channel_names"]
     if "full_conditioning_channel_names" in samples[0]:
         batch["full_conditioning_channel_names"] = samples[0]["full_conditioning_channel_names"]
+    if "candidate_image_names" in samples[0]:
+        batch["candidate_image_names"] = [s.get("candidate_image_names", []) for s in samples]
     return batch
 
 
@@ -2152,6 +4196,29 @@ def build_model_visible_conditioning(
     return full_conditioning, dataset.full_conditioning_channel_names, diagnostics
 
 
+def build_corrupted_model_visible_conditioning(
+    batch: Dict[str, object],
+    dataset: TerrainSemanticManifestDataset,
+    seam_config: Dict[str, object],
+    corrupted_conditioning: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    expanded_halo_px: int = 0,
+) -> torch.Tensor:
+    corrupted_batch = dict(batch)
+    corrupted_batch["conditioning_images"] = corrupted_conditioning
+    model_conditioning, _, _ = build_model_visible_conditioning(
+        corrupted_batch,
+        dataset,
+        seam_config,
+        device,
+        dtype,
+    )
+    if int(expanded_halo_px) > 0:
+        model_conditioning = _center_embed_spatial_tensor(model_conditioning, int(expanded_halo_px), fill_value=0.0)
+    return model_conditioning
+
+
 def apply_runtime_material_lora(
     text_encoders: List[torch.nn.Module],
     unet: torch.nn.Module,
@@ -2213,6 +4280,69 @@ def prepare_text_conditioning(
         encoder_hidden_states2.to(device=device, dtype=dtype),
         pool2.to(device=device, dtype=dtype),
     )
+
+
+def _compute_canary_baseline_fields(
+    loss_trace: List[Dict[str, object]],
+    current_row: Dict[str, object],
+    baseline_window: int = 10,
+) -> Dict[str, float]:
+    baseline_window = max(1, int(baseline_window))
+
+    def _row_float(row: Dict[str, object], key: str, default: float = 0.0) -> float:
+        value = row.get(key, default)
+        try:
+            value = float(value)
+        except Exception:
+            return default
+        return value if math.isfinite(value) else default
+
+    def _is_valid(row: Dict[str, object]) -> bool:
+        regional_loss = _row_float(row, "regional_diff_loss_weighted", float("nan"))
+        terrain_empty = _row_float(row, "terrain_empty_count", _row_float(row, "terrain_empty_sample_count", 0.0))
+        skipped_low_sigma = _row_float(row, "regional_competition_skipped_low_sigma", 0.0)
+        active_sum = _row_float(row, "active_content_mask_sum_pooled", _row_float(row, "active_content_pooled_mask_sum", 0.0))
+        return (
+            math.isfinite(regional_loss)
+            and regional_loss > 0.0
+            and terrain_empty <= 0.0
+            and skipped_low_sigma <= 0.0
+            and active_sum > 0.0
+        )
+
+    valid_losses: List[float] = []
+    for row in list(loss_trace) + [current_row]:
+        if _is_valid(row):
+            valid_losses.append(_row_float(row, "regional_diff_loss_weighted", 0.0))
+            if len(valid_losses) >= baseline_window:
+                break
+    if len(valid_losses) < baseline_window:
+        return {
+            "canary_baseline_ready": 0.0,
+            "canary_regional_loss_baseline": 0.0,
+            "canary_baseline_sample_count": float(len(valid_losses)),
+            "canary_regional_loss_ratio_to_baseline": 0.0,
+            "regional_loss_initial_baseline": 0.0,
+            "regional_loss_ratio_to_initial": 0.0,
+            "regional_loss_rolling_median_20": 0.0,
+            "regional_loss_ratio_to_rolling": 0.0,
+        }
+    baseline = float(_safe_list_median(valid_losses))
+    current_loss = _row_float(current_row, "regional_diff_loss_weighted", 0.0)
+    rolling_values = _recent_float_values(loss_trace + [current_row], "regional_diff_loss_weighted_raw", 20)
+    if not rolling_values:
+        rolling_values = _recent_float_values(loss_trace + [current_row], "regional_diff_loss_weighted", 20)
+    rolling_median_20 = _safe_list_median(rolling_values) if rolling_values else current_loss
+    return {
+        "canary_baseline_ready": 1.0,
+        "canary_regional_loss_baseline": baseline,
+        "canary_baseline_sample_count": float(len(valid_losses)),
+        "canary_regional_loss_ratio_to_baseline": current_loss / max(baseline, 1e-12) if current_loss > 0.0 else 0.0,
+        "regional_loss_initial_baseline": baseline,
+        "regional_loss_ratio_to_initial": current_loss / max(baseline, 1e-12) if current_loss > 0.0 else 0.0,
+        "regional_loss_rolling_median_20": rolling_median_20,
+        "regional_loss_ratio_to_rolling": current_loss / max(rolling_median_20, 1e-12) if current_loss > 0.0 else 0.0,
+    }
 
 
 def build_size_embeddings(batch: Dict[str, object], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -3378,6 +5508,159 @@ def _masked_mean_per_sample(values: torch.Tensor, mask: torch.Tensor) -> torch.T
     return masked_sum / masked_area
 
 
+def _get_texture_collapse_lpips_model(device: torch.device):
+    global _TEXTURE_COLLAPSE_LPIPS_MODEL, _TEXTURE_COLLAPSE_LPIPS_DEVICE, _TEXTURE_COLLAPSE_LPIPS_DISABLED
+    if _TEXTURE_COLLAPSE_LPIPS_DISABLED or lpips is None:
+        return None
+    if _TEXTURE_COLLAPSE_LPIPS_MODEL is not None and _TEXTURE_COLLAPSE_LPIPS_DEVICE == device:
+        return _TEXTURE_COLLAPSE_LPIPS_MODEL
+    try:
+        model = lpips.LPIPS(net="alex")
+        model = model.to(device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+        _TEXTURE_COLLAPSE_LPIPS_MODEL = model
+        _TEXTURE_COLLAPSE_LPIPS_DEVICE = device
+        return _TEXTURE_COLLAPSE_LPIPS_MODEL
+    except Exception as exc:
+        logger.warning("[regional/texture_collapse] LPIPS unavailable: %s", exc)
+        _TEXTURE_COLLAPSE_LPIPS_DISABLED = True
+        _TEXTURE_COLLAPSE_LPIPS_MODEL = None
+        _TEXTURE_COLLAPSE_LPIPS_DEVICE = None
+        return None
+
+
+def _pairwise_mean(values: List[torch.Tensor]) -> Optional[torch.Tensor]:
+    if not values:
+        return None
+    return torch.stack(values).mean()
+
+
+def _extract_masked_region_crop(image: torch.Tensor, mask: torch.Tensor, output_size: int = 64) -> Optional[torch.Tensor]:
+    mask_2d = (mask.squeeze(0) > 0.05)
+    if int(mask_2d.sum().item()) <= 4:
+        return None
+    coords = mask_2d.nonzero(as_tuple=False)
+    y0 = int(coords[:, 0].min().item())
+    y1 = int(coords[:, 0].max().item()) + 1
+    x0 = int(coords[:, 1].min().item())
+    x1 = int(coords[:, 1].max().item()) + 1
+    if (y1 - y0) < 2 or (x1 - x0) < 2:
+        return None
+    crop = image[:, y0:y1, x0:x1]
+    crop_mask = mask[:, y0:y1, x0:x1].clamp(0.0, 1.0)
+    crop = crop * crop_mask
+    crop = F.interpolate(crop.unsqueeze(0), size=(output_size, output_size), mode="bilinear", align_corners=False).squeeze(0)
+    return crop.clamp(-1.0, 1.0)
+
+
+def _compute_texture_collapse_metrics(
+    pred_latents: torch.Tensor,
+    pred_rgb: torch.Tensor,
+    candidate_q_latent: torch.Tensor,
+    candidate_active_mask: torch.Tensor,
+) -> Dict[str, float]:
+    result = {
+        "texture_collapse_cosine_similarity": float("nan"),
+        "texture_collapse_fft_energy_similarity": float("nan"),
+        "texture_collapse_cross_region_lpips": float("nan"),
+        "texture_collapse_pair_count": 0.0,
+    }
+
+    if pred_latents.ndim != 4 or pred_rgb.ndim != 4 or candidate_q_latent.ndim != 5:
+        return result
+
+    B, T, _, Hl, Wl = candidate_q_latent.shape
+    if T < 2:
+        return result
+
+    active = candidate_active_mask.to(device=pred_latents.device, dtype=pred_latents.dtype).view(B, T, 1, 1)
+    q_lat = candidate_q_latent.squeeze(2).to(device=pred_latents.device, dtype=pred_latents.dtype)
+    q_lat = q_lat * active
+    q_rgb = F.interpolate(
+        q_lat,
+        size=pred_rgb.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    latent_pairs: List[torch.Tensor] = []
+    fft_pairs: List[torch.Tensor] = []
+    lpips_pairs: List[torch.Tensor] = []
+    lpips_model = _get_texture_collapse_lpips_model(pred_rgb.device)
+
+    for batch_index in range(B):
+        active_slots = [slot for slot in range(T) if float(candidate_active_mask[batch_index, slot].detach().item()) > 0.0]
+        if len(active_slots) < 2:
+            continue
+
+        hard_q_lat = q_lat[batch_index : batch_index + 1, active_slots]
+        hard_q_rgb = q_rgb[batch_index : batch_index + 1, active_slots]
+        hard_idx_lat = hard_q_lat.argmax(dim=1)
+        hard_idx_rgb = hard_q_rgb.argmax(dim=1)
+        hard_max_lat = hard_q_lat.amax(dim=1, keepdim=True)
+        hard_max_rgb = hard_q_rgb.amax(dim=1, keepdim=True)
+
+        latent_vectors: Dict[int, torch.Tensor] = {}
+        fft_vectors: Dict[int, torch.Tensor] = {}
+        rgb_crops: Dict[int, torch.Tensor] = {}
+
+        for local_slot_index, slot_index in enumerate(active_slots):
+            latent_mask = ((hard_idx_lat == local_slot_index).float() * (hard_max_lat >= 1e-4).float()).to(dtype=pred_latents.dtype)
+            rgb_mask = ((hard_idx_rgb == local_slot_index).float() * (hard_max_rgb >= 1e-4).float()).to(dtype=pred_rgb.dtype)
+
+            latent_area = latent_mask.sum()
+            rgb_area = rgb_mask.sum()
+            if float(latent_area.detach().item()) <= 4.0 or float(rgb_area.detach().item()) <= 16.0:
+                continue
+
+            latent_mean = (
+                pred_latents[batch_index : batch_index + 1] * latent_mask
+            ).sum(dim=(-2, -1)) / latent_area.clamp_min(1e-6)
+            latent_vectors[slot_index] = F.normalize(latent_mean.flatten(), dim=0, eps=1e-6)
+
+            crop = _extract_masked_region_crop(pred_rgb[batch_index], rgb_mask[0], output_size=64)
+            if crop is None:
+                continue
+            rgb_crops[slot_index] = crop
+
+            gray = crop.mean(dim=0, keepdim=True)
+            fft_energy = torch.log1p(torch.abs(torch.fft.fftshift(torch.fft.fft2(gray), dim=(-2, -1))))
+            fft_vectors[slot_index] = F.normalize(fft_energy.flatten(), dim=0, eps=1e-6)
+
+        valid_slots = sorted(set(latent_vectors.keys()) & set(fft_vectors.keys()) & set(rgb_crops.keys()))
+        if len(valid_slots) < 2:
+            continue
+
+        for pair_i in range(len(valid_slots)):
+            for pair_j in range(pair_i + 1, len(valid_slots)):
+                slot_i = valid_slots[pair_i]
+                slot_j = valid_slots[pair_j]
+                latent_pairs.append(torch.dot(latent_vectors[slot_i], latent_vectors[slot_j]))
+                fft_pairs.append(torch.dot(fft_vectors[slot_i], fft_vectors[slot_j]))
+                if lpips_model is not None:
+                    with torch.no_grad():
+                        lpips_dist = lpips_model(
+                            rgb_crops[slot_i].unsqueeze(0).float(),
+                            rgb_crops[slot_j].unsqueeze(0).float(),
+                        ).mean()
+                    lpips_pairs.append(lpips_dist)
+
+    pair_count = float(len(latent_pairs))
+    result["texture_collapse_pair_count"] = pair_count
+    latent_mean = _pairwise_mean(latent_pairs)
+    fft_mean = _pairwise_mean(fft_pairs)
+    lpips_mean = _pairwise_mean(lpips_pairs)
+    if latent_mean is not None:
+        result["texture_collapse_cosine_similarity"] = float(latent_mean.detach().item())
+    if fft_mean is not None:
+        result["texture_collapse_fft_energy_similarity"] = float(fft_mean.detach().item())
+    if lpips_mean is not None:
+        result["texture_collapse_cross_region_lpips"] = float(lpips_mean.detach().item())
+    return result
+
+
 def _summarize_weighted_seam_regions(
     error_map: torch.Tensor,
     seam_maps: Dict[str, torch.Tensor],
@@ -3672,6 +5955,9 @@ def _compute_masked_rgb_gradient_loss(
     weight_mask: torch.Tensor,
     sobel_radius_px: int = 1,
 ) -> Dict[str, torch.Tensor]:
+    pred_rgb = pred_rgb.float()
+    target_rgb = target_rgb.float()
+    weight_mask = weight_mask.float()
     if pred_rgb.ndim != 4 or target_rgb.ndim != 4 or pred_rgb.shape[1] != 3 or target_rgb.shape[1] != 3:
         raise ValueError(
             "masked RGB gradient loss expects RGB tensors with shape [batch, 3, height, width]: "
@@ -3683,10 +5969,11 @@ def _compute_masked_rgb_gradient_loss(
     sobel_x = _SOBEL_X_KERNEL.to(device=pred_rgb.device, dtype=pred_rgb.dtype).expand(3, 1, 3, 3)
     sobel_y = _SOBEL_Y_KERNEL.to(device=pred_rgb.device, dtype=pred_rgb.dtype).expand(3, 1, 3, 3)
 
-    pred_grad_x = F.conv2d(pred_rgb, sobel_x, padding=1, groups=3)
-    pred_grad_y = F.conv2d(pred_rgb, sobel_y, padding=1, groups=3)
-    target_grad_x = F.conv2d(target_rgb, sobel_x, padding=1, groups=3)
-    target_grad_y = F.conv2d(target_rgb, sobel_y, padding=1, groups=3)
+    with torch.backends.cudnn.flags(enabled=False):
+        pred_grad_x = F.conv2d(pred_rgb, sobel_x, padding=1, groups=3)
+        pred_grad_y = F.conv2d(pred_rgb, sobel_y, padding=1, groups=3)
+        target_grad_x = F.conv2d(target_rgb, sobel_x, padding=1, groups=3)
+        target_grad_y = F.conv2d(target_rgb, sobel_y, padding=1, groups=3)
 
     pred_grad_mag = torch.sqrt(pred_grad_x.square() + pred_grad_y.square() + 1e-6)
     target_grad_mag = torch.sqrt(target_grad_x.square() + target_grad_y.square() + 1e-6)
@@ -3849,6 +6136,7 @@ def _build_seam_region_maps(
     valid_expanded_source_mask: Optional[torch.Tensor] = None,
     continuation_valid_mask: Optional[torch.Tensor] = None,
     style_support_valid_mask: Optional[torch.Tensor] = None,
+    q_valid_support_mask: Optional[torch.Tensor] = None,
     style_ratio_config: Optional[Dict[str, object]] = None,
 ) -> Dict[str, torch.Tensor]:
     return shared_build_seam_region_maps(
@@ -3864,6 +6152,7 @@ def _build_seam_region_maps(
         valid_expanded_source_mask=valid_expanded_source_mask,
         continuation_valid_mask=continuation_valid_mask,
         style_support_valid_mask=style_support_valid_mask,
+        q_valid_support_mask=q_valid_support_mask,
         style_ratio_config=style_ratio_config,
     )
 
@@ -4188,7 +6477,7 @@ def _detach_tensor_tree(value):
 def _save_seam_visual_debug(
     output_dir: str,
     step: int,
-    pred_rgb: torch.Tensor,
+    pred_rgb: Optional[torch.Tensor],
     target_rgb: torch.Tensor,
     supervision_mask: torch.Tensor,
     seam_maps: Dict[str, torch.Tensor],
@@ -4203,6 +6492,16 @@ def _save_seam_visual_debug(
 ) -> None:
     seam_dir = os.path.join(output_dir, "sanity", "seam_debug")
     os.makedirs(seam_dir, exist_ok=True)
+
+    if target_rgb is None or supervision_mask is None or seam_maps is None:
+        logger.warning(
+            "[seam/debug] step=%d seam preview unavailable; skipping visual debug render target=%s supervision=%s seam_maps=%s",
+            step,
+            "present" if target_rgb is not None else "missing",
+            "present" if supervision_mask is not None else "missing",
+            "present" if seam_maps is not None else "missing",
+        )
+        return
 
     seam_maps_for_debug = full_seam_maps if full_seam_maps is not None else seam_maps
     full_height = int(seam_maps_for_debug["margin_inner"].shape[-2])
@@ -4335,10 +6634,19 @@ def _save_seam_visual_debug(
         return resolved_height, resolved_width
 
     debug_output_size_hw = _resolve_debug_output_size_hw()
+    if (
+        debug_output_size_hw is None
+        or len(debug_output_size_hw) < 2
+        or debug_output_size_hw[0] is None
+        or debug_output_size_hw[1] is None
+    ):
+        logger.warning(
+            "[seam/debug] step=%d preview output size unavailable; skipping visual debug render",
+            step,
+        )
+        return
 
     def _resize_rgb_to_output(tensor: torch.Tensor) -> torch.Tensor:
-        if debug_output_size_hw is None:
-            return tensor
         output_height, output_width = int(debug_output_size_hw[0]), int(debug_output_size_hw[1])
         if tuple(tensor.shape[-2:]) == (output_height, output_width):
             return tensor
@@ -4350,8 +6658,6 @@ def _save_seam_visual_debug(
         )[0]
 
     def _resize_mask_to_output(tensor: torch.Tensor, *, nearest: bool = False) -> torch.Tensor:
-        if debug_output_size_hw is None:
-            return tensor
         output_height, output_width = int(debug_output_size_hw[0]), int(debug_output_size_hw[1])
         if tuple(tensor.shape[-2:]) == (output_height, output_width):
             return tensor
@@ -4368,10 +6674,15 @@ def _save_seam_visual_debug(
             align_corners=False,
         )[0, 0]
 
-    pred0_crop = pred_rgb[0].detach().float().cpu()
     target0_crop = target_rgb[0].detach().float().cpu()
     supervision0_crop = supervision_mask[0, 0].detach().float().cpu().clamp(0.0, 1.0)
-    pred0 = _place_rgb_crop(pred0_crop)
+    pred0_crop: Optional[torch.Tensor] = None
+    pred0: Optional[torch.Tensor] = None
+    if pred_rgb is None or pred_rgb.ndim < 4 or pred_rgb.shape[0] <= 0:
+        logger.warning("[seam/debug] step=%d prediction preview unavailable; skipping expanded prediction render", step)
+    else:
+        pred0_crop = pred_rgb[0].detach().float().cpu()
+        pred0 = _place_rgb_crop(pred0_crop)
     if full_target_rgb is not None:
         target0 = full_target_rgb[0].detach().float().cpu()
     else:
@@ -4380,8 +6691,11 @@ def _save_seam_visual_debug(
     halo_mask0 = (seam_maps_for_debug["margin_inner"][0, 0] + seam_maps_for_debug["margin_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
     interior_mask0 = (seam_maps_for_debug["interior_inner"][0, 0] + seam_maps_for_debug["interior_outer"][0, 0]).detach().float().cpu().clamp(0.0, 1.0)
 
-    diff_map = _place_mask_crop((pred0_crop - target0_crop).abs().mean(dim=0))
-    pred0 = _resize_rgb_to_output(_prepare_preview_tensor(pred0))
+    if pred0_crop is not None:
+        diff_map = _place_mask_crop((pred0_crop - target0_crop).abs().mean(dim=0))
+        pred0 = _resize_rgb_to_output(_prepare_preview_tensor(pred0))
+    else:
+        diff_map = torch.zeros((full_height, full_width), dtype=torch.float32)
     target0 = _resize_rgb_to_output(_prepare_preview_tensor(target0))
     supervision0 = _resize_mask_to_output(_prepare_preview_tensor(supervision0), nearest=True)
     halo_mask0 = _resize_mask_to_output(_prepare_preview_tensor(halo_mask0), nearest=True)
@@ -4393,7 +6707,8 @@ def _save_seam_visual_debug(
     halo_norm = halo_diff / max(float(halo_diff.max().item()), 1e-6)
     interior_norm = interior_diff / max(float(interior_diff.max().item()), 1e-6)
 
-    _tensor_to_image(pred0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_prediction.png"))
+    if pred0 is not None:
+        _tensor_to_image(pred0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_prediction.png"))
     _tensor_to_image(target0).save(os.path.join(seam_dir, f"step_{step:06d}_expanded_target.png"))
     _mask_to_image(supervision0).save(os.path.join(seam_dir, f"step_{step:06d}_supervision_mask.png"))
     _mask_to_image(supervision0).save(os.path.join(seam_dir, f"step_{step:06d}_seam_loss_support_mask.png"))
@@ -4526,6 +6841,162 @@ def _save_seam_visual_debug(
             style_overlay[0] = torch.maximum(style_overlay[0], patch_grid)
             style_overlay[1] = torch.maximum(style_overlay[1], patch_grid * 0.5)
             _tensor_to_image((style_overlay * 2.0) - 1.0).save(os.path.join(seam_dir, f"step_{step:06d}_style_patch_grid_overlay.png"))
+
+
+def _save_regional_visual_debug(
+    output_dir: str,
+    step: int,
+    pred_rgb: torch.Tensor,
+    winner_rgb: torch.Tensor,
+    candidate_rgb: torch.Tensor,
+    gate_pooled: torch.Tensor,
+    winner_idx_pooled: torch.Tensor,
+    candidate_q_latent: torch.Tensor,
+    q_debug_maps: Optional[Dict[str, torch.Tensor]],
+    trusted_mask: torch.Tensor,
+    halo_debug_maps: Optional[Dict[str, torch.Tensor]] = None,
+    ri_debug_maps: Optional[Dict[str, torch.Tensor]] = None,
+    q_blend_target_rgb: Optional[torch.Tensor] = None,
+    q_blend_student_rgb: Optional[torch.Tensor] = None,
+) -> None:
+    debug_dir = os.path.join(output_dir, "sanity", "regional_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    labels = ("pred_x0", "winner", "target_interior", "target_north", "target_south", "target_east", "target_west")
+    tile_w = 256
+    tile_h = 144
+    label_h = 22
+
+    def _resize_tile(image: Image.Image) -> Image.Image:
+        return image.convert("RGB").resize((tile_w, tile_h), Image.Resampling.BILINEAR)
+
+    def _rgb_tile(tensor: torch.Tensor) -> Image.Image:
+        return _resize_tile(_tensor_to_image(tensor.detach().float().cpu()))
+
+    def _mask_tile(mask: torch.Tensor) -> Image.Image:
+        return _resize_tile(_mask_to_image(mask.detach().float().cpu().clamp(0.0, 1.0)).convert("RGB"))
+
+    def _heat_tile(value: torch.Tensor, *, signed: bool = False) -> Image.Image:
+        value = value.detach().float().cpu()
+        finite = torch.isfinite(value)
+        if not bool(finite.any().item()):
+            return _mask_tile(torch.zeros_like(value))
+        safe = torch.where(finite, value, torch.zeros_like(value))
+        if signed:
+            scale = safe.abs().amax().clamp_min(1e-6)
+            safe = ((safe / scale) * 0.5) + 0.5
+        else:
+            vmin = safe[finite].amin()
+            vmax = safe[finite].amax()
+            safe = (safe - vmin) / (vmax - vmin).clamp_min(1e-6)
+        return _mask_tile(safe.clamp(0.0, 1.0))
+
+    def _upsample_mask(mask: torch.Tensor, size_hw: Tuple[int, int], nearest: bool = False) -> torch.Tensor:
+        mode = "nearest" if nearest else "bilinear"
+        kwargs = {} if nearest else {"align_corners": False}
+        return F.interpolate(mask.unsqueeze(0).unsqueeze(0).float(), size=size_hw, mode=mode, **kwargs)[0, 0]
+
+    pred0 = pred_rgb[0].detach().float().cpu()
+    winner0 = winner_rgb[0].detach().float().cpu()
+    cand0 = candidate_rgb[0].detach().float().cpu()
+    gate0 = gate_pooled[0].detach().float().cpu()
+    winner_idx0 = winner_idx_pooled[0, 0].detach().float().cpu()
+    q0 = candidate_q_latent[0].detach().float().cpu()
+    if q0.ndim == 4 and q0.shape[1] == 1:
+        q0 = q0[:, 0]
+    trusted0 = trusted_mask[0, 0].detach().float().cpu().clamp(0.0, 1.0)
+    rgb_size = tuple(int(v) for v in pred0.shape[-2:])
+
+    rows: List[Tuple[str, List[Image.Image]]] = []
+    overview_tiles = [_rgb_tile(pred0), _rgb_tile(winner0)]
+    for ti in range(min(5, cand0.shape[0])):
+        overview_tiles.append(_rgb_tile(cand0[ti]))
+    rows.append(("rgb", overview_tiles))
+
+    q_blend_tiles = []
+    if q_blend_student_rgb is not None:
+        q_blend_tiles.append(_rgb_tile(q_blend_student_rgb[0].detach().float().cpu()))
+    if q_blend_target_rgb is not None:
+        q_blend_tiles.append(_rgb_tile(q_blend_target_rgb[0].detach().float().cpu()))
+    if q_blend_tiles:
+        rows.append(("q_blend_rgb", q_blend_tiles))
+
+    gate_tiles = []
+    for ti in range(min(5, gate0.shape[0])):
+        gate_tiles.append(_mask_tile(_upsample_mask(gate0[ti], rgb_size)))
+    rows.append(("gate", gate_tiles))
+
+    q_tiles = []
+    for ti in range(min(5, q0.shape[0])):
+        q_tiles.append(_mask_tile(_upsample_mask(q0[ti], rgb_size)))
+    rows.append(("q_field", q_tiles))
+
+    if q_debug_maps:
+        for row_label, tensor in q_debug_maps.items():
+            if tensor is None:
+                continue
+            debug_tensor = tensor[0].detach().float().cpu()
+            if debug_tensor.ndim == 2:
+                debug_tensor = debug_tensor.unsqueeze(0)
+            if debug_tensor.ndim != 3:
+                continue
+            debug_tiles = []
+            for tile_index in range(min(5, debug_tensor.shape[0])):
+                debug_tiles.append(_mask_tile(_upsample_mask(debug_tensor[tile_index].clamp(0.0, 1.0), rgb_size)))
+            if debug_tiles:
+                rows.append((row_label, debug_tiles))
+
+    if ri_debug_maps:
+        for row_label, tensor in ri_debug_maps.items():
+            if tensor is None:
+                continue
+            debug_tensor = tensor[0].detach().float().cpu()
+            if debug_tensor.ndim == 4 and debug_tensor.shape[1] == 1:
+                debug_tensor = debug_tensor[:, 0]
+            if debug_tensor.ndim == 2:
+                debug_tensor = debug_tensor.unsqueeze(0)
+            if debug_tensor.ndim != 3:
+                continue
+            debug_tiles = []
+            signed = "advantage" in row_label
+            for tile_index in range(min(5, debug_tensor.shape[0])):
+                debug_tiles.append(_heat_tile(_upsample_mask(debug_tensor[tile_index], rgb_size), signed=signed))
+            if debug_tiles:
+                rows.append((row_label, debug_tiles))
+
+    if halo_debug_maps:
+        for row_label in ("halo_inner_mask", "halo_outer_mask", "halo_inner_diff", "halo_outer_diff"):
+            tensor = halo_debug_maps.get(row_label)
+            if tensor is None:
+                continue
+            debug_tensor = tensor.detach().float().cpu()
+            if debug_tensor.ndim == 4:
+                debug_tensor = debug_tensor[0]
+            if debug_tensor.ndim == 3:
+                debug_tensor = debug_tensor[0]
+            if debug_tensor.ndim != 2:
+                continue
+            if tuple(int(v) for v in debug_tensor.shape[-2:]) != rgb_size:
+                debug_tensor = _upsample_mask(debug_tensor, rgb_size)
+            if row_label.endswith("_diff"):
+                debug_tensor = debug_tensor / debug_tensor.max().clamp_min(1e-6)
+            rows.append((row_label, [_mask_tile(debug_tensor.clamp(0.0, 1.0))]))
+
+    argmax_norm = winner_idx0 / max(1.0, float(min(5, cand0.shape[0]) - 1))
+    rows.append(("winner_active", [_mask_tile(_upsample_mask(argmax_norm, rgb_size, nearest=True)), _mask_tile(_upsample_mask(trusted0, rgb_size))]))
+
+    cols = max(len(tiles) for _row_label, tiles in rows)
+    canvas = Image.new("RGB", (cols * tile_w, len(rows) * (tile_h + label_h)), (18, 18, 18))
+    draw = ImageDraw.Draw(canvas)
+    for row_idx, (row_label, tiles) in enumerate(rows):
+        y = row_idx * (tile_h + label_h)
+        for col_idx, tile in enumerate(tiles):
+            x = col_idx * tile_w
+            canvas.paste(tile, (x, y + label_h))
+            label = labels[col_idx] if row_label == "rgb" and col_idx < len(labels) else f"{row_label}_{col_idx}"
+            draw.rectangle((x, y, x + tile_w - 1, y + label_h - 1), fill=(0, 0, 0))
+            draw.text((x + 5, y + 4), label, fill=(255, 255, 255))
+    canvas.save(os.path.join(debug_dir, f"step_{step:06d}_regional_board.png"))
 
 
 def _terrain_mask_to_occupancy(mask: torch.Tensor, black_is_terrain: bool) -> torch.Tensor:
@@ -4682,12 +7153,16 @@ def save_controlnet_checkpoint(
     os.makedirs(output_dir, exist_ok=True)
     filename = os.path.join(output_dir, f"{output_name}-step-{step:06d}.safetensors")
     state_dict = unwrap_model(accelerator, control_net).state_dict()
-    converted = {key: value.detach().to("cpu", dtype=save_dtype) for key, value in state_dict.items()}
+    converted = {
+        key: value.detach().to(device="cpu", dtype=save_dtype) if torch.is_floating_point(value) else value.detach().to(device="cpu")
+        for key, value in state_dict.items()
+    }
     save_file(converted, filename)
     logger.info(f"saved checkpoint: {filename}")
 
 
 def _collect_module_param_counts(named_parameters) -> Tuple[int, int, Dict[str, int]]:
+    per_edge_debug: Optional[List[Dict[str, object]]] = None,
     total = 0
     trainable = 0
     top_level_counts: Dict[str, int] = {}
@@ -4818,6 +7293,31 @@ def _unwrap_optimizer_for_debug(optimizer: torch.optim.Optimizer) -> torch.optim
     return getattr(optimizer, "optimizer", optimizer)
 
 
+def _capture_optimizer_base_lrs(optimizer: torch.optim.Optimizer) -> None:
+    raw_optimizer = _unwrap_optimizer_for_debug(optimizer)
+    for group in raw_optimizer.param_groups:
+        group["_base_lr_after_resume"] = float(group.get("lr", 0.0))
+
+
+def _apply_optimizer_lr_warmup(
+    optimizer: torch.optim.Optimizer,
+    relative_step: int,
+    warmup_steps: int,
+    start_factor: float,
+) -> float:
+    warmup_steps = max(0, int(warmup_steps))
+    if warmup_steps <= 0:
+        return 1.0
+    start_factor = max(0.0, min(1.0, float(start_factor)))
+    progress = max(0.0, min(1.0, float(max(1, int(relative_step))) / float(warmup_steps)))
+    scale = start_factor + ((1.0 - start_factor) * progress)
+    raw_optimizer = _unwrap_optimizer_for_debug(optimizer)
+    for group in raw_optimizer.param_groups:
+        base_lr = float(group.get("_base_lr_after_resume", group.get("lr", 0.0)))
+        group["lr"] = base_lr * scale
+    return scale
+
+
 def _optimizer_state_value_norm(value: object) -> float:
     if not isinstance(value, torch.Tensor):
         return 0.0
@@ -4871,13 +7371,96 @@ def _parameters_grad_norm(named_parameters: List[Tuple[str, torch.nn.Parameter]]
     return math.sqrt(max(total, 0.0))
 
 
+def _masked_channel_std(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    support = mask.expand(-1, values.shape[1], -1, -1)
+    denom = support.sum().clamp_min(1e-6)
+    mean = (values * support).sum() / denom
+    var = (((values - mean) ** 2) * support).sum() / denom
+    return var.clamp_min(0.0).sqrt()
+
+
+def _compute_visible_terrain_trace_metrics(pred_rgb: torch.Tensor, support_mask: torch.Tensor) -> Dict[str, float]:
+    rgb01 = ((pred_rgb.detach().float().clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    mask = support_mask.detach().float().clamp(0.0, 1.0)
+    if mask.shape[-2:] != rgb01.shape[-2:]:
+        mask = F.interpolate(mask, size=rgb01.shape[-2:], mode="bilinear", align_corners=False)
+    mask = mask[:, :1]
+    support_sum = float(mask.sum().item())
+    if support_sum <= 1e-6:
+        return {
+            "visible_terrain_rgb_mean": 0.0,
+            "visible_terrain_rgb_std": 0.0,
+            "visible_terrain_gradient_energy": 0.0,
+            "visible_terrain_laplacian_energy": 0.0,
+            "active_terrain_alpha_support_sum": 0.0,
+        }
+
+    support_rgb = mask.expand(-1, rgb01.shape[1], -1, -1)
+    rgb_mean = float(((rgb01 * support_rgb).sum() / support_rgb.sum().clamp_min(1e-6)).item())
+    rgb_std = float(_masked_channel_std(rgb01, mask).item())
+    gray = (0.2989 * rgb01[:, 0:1]) + (0.5870 * rgb01[:, 1:2]) + (0.1140 * rgb01[:, 2:3])
+    grad_x = F.pad(gray[:, :, :, 1:] - gray[:, :, :, :-1], (0, 1, 0, 0))
+    grad_y = F.pad(gray[:, :, 1:, :] - gray[:, :, :-1, :], (0, 0, 0, 1))
+    gradient_energy = float((((grad_x * grad_x) + (grad_y * grad_y)) * mask).sum().item() / max(support_sum, 1e-6))
+    lap_kernel = torch.tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+        device=gray.device,
+        dtype=gray.dtype,
+    ).view(1, 1, 3, 3)
+    lap = F.conv2d(gray, lap_kernel, padding=1)
+    laplacian_energy = float(((lap * lap) * mask).sum().item() / max(support_sum, 1e-6))
+    return {
+        "visible_terrain_rgb_mean": rgb_mean,
+        "visible_terrain_rgb_std": rgb_std,
+        "visible_terrain_gradient_energy": gradient_energy,
+        "visible_terrain_laplacian_energy": laplacian_energy,
+        "active_terrain_alpha_support_sum": support_sum,
+    }
+
+
+def _assert_standard_base_diffusion_mode(regional_loss_config: Dict[str, object]) -> None:
+    if bool(regional_loss_config.get("enabled", False)):
+        return
+    failures: List[str] = []
+    if bool(regional_loss_config.get("q_blend_diffusion_enabled", False)):
+        failures.append("q_blend_diffusion_enabled")
+    if float(regional_loss_config.get("q_regret_loss_weight", 0.0)) != 0.0:
+        failures.append("q_regret_loss_weight")
+    if float(regional_loss_config.get("bind_preference_weight", 0.0)) != 0.0:
+        failures.append("bind_preference_weight")
+    if float(regional_loss_config.get("rgb_aux_loss_weight", 0.0)) != 0.0:
+        failures.append("rgb_aux_loss_weight")
+    if bool(regional_loss_config.get("teacher_preservation_enabled", False)):
+        failures.append("teacher_preservation_enabled")
+    if bool(regional_loss_config.get("q_route_dynamic_enabled", False)):
+        failures.append("q_route_dynamic_enabled")
+    if bool(regional_loss_config.get("competitive_gate_enabled", False)):
+        failures.append("competitive_gate_enabled")
+    if bool(regional_loss_config.get("competitive_catchup_enabled", False)):
+        failures.append("competitive_catchup_enabled")
+    if bool(regional_loss_config.get("regional_use_fixed_q_route_for_ownership", False)):
+        failures.append("regional_use_fixed_q_route_for_ownership")
+    if bool(regional_loss_config.get("regional_freeze_gate_routing_head", False)):
+        failures.append("regional_freeze_gate_routing_head")
+    if bool(regional_loss_config.get("regional_detach_routing_from_regional_loss", False)):
+        failures.append("regional_detach_routing_from_regional_loss")
+    if int(regional_loss_config.get("tau_anneal_steps", 0)) != 0:
+        failures.append("tau_anneal_steps")
+    if failures:
+        raise RuntimeError(
+            "regional multi-target is disabled, but inactive-only baseline requirements were violated: " + ", ".join(failures)
+        )
+    logger.info(
+        "[regional/config] regional_multitarget_enabled=0 standard_base_diffusion_only=1 q_blend_enabled=0 q_regret_weight=0 bind_weight=0 teacher_preservation=0 learned_routing_gate_enabled=0"
+    )
+
+
 def _collect_seam_adapter_runtime_diagnostics(
     control_net: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     raw_control_net: Optional[torch.nn.Module] = None,
 ) -> Dict[str, float]:
     named_parameters = dict(control_net.named_parameters())
-    optimizer_map = _optimizer_param_group_map(optimizer)
 
     proj_out_weight = named_parameters.get("controlnet_seam_adapter.proj_out.weight")
     proj_out_bias = named_parameters.get("controlnet_seam_adapter.proj_out.bias")
@@ -4921,12 +7504,23 @@ def _collect_seam_adapter_runtime_diagnostics(
         "seam_adapter_block_heads_optimizer_lr": float(block_head_groups[0][1]) if block_head_groups else 0.0,
         "seam_adapter_proj_out_optimizer_group": float(proj_out_weight_group[0]) if proj_out_weight_group is not None else -1.0,
         "seam_adapter_block_heads_optimizer_group": float(block_head_groups[0][0]) if block_head_groups else -1.0,
-        "seam_adapter_multi_inject_enabled_runtime": 1.0 if bool(getattr(attr_source, "seam_adapter_multi_inject", False)) else 0.0,
         "seam_adapter_scale_block0_runtime": float(getattr(attr_source, "seam_adapter_scale_block0", 0.0) or 0.0),
         "seam_adapter_scale_block1_runtime": float(getattr(attr_source, "seam_adapter_scale_block1", 0.0) or 0.0),
+        "seam_adapter_multi_inject_enabled_runtime": 1.0 if bool(getattr(attr_source, "seam_adapter_multi_inject_enabled", False)) else 0.0,
     }
     diagnostics.update(
-        _collect_parameter_optimizer_state(proj_out_weight, optimizer, "seam_adapter_proj_out_weight_optimizer")
+        _collect_parameter_optimizer_state(
+            proj_out_weight,
+            optimizer,
+            "seam_adapter_proj_out_weight_optimizer",
+        )
+    )
+    diagnostics.update(
+        _collect_parameter_optimizer_state(
+            proj_out_bias,
+            optimizer,
+            "seam_adapter_proj_out_bias_optimizer",
+        )
     )
     return diagnostics
 
@@ -6195,6 +8789,8 @@ def train(args: argparse.Namespace) -> None:
     style_pool_config = parse_style_pool_config(semantic_config)
     style_ratio_config = parse_style_ratio_config(semantic_config)
     seam_config = parse_seam_config(semantic_config)
+    regional_loss_config = parse_regional_loss_config(semantic_config)
+    _assert_standard_base_diffusion_mode(regional_loss_config)
     style_ratio_plumbing_enabled = bool(style_ratio_config["enabled"] or style_ratio_config.get("plumbing_only", False))
     if style_ratio_plumbing_enabled and not seam_config["enabled"]:
         raise ValueError("style-ratio plumbing requires [seam].enabled=true")
@@ -6256,6 +8852,7 @@ def train(args: argparse.Namespace) -> None:
         seam_config=seam_config,
         style_pool_config=style_pool_config,
         style_ratio_config=style_ratio_config,
+        regional_loss_config=regional_loss_config,
     )
     if bool(evaluation_config.get("expanded_prediction_enabled", False)) and int(evaluation_config.get("expanded_halo_px", 0)) > 0:
         logger.warning(
@@ -6757,6 +9354,14 @@ def train(args: argparse.Namespace) -> None:
     )
     if resumed_ema_state is not None:
         ema_state = resumed_ema_state
+    _capture_optimizer_base_lrs(optimizer)
+    if int(getattr(args, "lr_warmup_steps", 0) or 0) > 0:
+        logger.info(
+            "[optimizer/lr_warmup] steps=%d start_factor=%.4f base_lrs=%s",
+            int(args.lr_warmup_steps),
+            float(args.lr_warmup_start_factor),
+            ",".join(f"{float(group.get('_base_lr_after_resume', group.get('lr', 0.0))):.3e}" for group in _unwrap_optimizer_for_debug(optimizer).param_groups),
+        )
 
     # Resume fallback can load tensors from CPU artifacts; reassert runtime device placement.
     control_net.to(accelerator.device, dtype=torch.float32)
@@ -6885,6 +9490,11 @@ def train(args: argparse.Namespace) -> None:
     loss_trace: List[Dict[str, float]] = []
     loss_trace_mode = _normalize_loss_trace_mode(verification_config.get("loss_trace_mode", "full"))
     loss_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
+    regional_qroute_controller = DynamicQRoutingControllerState(
+        phase=float(regional_loss_config.get("q_route_initial_phase", 1.0)),
+        rho_q_route=float(regional_loss_config.get("q_route_initial_rho", regional_loss_config.get("phase15_rho_start", 0.80))),
+    )
+    regional_loss_config["hard_band_gradient_loss_weight_base"] = float(seam_config.get("hard_band_gradient_loss_weight", 0.0))
     seam_adapter_diag_trace: List[Dict[str, float]] = []
     seam_adapter_diag_path = os.path.join(args.output_dir, "sanity", "seam_adapter_diag.csv")
     style_prototype_cache: Dict[Tuple[str, int, int, int, bool, str, str], Dict[str, object]] = {}
@@ -6896,6 +9506,14 @@ def train(args: argparse.Namespace) -> None:
     if resumed_step > 0 and os.path.exists(seam_adapter_diag_path):
         with open(seam_adapter_diag_path, "r", newline="", encoding="utf-8") as handle:
             seam_adapter_diag_trace = list(csv.DictReader(handle))
+
+    def _loss_trace_fieldnames(rows: List[Dict[str, object]]) -> List[str]:
+        fieldnames: List[str] = []
+        for trace_row in rows:
+            for key in trace_row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        return fieldnames
 
     def _append_loss_trace_row_live(row: Dict[str, object]) -> None:
         if not accelerator.is_main_process:
@@ -6933,6 +9551,8 @@ def train(args: argparse.Namespace) -> None:
     )
     warned_expanded_latent_cache_bypass = False
     seam_adapter_debug_saved = False
+    loss_ema20_value: Optional[float] = None
+    recent_total_losses: deque = deque(maxlen=20)
     progress_bar = tqdm(total=args.max_train_steps, initial=global_step, disable=not accelerator.is_local_main_process, desc="steps")
     while global_step < args.max_train_steps:
         for batch in dataloader:
@@ -7037,9 +9657,14 @@ def train(args: argparse.Namespace) -> None:
                 vector_embedding = torch.cat([pool2.expand(batch_size, -1), size_embeddings], dim=1).to(dtype=weight_dtype)
 
                 diffusion_loss_value = 0.0
+                standard_base_diffusion_loss_raw_value = 0.0
+                standard_base_diffusion_loss_weighted_value = 0.0
                 alpha_bce_value = 0.0
                 alpha_edge_value = 0.0
+                alpha_loss_raw_value = 0.0
                 alpha_total_value = 0.0
+                alpha_loss_mask_sum_value = 0.0
+                active_terrain_alpha_support_sum_value = 0.0
                 seam_alpha_local_value = 0.0
                 seam_margin_inner_loss_value = 0.0
                 seam_margin_outer_loss_value = 0.0
@@ -7077,6 +9702,9 @@ def train(args: argparse.Namespace) -> None:
                 seam_rgb_interior_core_loss_value = 0.0
                 seam_rgb_continuation_weighted_loss_value = 0.0
                 seam_rgb_total_loss_value = 0.0
+                seam_rgb_total_loss_weighted_value = 0.0
+                seam_rgb_weight_current = 0.0
+                seam_rgb_total_ratio_value = 0.0
                 seam_rgb_halo_loss_raw_value = 0.0
                 seam_rgb_interior_loss_raw_value = 0.0
                 seam_rgb_halo_loss_weighted_value = 0.0
@@ -7108,6 +9736,8 @@ def train(args: argparse.Namespace) -> None:
                 seam_loss_contribution_ratio_value = 0.0
                 halo_inner_weighted_contribution = 0.0
                 halo_outer_weighted_contribution = 0.0
+                halo_inner_rgb_ratio_value = 0.0
+                halo_outer_rgb_ratio_value = 0.0
                 interior_continuation_weighted_contribution = 0.0
                 interior_core_weighted_contribution = 0.0
                 continuation_gradient_weighted_contribution = 0.0
@@ -7199,6 +9829,12 @@ def train(args: argparse.Namespace) -> None:
                 bind_win_rate_value = 0.0
                 bind_active_batch = 0.0
                 bind_negative_mode = "none"
+                bind_negative_mode_requested = "none"
+                bind_negative_mode_realized = "none"
+                bind_negative_delta_retry_count = 0.0
+                bind_negative_fallback_triggered = 0.0
+                bind_negative_fallback_reason = "none"
+                bind_negative_delta_mean = 0.0
                 seam_rgb_summary: Dict[str, object] = {}
                 seam_alpha_summary: Dict[str, object] = {}
                 step_for_logging = global_step + 1
@@ -7211,6 +9847,7 @@ def train(args: argparse.Namespace) -> None:
                 seam_adapter_log_now = bool(
                     seam_config["enabled"]
                     and seam_config.get("seam_adapter_enabled", False)
+                    and not bool(regional_loss_config.get("enabled", False))
                     and (
                         step_for_logging == 1
                         or step_for_logging % max(1, args.loss_trace_every) == 0
@@ -7333,6 +9970,1430 @@ def train(args: argparse.Namespace) -> None:
                     pos_loss_per_sample = masked_sum / masked_area
                     diffusion_loss = pos_loss_per_sample.mean()
                     loss = diffusion_loss
+                    standard_base_diffusion_loss_raw_value = float(diffusion_loss.detach().item())
+                    standard_base_diffusion_loss_weighted_value = standard_base_diffusion_loss_raw_value
+                    regional_relative_step = max(0, int(global_step) - int(resumed_step))
+                    regional_schedule_step = regional_relative_step
+                    if regional_loss_config.get("enabled", False):
+                        regional_hold_step = int(regional_loss_config.get("behavior_hold_step", regional_loss_config.get("tau_anneal_steps", 200)))
+                        if regional_hold_step >= 0:
+                            regional_schedule_step = min(regional_relative_step, regional_hold_step)
+                    pred_x0_latents_for_decode = None
+                    pred_x0_latents_for_decode_grad = None
+                    pred_x0_latents_for_decode_style_ratio_grad = None
+                    seam_rgb_grad_scale = 1.0
+
+                    # ----------------------------------------------------------
+                    # Regional multi-target diffusion loss (Phase 1 of plan).
+                    # When enabled, REPLACES the standard MSE diffusion loss.
+                    # ----------------------------------------------------------
+                    regional_outputs = None
+                    regional_loss_value = 0.0
+                    rgb_aux_loss_value = 0.0
+                    rgb_aux_mask_sum_value = 0.0
+                    hard_band_gradient_loss_value = 0.0
+                    hard_band_gradient_loss_weighted_value = 0.0
+                    hard_band_valid_mask_sum_value = 0.0
+                    regional_pred_rgb = None
+                    regional_winner_rgb = None
+                    regional_cand_rgb = None
+                    regional_cand_q_lat = None
+                    regional_targets_x0 = None
+                    regional_cand_active = None
+                    regional_sqrt_alpha_t = None
+                    regional_sqrt_one_minus_alpha_t = None
+                    regional_pred_x0_for_region = None
+                    regional_candidate_valid = None
+                    regional_candidate_valid_diagnostics: Dict[str, torch.Tensor] = {}
+                    regional_terrain_soft_full = None
+                    regional_alpha_boundary_full = None
+                    regional_seam_boundary_full = None
+                    regional_loss_valid_mask_full = trusted_mask.float()
+                    dynamic_qroute_enabled = bool(regional_loss_config.get("q_route_dynamic_enabled", True))
+                    if regional_loss_config.get("enabled", False):
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
+                            regional_loss_valid_mask_full = _center_embed_spatial_tensor(
+                                torch.ones(
+                                    (
+                                        source_batch_images.shape[0],
+                                        1,
+                                        source_batch_images.shape[-2],
+                                        source_batch_images.shape[-1],
+                                    ),
+                                    device=accelerator.device,
+                                    dtype=weight_dtype,
+                                ),
+                                int(training_expanded_halo_px),
+                                fill_value=0.0,
+                            )
+                            if batch.get("valid_expanded_source_mask") is not None:
+                                regional_loss_valid_mask_full = regional_loss_valid_mask_full * batch["valid_expanded_source_mask"].to(
+                                    accelerator.device,
+                                    dtype=weight_dtype,
+                                ).unsqueeze(1)
+                        else:
+                            regional_loss_valid_mask_full = torch.ones_like(trusted_mask.float())
+                    regional_diag_values: Dict[str, object] = {
+                        "regional_diff_loss": 0.0,
+                        "regional_diff_loss_weighted": 0.0,
+                        "base_diffusion_loss": 0.0,
+                        "regional_base_ownership_weight": 0.0,
+                        "base_diffusion_anchor_weight": 1.0,
+                        "teacher_preservation_enabled": 0.0,
+                        "teacher_preservation_loss": 0.0,
+                        "teacher_preservation_weight": 0.0,
+                        "regional_routing_protected_warmup_active": 0.0,
+                        "regional_freeze_gate_routing_head_during_warmup": 0.0,
+                        "regional_detach_routing_from_regional_loss_during_warmup": 0.0,
+                        "competitive_gate_enabled": 0.0,
+                        "competitive_gate_effective_weight": 0.0,
+                        "competitive_gate_neutralized_for_equivalence": 1.0,
+                        "base_weight_floor": 1.0,
+                        "competitive_surplus_weight": 0.0,
+                        "catchup_weight": 0.0,
+                        "regional_diff_loss_unmasked": 0.0,
+                        "regional_diff_loss_raw": 0.0,
+                        "regional_diff_loss_safe": 0.0,
+                        "regional_diff_loss_weighted_raw": 0.0,
+                        "regional_loss_raw_safe_ratio": 0.0,
+                        "regional_loss_spike": 0.0,
+                        "regional_loss_spike_threshold": 0.0,
+                        "regional_loss_rolling_median_200": 0.0,
+                        "regional_loss_rolling_median_20": 0.0,
+                        "regional_loss_initial_baseline": 0.0,
+                        "regional_loss_ratio_to_initial": 0.0,
+                        "regional_loss_ratio_to_rolling": 0.0,
+                        "regional_loss_spike_but_slope_improving": 0.0,
+                        "regional_loss_spike_debug_saved": 0.0,
+                        "spike_count_100": 0.0,
+                        "max_raw_regional_loss_100": 0.0,
+                        "log10_max_raw_regional_loss_100": 0.0,
+                        "regional_loss_denominator": 0.0,
+                        "regional_loss_min_denominator": 0.0,
+                        "regional_loss_per_sample_raw_max": 0.0,
+                        "regional_loss_per_sample_safe_max": 0.0,
+                        "max_pixel_loss_per_sample_max": 0.0,
+                        "mean_pixel_loss_per_sample_max": 0.0,
+                        "max_candidate_loss_per_sample_max": 0.0,
+                        "candidate_with_max_loss_max": 0.0,
+                        "pixel_max_candidate_max": 0.0,
+                        "pixel_max_y_max": 0.0,
+                        "pixel_max_x_max": 0.0,
+                        "target_eps_sigma_min_raw": 0.0,
+                        "target_eps_sigma_min_safe": 0.0,
+                        "timestep_min": 0.0,
+                        "timestep_max": 0.0,
+                        "sigma": 0.0,
+                        "sigma_min": 0.0,
+                        "sigma_max": 0.0,
+                        "snr": 0.0,
+                        "snr_min": 0.0,
+                        "snr_max": 0.0,
+                        "diffusion_loss_weight_t_raw_max": 0.0,
+                        "diffusion_loss_weight_t_safe_max": 0.0,
+                        "diffusion_loss_weight_t_max": 0.0,
+                        "regional_loss_sigma_weight_mean": 1.0,
+                        "regional_loss_sigma_weight_min": 1.0,
+                        "regional_loss_sigma_weight_max": 1.0,
+                        "regional_low_sigma_weight": 1.0,
+                        "regional_competition_skipped_low_sigma": 0.0,
+                        "regional_competition_skipped_low_sigma_count": 0.0,
+                        "candidate_competition_weight_mean": 1.0,
+                        "candidate_competition_weight_min": 1.0,
+                        "candidate_competition_weight_max": 1.0,
+                        "regional_nonfinite_detected": 0.0,
+                        "isfinite_pred_x0": 1.0,
+                        "isfinite_target_i": 1.0,
+                        "isfinite_R_i": 1.0,
+                        "isfinite_L_train_i": 1.0,
+                        "isfinite_L_train_i_safe": 1.0,
+                        "isfinite_routing": 1.0,
+                        "max_abs_pred_x0": 0.0,
+                        "max_abs_pred_target_delta": 0.0,
+                        "max_abs_R_i": 0.0,
+                        "max_abs_L_train_i": 0.0,
+                        "max_abs_L_train_i_safe": 0.0,
+                        "active_content_mask_mean": 0.0,
+                        "active_content_mask_sum": 0.0,
+                        "active_content_mask_sum_latent": 0.0,
+                        "active_content_mask_sum_pooled": 0.0,
+                        "active_content_latent_mask_sum": 0.0,
+                        "active_content_pooled_mask_sum": 0.0,
+                        "terrain_soft_mean": 0.0,
+                        "terrain_soft_sum": 0.0,
+                        "terrain_soft_min": 0.0,
+                        "terrain_soft_max": 0.0,
+                        "terrain_empty_count": 0.0,
+                        "terrain_empty_sample_count": 0.0,
+                        "seam_boundary_content_mask_sum": 0.0,
+                        "active_content_fraction": 0.0,
+                        "fraction_of_active_diffusion_pixels_kept": 0.0,
+                        "active_content_fraction_raw_min": 0.0,
+                        "active_content_fraction_raw_max": 0.0,
+                        "active_content_fraction_min": 0.0,
+                        "active_content_fraction_max": 0.0,
+                        "active_content_mask_fallback": 0.0,
+                        "active_content_fallback_count": 0.0,
+                        "active_diffusion_mask_sum_min": 0.0,
+                        "active_content_mask_sum_min": 0.0,
+                        "ri_active_candidate_std_mean": 0.0,
+                        "ri_active_candidate_std_max": 0.0,
+                        "ri_active_pairwise_absdiff_mean": 0.0,
+                        "ri_active_pairwise_absdiff_max": 0.0,
+                        "ri_active_q_neg_r_corr_mean": 0.0,
+                        "ri_active_q_neg_r_corr_min": 0.0,
+                        "ri_unmasked_candidate_std_mean": 0.0,
+                        "ri_unmasked_candidate_std_max": 0.0,
+                        "ri_unmasked_pairwise_absdiff_mean": 0.0,
+                        "ri_unmasked_pairwise_absdiff_max": 0.0,
+                        "ri_unmasked_q_neg_r_corr_mean": 0.0,
+                        "ri_unmasked_q_neg_r_corr_min": 0.0,
+                        "q_regret_loss": 0.0,
+                        "q_regret_loss_weighted": 0.0,
+                        "q_regret_active_pair_fraction": 0.0,
+                        "q_regret_violation_mean": 0.0,
+                        "q_regret_violation_max": 0.0,
+                        "phase": 1.0,
+                        "rho_q_route": 0.0,
+                        "q_route_u": 0.0,
+                        "gamma_boot": 0.0,
+                        "gamma_route": 0.0,
+                        "q_confidence_mean": 0.0,
+                        "q_confidence_max": 0.0,
+                        "q_confidence_threshold": 0.0,
+                        "q_confidence_mask_fraction": 0.0,
+                        "aux_ramp": 0.0,
+                        "aux_strength": 0.0,
+                        "lambda_q_regret_current": 0.0,
+                        "lambda_bind_current": 0.0,
+                        "q_regret_weight_current": 0.0,
+                        "bind_weight_current": 0.0,
+                        "combined_aux_regional_ratio": 0.0,
+                        "regional_loss_slope": 0.0,
+                        "regional_loss_slope_raw_ema": 0.0,
+                        "regional_loss_log_slope_raw": 0.0,
+                        "regional_loss_log_slope_clipped": 0.0,
+                        "regional_loss_ema_raw": 0.0,
+                        "regional_diff_loss_100step_ema": 0.0,
+                        "guardrail_triggered": 0.0,
+                        "guardrail_reason": "none",
+                        "phase15_ready_streak": 0.0,
+                        "phase15_exit_ready": 0.0,
+                        "phase15_exit_block_reason": "not_checked",
+                        "regional_guard_ma20": 0.0,
+                        "regional_guard_threshold": 0.0,
+                        "regional_guard_bad_streak": 0.0,
+                        "regional_guard_stop": 0.0,
+                        "regional_guard_baseline": 0.0,
+                        "q_regret_ratio": 0.0,
+                        "bind_ratio": 0.0,
+                        "hard_band_ratio": 0.0,
+                        "alpha_ratio": 0.0,
+                        "rgb_aux_ratio": 0.0,
+                        "lambda_q_mix": 0.0,
+                        "q_mix_schedule_step": 0.0,
+                        "q_mix_weight": 0.0,
+                        "q_mix_added_mass": 0.0,
+                        "q_entropy_mean": 0.0,
+                        "q_entropy_normalized": 0.0,
+                        "q_raw_entropy_mean": 0.0,
+                        "q_raw_entropy_normalized": 0.0,
+                        "q_route_entropy_mean": 0.0,
+                        "q_route_entropy_normalized": 0.0,
+                        "q_boot_entropy_mean": 0.0,
+                        "q_boot_entropy_normalized": 0.0,
+                        "q_boot_usage": 0.0,
+                        "routing_entropy_mean": 0.0,
+                        "routing_entropy_normalized": 0.0,
+                        "entropy_sharpening": 0.0,
+                        "routing_gate_l1_mean": 0.0,
+                        "routing_q_l1_mean": 0.0,
+                        "routing_mass_mean": 0.0,
+                        "routing_mass_abs_error": 0.0,
+                        "q_valid_sum_deviation_from_1": 0.0,
+                        "rgb_aux_loss": 0.0,
+                        "rgb_aux_loss_weighted": 0.0,
+                        "rgb_aux_mask_sum": 0.0,
+                        "hard_band_gradient_loss": 0.0,
+                        "hard_band_gradient_loss_weighted": 0.0,
+                        "hard_band_valid_mask_sum": 0.0,
+                        "hard_band_current_scale": 0.0,
+                        "hard_band_weight_current": 0.0,
+                        "alpha_loss_mask_sum": 0.0,
+                        "gate_entropy_mean": 0.0,
+                        "gate_entropy_normalized": 0.0,
+                        "gate_score_gap_mean": 0.0,
+                        "gate_smoothness": 0.0,
+                        "q_winner_alignment": 0.0,
+                        "q_winner_alignment_all": 0.0,
+                        "winner_share_interior": 0.0,
+                        "winner_share_north": 0.0,
+                        "winner_share_south": 0.0,
+                        "winner_share_east": 0.0,
+                        "winner_share_west": 0.0,
+                        "winner_hard_region_share_interior": 0.0,
+                        "winner_hard_band_share_north": 0.0,
+                        "winner_hard_band_share_south": 0.0,
+                        "winner_hard_band_share_east": 0.0,
+                        "winner_hard_band_share_west": 0.0,
+                        "tau_current": 0.0,
+                        "gamma_current": 0.0,
+                        "bind_loss": 0.0,
+                        "bind_loss_weighted": 0.0,
+                        "bind_ranking_gap": 0.0,
+                        "effective_bind_weight": 0.0,
+                        "min_in_region_advantage": 0.0,
+                        "mean_in_region_advantage": 0.0,
+                        "worst_region_index": 0.0,
+                        "worst_region_slot": 0.0,
+                        "worst_region_name": "none",
+                        "worst_region_is_active": 0.0,
+                        "worst_region_advantage": 0.0,
+                        "worst_region_R_self": 0.0,
+                        "worst_region_R_comp": 0.0,
+                        "worst_region_q_route_mass": 0.0,
+                        "worst_region_q_raw_mass": 0.0,
+                        "worst_region_gate_share": 0.0,
+                        "worst_region_routing_share": 0.0,
+                        "worst_region_winner_share": 0.0,
+                        "phase1_exit_ready": 0.0,
+                        "phase1_exit_block_reason": "not_checked",
+                        "q_route_mass_sum": 0.0,
+                        "q_raw_mass_sum": 0.0,
+                        "competitive_catchup_loss": 0.0,
+                        "canary_baseline_ready": 0.0,
+                        "canary_regional_loss_baseline": 0.0,
+                        "canary_baseline_sample_count": 0.0,
+                        "canary_regional_loss_ratio_to_baseline": 0.0,
+                    }
+                    for _slot_name in ("interior", "north", "south", "east", "west"):
+                        regional_diag_values[f"q_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"q_valid_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"q_raw_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"invalid_q_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"invalid_raw_q_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"gate_share_{_slot_name}"] = 0.0
+                        regional_diag_values[f"routing_share_{_slot_name}"] = 0.0
+                        regional_diag_values[f"invalid_routing_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"invalid_gate_mass_{_slot_name}"] = 0.0
+                        regional_diag_values[f"invalid_winner_share_{_slot_name}"] = 0.0
+                        regional_diag_values[f"q_route_terrain_support_{_slot_name}"] = 0.0
+                        regional_diag_values[f"regional_loss_contribution_{_slot_name}"] = 0.0
+                        regional_diag_values[f"gate_q_ratio_{_slot_name}"] = 0.0
+                        regional_diag_values[f"q_band_gate_{_slot_name}"] = 0.0
+                        regional_diag_values[f"q_gate_corr_{_slot_name}"] = 0.0
+                        regional_diag_values[f"q_routing_corr_{_slot_name}"] = 0.0
+                        regional_diag_values[f"r_mean_{_slot_name}"] = 0.0
+                        regional_diag_values[f"r_high_q_{_slot_name}"] = 0.0
+                        regional_diag_values[f"r_low_q_{_slot_name}"] = 0.0
+                        regional_diag_values[f"specialization_advantage_{_slot_name}"] = 0.0
+                        regional_diag_values[f"region_weight_sum_{_slot_name}"] = 0.0
+                        regional_diag_values[f"R_self_{_slot_name}"] = 0.0
+                        regional_diag_values[f"R_comp_{_slot_name}"] = 0.0
+                        regional_diag_values[f"R_comp_mean_{_slot_name}"] = 0.0
+                        regional_diag_values[f"R_comp_best_{_slot_name}"] = 0.0
+                        regional_diag_values[f"in_region_advantage_{_slot_name}"] = 0.0
+                        regional_diag_values[f"in_region_advantage_ema_{_slot_name}"] = 0.0
+                        regional_diag_values[f"competitive_gate_{_slot_name}"] = 1.0
+                        regional_diag_values[f"competitive_gate_raw_{_slot_name}"] = 1.0
+                        regional_diag_values[f"competitive_gate_delta_{_slot_name}"] = 0.0
+                        regional_diag_values[f"base_region_loss_{_slot_name}"] = 0.0
+                        regional_diag_values[f"competitive_region_loss_{_slot_name}"] = 0.0
+                        regional_diag_values[f"final_region_loss_{_slot_name}"] = 0.0
+                        regional_diag_values[f"catchup_loss_{_slot_name}"] = 0.0
+                        regional_diag_values[f"catchup_active_{_slot_name}"] = 0.0
+                        regional_diag_values[f"would_hard_gate_suppress_{_slot_name}"] = 0.0
+                    regional_debug_due = False
+                    regional_halo_debug_maps = None
+                    if (
+                        regional_loss_config["enabled"]
+                        and batch.get("candidate_targets_rgb") is not None
+                        and batch.get("candidate_active_mask") is not None
+                    ):
+                        rcfg = regional_loss_lib.RegionalLossConfig.from_dict(regional_loss_config)
+                        if (
+                            training_expanded_supervision_enabled
+                            and int(training_expanded_halo_px) > 0
+                            and batch.get("expanded_candidate_targets_rgb") is not None
+                        ):
+                            cand_rgb_source = batch["expanded_candidate_targets_rgb"]
+                        else:
+                            cand_rgb_source = batch["candidate_targets_rgb"]
+                        cand_rgb = cand_rgb_source.to(accelerator.device, dtype=vae_dtype)
+                        cand_active = batch["candidate_active_mask"].to(accelerator.device, dtype=torch.float32)
+                        regional_cand_rgb = cand_rgb
+                        regional_cand_active = cand_active
+                        # VAE-encode candidate stack -> [B, T, 4, Hl, Wl]
+                        targets_x0 = regional_loss_lib.encode_candidate_targets(
+                            vae,
+                            cand_rgb,
+                            cand_active,
+                            sdxl_model_util.VAE_SCALE_FACTOR,
+                            encode_groups=int(regional_loss_config.get("encode_groups", 1)),
+                            enable_vae_tiling=bool(regional_loss_config.get("target_encode_vae_tiling", True)),
+                            tile_sample_min_size=int(regional_loss_config.get("target_encode_tile_sample_min_size", 512)),
+                            tile_overlap_factor=float(regional_loss_config.get("target_encode_tile_overlap_factor", 0.0)),
+                        ).to(dtype=weight_dtype)
+                        regional_targets_x0 = targets_x0
+                        regional_control = _build_qrouting_control(regional_qroute_controller, regional_loss_config, regional_relative_step) if dynamic_qroute_enabled else {
+                            "phase": 2.0,
+                            "rho_q_route": 1.0,
+                            "aux_strength": 0.0,
+                            "q_regret_weight": float(regional_loss_config.get("q_regret_loss_weight", 0.0)),
+                            "bind_weight": float(regional_loss_config.get("bind_preference_weight", 0.0)),
+                            "hard_band_scale": 1.0,
+                            "hard_band_weight": float(seam_config.get("hard_band_gradient_loss_weight", 0.0)),
+                        }
+                        protected_warmup_active = bool(regional_loss_config.get("regional_routing_protected_warmup_enabled", False)) and regional_relative_step < int(
+                            regional_loss_config.get("regional_routing_protected_warmup_steps", 0)
+                        )
+                        if protected_warmup_active:
+                            regional_control["rho_q_route"] = 1.0
+                            regional_control["q_regret_weight"] = 0.0
+                            regional_control["bind_weight"] = 0.0
+                        ratio_caps = _ratio_caps_for_phase(float(regional_control["phase"]))
+
+                        # Build per-candidate q-field from soft fields already on the
+                        # batch (slot 0 = interior, 1..4 = N/S/E/W). When the seam q
+                        # fields are not present we fall back to edge_band_masks.
+                        B_, T_ = cand_active.shape
+                        Hl_, Wl_ = noisy_latents.shape[-2:]
+                        # On training-grid (full res):
+                        H_full = batch_images.shape[-2]
+                        W_full = batch_images.shape[-1]
+                        cand_q_full = torch.zeros((B_, T_, 1, H_full, W_full), device=accelerator.device, dtype=torch.float32)
+                        def _coerce_regional_edge_tensor(raw_tensor: Optional[torch.Tensor], name: str) -> Optional[torch.Tensor]:
+                            if raw_tensor is None:
+                                return None
+                            out_tensor = raw_tensor.to(accelerator.device, dtype=torch.float32)
+                            if out_tensor.dim() == 5 and out_tensor.shape[2] == 1:
+                                out_tensor = out_tensor.squeeze(2)
+                            if out_tensor.dim() != 4:
+                                raise RuntimeError(f"{name} must be [B,4,H,W], got {tuple(out_tensor.shape)}")
+                            if out_tensor.shape[-2:] != (H_full, W_full):
+                                out_tensor = F.interpolate(out_tensor, size=(H_full, W_full), mode="area")
+                            return out_tensor.clamp(0.0, 1.0)
+
+                        edge_band_raw = batch.get("edge_band_masks")
+                        if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
+                            expanded_edge_band = batch.get("expanded_edge_band_masks")
+                            if expanded_edge_band is not None:
+                                edge_band_raw = expanded_edge_band
+                        edge_band = _coerce_regional_edge_tensor(edge_band_raw, "edge_band_masks")
+                        hard_band = _coerce_regional_edge_tensor(batch.get("hard_band_mask_per_edge"), "hard_band_mask_per_edge")
+                        if hard_band is None:
+                            hard_band = edge_band
+                        seam_interior_edge_band = _coerce_regional_edge_tensor(
+                            batch.get("seam_interior_edge_band_per_edge"),
+                            "seam_interior_edge_band_per_edge",
+                        )
+                        if seam_interior_edge_band is None:
+                            seam_interior_edge_band = hard_band
+                        seam_halo_band = _coerce_regional_edge_tensor(
+                            batch.get("seam_halo_band_per_edge"),
+                            "seam_halo_band_per_edge",
+                        )
+                        if terrain_mask_index >= 0:
+                            terrain_alpha_raw = conditioning_images[:, terrain_mask_index : terrain_mask_index + 1].float().clamp(0.0, 1.0)
+                            if terrain_alpha_raw.shape[-2:] != (H_full, W_full):
+                                terrain_alpha_raw = F.interpolate(terrain_alpha_raw, size=(H_full, W_full), mode="area")
+                            terrain_alpha_occ = _terrain_mask_to_occupancy(
+                                terrain_alpha_raw,
+                                bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+                            )
+                            regional_terrain_soft_full, regional_alpha_boundary_full = regional_loss_lib.build_terrain_soft_masks(
+                                terrain_alpha_occ,
+                                threshold=float(regional_loss_config.get("terrain_alpha_threshold", 0.05)),
+                                dilate_px=int(regional_loss_config.get("terrain_dilate_px", 6)),
+                                blur_sigma=float(regional_loss_config.get("terrain_blur_sigma", 3.0)),
+                                boundary_radius_px=int(regional_loss_config.get("terrain_boundary_radius_px", 6)),
+                            )
+                        if edge_band is not None:
+                            regional_seam_boundary_full = edge_band.amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                        if bool(regional_loss_config.get("q_blend_diffusion_enabled", False)):
+                            expanded_region_terrain_mask = regional_terrain_soft_full
+                            if expanded_region_terrain_mask is None:
+                                expanded_region_terrain_mask = regional_loss_valid_mask_full.float()
+                            regional_candidate_valid, regional_candidate_valid_diagnostics = _compute_seam_candidate_validity(
+                                cand_active=cand_active,
+                                seam_interior_edge_band=seam_interior_edge_band,
+                                seam_halo_band=seam_halo_band,
+                                expanded_region_terrain_mask=expanded_region_terrain_mask,
+                                regional_loss_config=regional_loss_config,
+                                step_for_logging=step_for_logging,
+                            )
+                        else:
+                            regional_candidate_valid = cand_active.detach()
+                        q_per_edge = batch.get("soft_field_q_per_edge")
+                        q_interior = batch.get("soft_field_q_interior")
+                        if q_per_edge is not None and q_interior is not None:
+                            q_per_edge = q_per_edge.to(accelerator.device, dtype=torch.float32)
+                            q_interior = q_interior.to(accelerator.device, dtype=torch.float32)
+                            if q_interior.dim() == 3:
+                                q_interior = q_interior.unsqueeze(1)
+                            if q_per_edge.dim() != 4 or q_interior.dim() != 4:
+                                raise RuntimeError(
+                                    f"regional q fields must be q_per_edge=[B,4,H,W], q_interior=[B,1,H,W]; got {tuple(q_per_edge.shape)} and {tuple(q_interior.shape)}"
+                                )
+                            if q_per_edge.shape[-2:] != (H_full, W_full):
+                                q_per_edge = F.interpolate(q_per_edge, size=(H_full, W_full), mode="area")
+                            if q_interior.shape[-2:] != (H_full, W_full):
+                                q_interior = F.interpolate(q_interior, size=(H_full, W_full), mode="area")
+                            cand_q_full[:, 0:1] = q_interior.clamp(0.0, 1.0).unsqueeze(1)
+                            cand_q_full[:, 1:5] = q_per_edge.clamp(0.0, 1.0).unsqueeze(2)
+                        elif edge_band is not None:
+                            # edge_band: [B, 4, H, W] order N/S/E/W matching dataset convention.
+                            interior_q = (1.0 - edge_band.amax(dim=1, keepdim=True)).clamp(0.0, 1.0)
+                            cand_q_full[:, 0:1] = interior_q
+                            cand_q_full[:, 1:5] = edge_band.unsqueeze(2)
+                        else:
+                            cand_q_full[:, 0:1] = 1.0
+                        # Resample to latent grid via area pool.
+                        cand_q_lat = F.interpolate(
+                            cand_q_full.view(B_ * T_, 1, H_full, W_full),
+                            size=(Hl_, Wl_),
+                            mode="area",
+                        ).view(B_, T_, 1, Hl_, Wl_)
+                        regional_cand_q_lat = cand_q_lat
+                        regional_q_debug_maps: Dict[str, torch.Tensor] = {}
+                        for batch_key, debug_label in (
+                            ("q_distance_px_per_edge", "q_distance"),
+                            ("q_inward_decay_per_edge", "q_inward_decay"),
+                            ("q_edge_post_mask_per_edge", "q_edge_final"),
+                            ("q_max_edge", "q_max_edge"),
+                            ("q_interior", "q_interior"),
+                        ):
+                            debug_tensor = batch.get(batch_key)
+                            if debug_tensor is not None:
+                                debug_tensor = debug_tensor.to(accelerator.device, dtype=torch.float32)
+                                if batch_key == "q_distance_px_per_edge":
+                                    distance_max = debug_tensor.amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+                                    debug_tensor = 1.0 - (debug_tensor / distance_max).clamp(0.0, 1.0)
+                                regional_q_debug_maps[debug_label] = debug_tensor.clamp(0.0, 1.0)
+
+                        # sqrt_alpha_t / sqrt_one_minus_alpha_t per sample.
+                        alpha_t_full = noise_scheduler.alphas_cumprod[timesteps].to(
+                            device=noisy_latents.device, dtype=noisy_latents.dtype
+                        )
+                        sqrt_alpha_t = alpha_t_full.sqrt().view(B_, 1, 1, 1)
+                        sqrt_one_minus_alpha_t = (1.0 - alpha_t_full).clamp_min(1e-8).sqrt().view(B_, 1, 1, 1)
+                        regional_sqrt_alpha_t = sqrt_alpha_t
+                        regional_sqrt_one_minus_alpha_t = sqrt_one_minus_alpha_t
+
+                        # Compute pred_x0 in the same convention as the existing seam
+                        # path (alpha_t is the cumulative alpha; eps prediction).
+                        pred_x0_for_region = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                        regional_pred_x0_for_region = pred_x0_for_region
+
+                        trusted_mask_lat = F.interpolate(regional_loss_valid_mask_full, size=(Hl_, Wl_), mode="area")
+                        terrain_soft_lat = None
+                        alpha_boundary_lat = None
+                        seam_boundary_lat = None
+                        if regional_terrain_soft_full is not None:
+                            terrain_soft_lat = F.interpolate(regional_terrain_soft_full, size=(Hl_, Wl_), mode="area")
+                        if regional_alpha_boundary_full is not None:
+                            alpha_boundary_lat = F.interpolate(regional_alpha_boundary_full, size=(Hl_, Wl_), mode="area")
+                        if regional_seam_boundary_full is not None:
+                            seam_boundary_lat = F.interpolate(regional_seam_boundary_full, size=(Hl_, Wl_), mode="area")
+                        prev_advantage_ema = torch.tensor(
+                            [
+                                float(regional_qroute_controller.ema.get(f"competitive_advantage_ema_slot{_slot_idx}", 0.0))
+                                for _slot_idx in range(len(REGIONAL_SLOT_NAMES))
+                            ],
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        prev_competitive_gate = torch.tensor(
+                            [
+                                float(regional_qroute_controller.ema.get(f"competitive_gate_slot{_slot_idx}", 1.0))
+                                for _slot_idx in range(len(REGIONAL_SLOT_NAMES))
+                            ],
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        regional_outputs = regional_loss_lib.compute_regional_loss(
+                            pred_x0_latents=pred_x0_for_region,
+                            targets_x0_latents=targets_x0.float(),
+                            candidate_active_mask=cand_active,
+                            candidate_q_field_latent=cand_q_lat,
+                            noise=noise.float(),
+                            noise_pred=noise_pred.float(),
+                            noisy_latents=noisy_latents.float(),
+                            sqrt_alpha_t=sqrt_alpha_t.float(),
+                            sqrt_one_minus_alpha_t=sqrt_one_minus_alpha_t.float(),
+                            trusted_mask_latent=trusted_mask_lat.float(),
+                            cfg=rcfg,
+                            current_step=regional_schedule_step,
+                            terrain_soft_latent=None if terrain_soft_lat is None else terrain_soft_lat.float(),
+                            seam_boundary_mask_latent=None if seam_boundary_lat is None else seam_boundary_lat.float(),
+                            alpha_boundary_mask_latent=None if alpha_boundary_lat is None else alpha_boundary_lat.float(),
+                            candidate_valid=regional_candidate_valid,
+                            candidate_valid_diagnostics=regional_candidate_valid_diagnostics,
+                            q_mix_step=regional_relative_step,
+                            rho_q_route_override=float(regional_control["rho_q_route"]) if dynamic_qroute_enabled else None,
+                            lambda_q_regret_override=float(regional_control["q_regret_weight"]) if dynamic_qroute_enabled else None,
+                            lambda_bind_override=float(regional_control["bind_weight"]) if dynamic_qroute_enabled else None,
+                            hard_band_scale_override=float(regional_control["hard_band_scale"]) if dynamic_qroute_enabled else None,
+                            phase_override=float(regional_control["phase"]) if dynamic_qroute_enabled else 2.0,
+                            advantage_ema_prev=prev_advantage_ema,
+                            competitive_gate_prev=prev_competitive_gate,
+                        )
+                        _diag = regional_outputs["diagnostics"]
+                        L_region = regional_outputs["loss"].to(weight_dtype)
+                        L_q_regret = regional_outputs["q_regret_loss"].to(weight_dtype)
+                        L_catchup = regional_outputs.get(
+                            "catchup_loss",
+                            torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype),
+                        ).to(weight_dtype)
+                        lambda_q_regret_current = float(_diag["lambda_q_regret_current"].detach().item())
+                        regional_loss_value = float(L_region.detach().item())
+                        regional_loss_raw_value = _tensor_scalar(_diag.get("regional_diff_loss_raw"), regional_loss_value)
+                        ownership_ramp_steps = max(0, int(regional_loss_config.get("regional_base_ownership_ramp_steps", 0)))
+                        if ownership_ramp_steps <= 0:
+                            regional_base_ownership_weight = float(regional_loss_config.get("regional_base_ownership_target_weight", 1.0))
+                        else:
+                            ownership_u = max(0.0, min(1.0, float(regional_relative_step) / float(ownership_ramp_steps)))
+                            regional_base_ownership_weight = _lerp_float(
+                                float(regional_loss_config.get("regional_base_ownership_initial_weight", 1.0)),
+                                float(regional_loss_config.get("regional_base_ownership_target_weight", 1.0)),
+                                ownership_u,
+                            )
+                        regional_base_ownership_weight = max(0.0, min(1.0, regional_base_ownership_weight))
+                        base_diffusion_anchor_weight = max(0.0, min(1.0, 1.0 - regional_base_ownership_weight))
+                        regional_diff_weighted_value = regional_base_ownership_weight * float(rcfg.regional_diff_loss_weight) * regional_loss_value
+                        regional_diff_weighted_raw_value = regional_base_ownership_weight * float(rcfg.regional_diff_loss_weight) * regional_loss_raw_value
+                        if dynamic_qroute_enabled:
+                            lambda_q_regret_current = _cap_weight_by_ratio(
+                                lambda_q_regret_current,
+                                float(L_q_regret.detach().item()),
+                                regional_diff_weighted_value,
+                                ratio_caps["q_regret"][1],
+                            )
+                        loss = (
+                            (base_diffusion_anchor_weight * diffusion_loss)
+                            + (regional_base_ownership_weight * float(rcfg.regional_diff_loss_weight) * L_region)
+                            + (regional_base_ownership_weight * ((lambda_q_regret_current * L_q_regret) + L_catchup))
+                        )
+
+                        advantage_ema_state = _diag.get("advantage_ema_state")
+                        if isinstance(advantage_ema_state, torch.Tensor):
+                            for _slot_idx, _slot_value in enumerate(advantage_ema_state.detach().float().reshape(-1).tolist()):
+                                regional_qroute_controller.ema[f"competitive_advantage_ema_slot{_slot_idx}"] = float(_slot_value)
+                        competitive_gate_state = _diag.get("competitive_gate_state")
+                        if isinstance(competitive_gate_state, torch.Tensor):
+                            for _slot_idx, _slot_value in enumerate(competitive_gate_state.detach().float().reshape(-1).tolist()):
+                                regional_qroute_controller.ema[f"competitive_gate_slot{_slot_idx}"] = float(_slot_value)
+
+                        hard_band_gradient_weight_base = float(seam_config.get("hard_band_gradient_loss_weight", 0.0))
+                        hard_band_current_scale = float(_diag["hard_band_current_scale"].detach().item())
+                        hard_band_gradient_weight = hard_band_gradient_weight_base * hard_band_current_scale
+                        regional_debug_enabled = bool(
+                            verification_config.get(
+                                "save_regional_visual_debug",
+                                verification_config.get("save_seam_visual_debug", False),
+                            )
+                        )
+                        regional_debug_max_steps = int(
+                            verification_config.get(
+                                "regional_visual_debug_max_steps",
+                                verification_config.get("seam_visual_debug_max_steps", 0),
+                            )
+                        )
+                        regional_debug_every = max(
+                            1,
+                            int(
+                                verification_config.get(
+                                    "regional_visual_debug_every_n_steps",
+                                    verification_config.get("seam_visual_debug_every_n_steps", 25),
+                                )
+                            ),
+                        )
+                        regional_debug_due = (
+                            regional_debug_enabled
+                            and regional_relative_step <= regional_debug_max_steps
+                            and (regional_relative_step == 0 or regional_relative_step % regional_debug_every == 0)
+                        )
+                        if regional_debug_due:
+                            full_h = int(batch_images.shape[-2])
+                            full_w = int(batch_images.shape[-1])
+                            regional_halo_debug_maps = {
+                                "halo_inner_mask": torch.zeros((1, 1, full_h, full_w), dtype=torch.float32),
+                                "halo_outer_mask": torch.zeros((1, 1, full_h, full_w), dtype=torch.float32),
+                                "halo_inner_diff": torch.zeros((1, 1, full_h, full_w), dtype=torch.float32),
+                                "halo_outer_diff": torch.zeros((1, 1, full_h, full_w), dtype=torch.float32),
+                            }
+                        L_rgb_aux = None
+                        L_hard_band_gradient = None
+
+                        needs_regional_decode = (
+                            rcfg.rgb_aux_loss_weight > 0.0
+                            or hard_band_gradient_weight > 0.0
+                            or regional_debug_due
+                        )
+                        if needs_regional_decode:
+                            if accelerator.is_main_process and regional_relative_step <= 1:
+                                logger.info(
+                                    "[regional/rgb_status] step=%d need_decode=1 rgb_aux_weight=%.6f hard_band_gradient_weight=%.6f debug_due=%d decode_scale=%.3f",
+                                    step_for_logging,
+                                    float(rcfg.rgb_aux_loss_weight),
+                                    float(hard_band_gradient_weight),
+                                    1 if regional_debug_due else 0,
+                                    float(regional_loss_config.get("rgb_aux_decode_scale", 1.0)),
+                                )
+                            try:
+                                regional_decode_scale = float(regional_loss_config.get("rgb_aux_decode_scale", 1.0))
+                                regional_decode_scale = max(0.125, min(1.0, regional_decode_scale))
+                                winner_lat = regional_loss_lib.gather_winner_latents(
+                                    targets_x0.float(),
+                                    regional_outputs["winner_idx_latent"],
+                                ).detach()
+
+                                pred_x0_latents_down = pred_x0_for_region
+                                winner_latents_down = winner_lat
+                                q_blend_target_latents_down = regional_outputs.get("q_blend_target_x0_latents")
+                                if regional_decode_scale < 0.999:
+                                    decode_h = max(1, int(round(float(pred_x0_for_region.shape[-2]) * regional_decode_scale)))
+                                    decode_w = max(1, int(round(float(pred_x0_for_region.shape[-1]) * regional_decode_scale)))
+                                    pred_x0_latents_down = F.interpolate(
+                                        pred_x0_for_region.float(),
+                                        size=(decode_h, decode_w),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    winner_latents_down = F.interpolate(
+                                        winner_lat.float(),
+                                        size=(decode_h, decode_w),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    if q_blend_target_latents_down is not None:
+                                        q_blend_target_latents_down = F.interpolate(
+                                            q_blend_target_latents_down.float(),
+                                            size=(decode_h, decode_w),
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                pred_x0_decode = (pred_x0_latents_down / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
+                                regional_pred_rgb = vae.decode(pred_x0_decode).sample
+                                regional_q_blend_target_rgb = None
+                                with torch.no_grad():
+                                    winner_decode = (winner_latents_down / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
+                                    regional_winner_rgb = vae.decode(winner_decode).sample
+                                    if regional_debug_due and q_blend_target_latents_down is not None:
+                                        q_blend_target_decode = (q_blend_target_latents_down / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
+                                        regional_q_blend_target_rgb = vae.decode(q_blend_target_decode).sample
+
+                                if rcfg.rgb_aux_loss_weight > 0.0:
+                                    conf_full = F.interpolate(
+                                        regional_outputs["conf_latent"].float(),
+                                        size=regional_pred_rgb.shape[-2:],
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    tm_full = F.interpolate(
+                                        regional_outputs["active_content_mask_latent"].float(),
+                                        size=regional_pred_rgb.shape[-2:],
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    rgb_aux_mask_sum_value = float(tm_full.detach().sum().item())
+                                    L_rgb_aux = regional_loss_lib.compute_rgb_aux_loss(
+                                        pred_rgb=regional_pred_rgb,
+                                        winner_rgb=regional_winner_rgb,
+                                        trusted_mask_full=tm_full,
+                                        conf_full=conf_full,
+                                        confidence_weighted=rcfg.rgb_aux_confidence_weighted,
+                                    ).to(weight_dtype)
+                                    rgb_aux_loss_value = float(L_rgb_aux.detach().item())
+
+                                if hard_band_gradient_weight > 0.0 and hard_band is not None:
+                                    hard_raw_sum = regional_pred_rgb.new_tensor(0.0)
+                                    hard_weight_sum = regional_pred_rgb.new_tensor(0.0)
+                                    hard_content_mask = F.interpolate(
+                                        regional_outputs["hard_band_content_mask_latent"].float(),
+                                        size=regional_pred_rgb.shape[-2:],
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    ).to(device=regional_pred_rgb.device, dtype=regional_pred_rgb.dtype).clamp(0.0, 1.0)
+                                    hard_edge_masks = hard_band.to(device=regional_pred_rgb.device, dtype=torch.float32)
+                                    if hard_edge_masks.shape[-2:] != regional_pred_rgb.shape[-2:]:
+                                        hard_edge_masks = F.interpolate(hard_edge_masks, size=regional_pred_rgb.shape[-2:], mode="area")
+                                    for _edge_idx in range(4):
+                                        _edge_active_source = regional_candidate_valid if regional_candidate_valid is not None else cand_active
+                                        edge_active = _edge_active_source[:, 1 + _edge_idx].view(-1, 1, 1, 1).to(dtype=regional_pred_rgb.dtype)
+                                        edge_mask = (hard_edge_masks[:, _edge_idx : _edge_idx + 1] >= 0.5).to(dtype=regional_pred_rgb.dtype) * edge_active * hard_content_mask
+                                        hard_band_valid_mask_sum_value += float(edge_mask.detach().sum().item())
+                                        if float(edge_mask.sum().detach().item()) <= 0.0:
+                                            continue
+                                        edge_target_rgb = cand_rgb[:, 1 + _edge_idx].to(device=regional_pred_rgb.device, dtype=regional_pred_rgb.dtype)
+                                        if edge_target_rgb.shape[-2:] != regional_pred_rgb.shape[-2:]:
+                                            edge_target_rgb = F.interpolate(edge_target_rgb, size=regional_pred_rgb.shape[-2:], mode="bilinear", align_corners=False)
+                                        edge_grad = _compute_masked_rgb_gradient_loss(
+                                            pred_rgb=regional_pred_rgb,
+                                            target_rgb=edge_target_rgb,
+                                            weight_mask=edge_mask,
+                                            sobel_radius_px=int(seam_config.get("gradient_loss_sobel_radius_px", 1)),
+                                        )
+                                        hard_raw_sum = hard_raw_sum + edge_grad["weighted_raw_sum"]
+                                        hard_weight_sum = hard_weight_sum + edge_grad["weight_sum"]
+                                    if float(hard_weight_sum.detach().item()) > 0.0:
+                                        L_hard_band_gradient = (hard_raw_sum / hard_weight_sum.clamp_min(1e-6)).to(weight_dtype)
+                                        hard_band_gradient_loss_value = float(L_hard_band_gradient.detach().item())
+                                        hard_band_gradient_loss_weighted_value = hard_band_gradient_weight * hard_band_gradient_loss_value
+
+                                if accelerator.is_main_process and regional_relative_step <= 1:
+                                    logger.info(
+                                        "[regional/rgb_status] step=%d decoded=1 pred_rgb_hw=%sx%s rgb_aux_loss=%.6f hard_band_gradient_loss=%.6f",
+                                        step_for_logging,
+                                        int(regional_pred_rgb.shape[-2]),
+                                        int(regional_pred_rgb.shape[-1]),
+                                        float(rgb_aux_loss_value),
+                                        float(hard_band_gradient_loss_value),
+                                    )
+
+                                if regional_debug_due and regional_winner_rgb is not None and regional_pred_rgb is not None:
+                                    try:
+                                        _save_regional_visual_debug(
+                                            output_dir=args.output_dir,
+                                            step=step_for_logging,
+                                            pred_rgb=regional_pred_rgb.detach(),
+                                            winner_rgb=regional_winner_rgb.detach(),
+                                            candidate_rgb=cand_rgb.detach(),
+                                            gate_pooled=regional_outputs["gate"].detach(),
+                                            winner_idx_pooled=regional_outputs["winner_idx_pooled"].detach(),
+                                            candidate_q_latent=cand_q_lat.detach(),
+                                            q_debug_maps={
+                                                **{key: value.detach() for key, value in regional_q_debug_maps.items()},
+                                                "q_raw": regional_outputs["q_raw_pooled"].detach(),
+                                                "q_route": regional_outputs["q_route_pooled"].detach(),
+                                                "routing": regional_outputs["routing_pooled"].detach(),
+                                            },
+                                            trusted_mask=regional_outputs["active_content_mask_latent"].detach(),
+                                            halo_debug_maps=regional_halo_debug_maps,
+                                            ri_debug_maps={
+                                                "R_i_raw": regional_outputs.get("R_pixel").detach(),
+                                                "R_i_active": regional_outputs.get("R_pixel_active").detach(),
+                                                "R_i_no_terrain": regional_outputs.get("R_pixel_unmasked_active").detach(),
+                                                "R_i_advantage": regional_outputs.get("R_advantage_pixel").detach(),
+                                                  "q_blend_loss_raw": regional_outputs.get("q_blend_loss_map_raw").detach(),
+                                                  "q_blend_loss_safe": regional_outputs.get("q_blend_loss_map_safe").detach(),
+                                                  "individual_regional_loss": regional_outputs.get("individual_regional_loss_map_safe").detach(),
+                                                "q_boot": regional_outputs.get("q_boot_pooled").detach(),
+                                            },
+                                              q_blend_target_rgb=regional_q_blend_target_rgb.detach() if regional_q_blend_target_rgb is not None else None,
+                                              q_blend_student_rgb=regional_pred_rgb.detach(),
+                                        )
+                                    except Exception as _dbg_e:
+                                        logger.warning("[regional/debug] failed: %s", _dbg_e)
+                            except Exception as _rgb_e:
+                                logger.warning("[regional/rgb] failed: %s", _rgb_e)
+
+                        rgb_aux_weight_current = float(rcfg.rgb_aux_loss_weight)
+                        if dynamic_qroute_enabled:
+                            rgb_aux_weight_current = _cap_weight_by_ratio(
+                                rgb_aux_weight_current,
+                                rgb_aux_loss_value,
+                                regional_diff_weighted_value,
+                                ratio_caps["rgb_aux"][1],
+                            )
+                        if L_rgb_aux is not None and rgb_aux_weight_current > 0.0:
+                            loss = loss + (rgb_aux_weight_current * L_rgb_aux)
+
+                        hard_band_weight_current = hard_band_gradient_weight
+                        if dynamic_qroute_enabled:
+                            q_regret_ratio_so_far = _loss_ratio(
+                                lambda_q_regret_current * float(L_q_regret.detach().item()),
+                                regional_diff_weighted_value,
+                            )
+                            hard_band_ratio_cap = min(
+                                ratio_caps["hard_band"][1],
+                                max(0.0, float(regional_loss_config.get("phase15_aux_triplet_ratio_cap", 0.12)) - q_regret_ratio_so_far),
+                            )
+                            hard_band_weight_current = _cap_weight_by_ratio(
+                                hard_band_gradient_weight,
+                                hard_band_gradient_loss_value,
+                                regional_diff_weighted_value,
+                                hard_band_ratio_cap,
+                            )
+                        if L_hard_band_gradient is not None and hard_band_weight_current > 0.0:
+                            hard_band_gradient_loss_weighted_value = hard_band_weight_current * hard_band_gradient_loss_value
+                            loss = loss + (hard_band_weight_current * L_hard_band_gradient)
+                        else:
+                            hard_band_gradient_loss_weighted_value = 0.0
+
+                        if bool(regional_loss_config.get("bind_loss_enabled", True)):
+                            effective_bind_weight = float(_diag["lambda_bind_current"].detach().item())
+                            regional_diag_values["effective_bind_weight"] = effective_bind_weight
+                            bind_ratio = float(alpha_config.get("bind_paired_batch_ratio", 0.0))
+                            if effective_bind_weight > 0.0 and bind_ratio > 0.0 and bind_pair_rng.random() < bind_ratio:
+                                bind_negative_mode_requested = _sample_negative_mode(alpha_config, bind_pair_rng, current_step=regional_relative_step)
+                                bind_negative_mode_realized = bind_negative_mode_requested
+                                precondition_c_ok, precondition_c_reason = _mode_c_precondition(
+                                    dataset,
+                                    conditioning_images,
+                                    terrain_mask_black_is_terrain=bool(alpha_config.get("terrain_mask_black_is_terrain", True)),
+                                )
+                                if bind_negative_mode_requested == "local_spatial_misalignment" and not precondition_c_ok:
+                                    bind_negative_mode_realized = "wall_to_flat_suppression"
+                                    bind_negative_fallback_reason = precondition_c_reason
+                                    bind_negative_fallback_triggered = 1.0
+                                corrupted_conditioning, bind_negative_mode_realized, bind_negative_delta_mean = _build_corrupted_geometry_conditioning(
+                                    dataset,
+                                    conditioning_images,
+                                    mode=bind_negative_mode_realized,
+                                    rng=bind_pair_rng,
+                                    alpha_config=alpha_config,
+                                    assigned_crop_class=batch.get("assigned_crop_class", None),
+                                    special_structure_tags=batch.get("special_structure_tags", None),
+                                )
+                                corrupted_model_conditioning = build_corrupted_model_visible_conditioning(
+                                    batch,
+                                    dataset,
+                                    seam_config,
+                                    corrupted_conditioning,
+                                    accelerator.device,
+                                    weight_dtype,
+                                    int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0,
+                                )
+                                input_resi_add_neg, mid_add_neg = control_net(
+                                    noisy_latents,
+                                    timesteps,
+                                    text_embedding,
+                                    vector_embedding,
+                                    corrupted_model_conditioning,
+                                )
+                                noise_pred_neg = unet(
+                                    noisy_latents,
+                                    timesteps,
+                                    text_embedding,
+                                    vector_embedding,
+                                    input_resi_add_neg,
+                                    mid_add_neg,
+                                )
+                                pred_x0_neg = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred_neg) / sqrt_alpha_t
+                                regional_outputs_neg = regional_loss_lib.compute_regional_loss(
+                                    pred_x0_latents=pred_x0_neg,
+                                    targets_x0_latents=targets_x0.float(),
+                                    candidate_active_mask=cand_active,
+                                    candidate_q_field_latent=cand_q_lat,
+                                    noise=noise.float(),
+                                    noise_pred=noise_pred_neg.float(),
+                                    noisy_latents=noisy_latents.float(),
+                                    sqrt_alpha_t=sqrt_alpha_t.float(),
+                                    sqrt_one_minus_alpha_t=sqrt_one_minus_alpha_t.float(),
+                                    trusted_mask_latent=trusted_mask_lat.float(),
+                                    cfg=rcfg,
+                                    current_step=regional_schedule_step,
+                                    terrain_soft_latent=None if terrain_soft_lat is None else terrain_soft_lat.float(),
+                                    seam_boundary_mask_latent=None if seam_boundary_lat is None else seam_boundary_lat.float(),
+                                    alpha_boundary_mask_latent=None if alpha_boundary_lat is None else alpha_boundary_lat.float(),
+                                    candidate_valid=regional_candidate_valid,
+                                    candidate_valid_diagnostics=regional_candidate_valid_diagnostics,
+                                    q_mix_step=regional_relative_step,
+                                    rho_q_route_override=float(regional_control["rho_q_route"]) if dynamic_qroute_enabled else None,
+                                    lambda_q_regret_override=float(regional_control["q_regret_weight"]) if dynamic_qroute_enabled else None,
+                                    lambda_bind_override=float(regional_control["bind_weight"]) if dynamic_qroute_enabled else None,
+                                    hard_band_scale_override=float(regional_control["hard_band_scale"]) if dynamic_qroute_enabled else None,
+                                    phase_override=float(regional_control["phase"]) if dynamic_qroute_enabled else 2.0,
+                                    advantage_ema_prev=prev_advantage_ema,
+                                    competitive_gate_prev=prev_competitive_gate,
+                                )
+                                L_region_neg = regional_outputs_neg["loss"].to(weight_dtype)
+                                bind_margin = float(regional_loss_config.get("bind_margin", 0.02))
+                                use_confident_bind = bool(regional_loss_config.get("q_confidence_mask_bind", True))
+                                L_region_bind_pos = regional_outputs.get("loss_q_confident", L_region) if use_confident_bind else L_region
+                                L_region_bind_neg = regional_outputs_neg.get("loss_q_confident", L_region_neg) if use_confident_bind else L_region_neg
+                                regional_ranking_gap = L_region_bind_neg - L_region_bind_pos
+                                bind_competition_weight = max(
+                                    float(regional_loss_config.get("candidate_competition_min_weight", 0.10)),
+                                    min(1.0, _tensor_scalar(_diag.get("candidate_competition_weight_mean"), 1.0)),
+                                )
+                                regional_bind_loss_raw = F.relu(
+                                    torch.tensor(bind_margin, device=regional_ranking_gap.device, dtype=regional_ranking_gap.dtype)
+                                    - regional_ranking_gap
+                                )
+                                regional_bind_loss = regional_bind_loss_raw * bind_competition_weight
+                                regional_diag_values["bind_loss"] = float(regional_bind_loss.detach().item())
+                                if dynamic_qroute_enabled:
+                                    q_hard_ratio_so_far = _loss_ratio(
+                                        (lambda_q_regret_current * float(L_q_regret.detach().item())) + hard_band_gradient_loss_weighted_value,
+                                        regional_diff_weighted_value,
+                                    )
+                                    bind_ratio_cap = min(
+                                        ratio_caps["bind"][1],
+                                        max(0.0, float(regional_loss_config.get("phase15_aux_triplet_ratio_cap", 0.12)) - q_hard_ratio_so_far),
+                                    )
+                                    effective_bind_weight = _cap_weight_by_ratio(
+                                        effective_bind_weight,
+                                        regional_diag_values["bind_loss"],
+                                        regional_diff_weighted_value,
+                                        bind_ratio_cap,
+                                    )
+                                regional_diag_values["bind_loss_weighted"] = effective_bind_weight * regional_diag_values["bind_loss"]
+                                loss = loss + (effective_bind_weight * regional_bind_loss)
+                                regional_diag_values["bind_ranking_gap"] = float(regional_ranking_gap.detach().item())
+                            regional_diag_values["effective_bind_weight"] = effective_bind_weight
+
+                        # Capture diagnostics into row-friendly floats.
+                        regional_diag_values["base_diffusion_loss"] = float(diffusion_loss.detach().item())
+                        regional_diag_values["regional_base_ownership_weight"] = regional_base_ownership_weight
+                        regional_diag_values["base_diffusion_anchor_weight"] = base_diffusion_anchor_weight
+                        regional_diag_values["teacher_preservation_enabled"] = 1.0 if bool(regional_loss_config.get("teacher_preservation_enabled", False)) else 0.0
+                        regional_diag_values["teacher_preservation_loss"] = 0.0
+                        regional_diag_values["teacher_preservation_weight"] = 0.0
+                        for _field_name in (
+                            "q_blend_diffusion_enabled",
+                            "q_blend_diffusion_space",
+                            "q_blend_weight",
+                            "q_blend_loss_raw",
+                            "q_blend_loss_safe",
+                            "q_blend_loss_weighted",
+                            "individual_regional_weight",
+                            "individual_regional_loss_raw",
+                            "individual_regional_loss_safe",
+                            "individual_regional_loss_weighted",
+                            "competitive_regret_weight",
+                            "q_blend_q_mass_abs_error",
+                            "q_blend_invalid_candidate_leak",
+                            "regional_loss_invalid_candidate_leak",
+                            "invalid_candidate_loss_leak",
+                            "q_valid_sum_deviation_from_1",
+                            "q_blend_active_content_mask_sum",
+                            "num_valid_directional_seams",
+                            "valid_directional_seams_hist_0",
+                            "valid_directional_seams_hist_1",
+                            "valid_directional_seams_hist_2",
+                            "valid_directional_seams_hist_gt2",
+                            "no_valid_directional_seam_count",
+                            "one_valid_directional_seam_count",
+                            "two_valid_directional_seam_count",
+                            "over_two_valid_directional_seam_count",
+                            "top2_truncation_count",
+                            "num_valid_directional_seams_raw",
+                            "candidate_valid_interior_mean",
+                            "candidate_valid_north_mean",
+                            "candidate_valid_south_mean",
+                            "candidate_valid_east_mean",
+                            "candidate_valid_west_mean",
+                            "valid_north_rate",
+                            "valid_south_rate",
+                            "valid_east_rate",
+                            "valid_west_rate",
+                            "seam_edge_support_fraction_north",
+                            "seam_edge_support_fraction_south",
+                            "seam_edge_support_fraction_east",
+                            "seam_edge_support_fraction_west",
+                            "halo_support_fraction_north",
+                            "halo_support_fraction_south",
+                            "halo_support_fraction_east",
+                            "halo_support_fraction_west",
+                            "seam_validity_score_north",
+                            "seam_validity_score_south",
+                            "seam_validity_score_east",
+                            "seam_validity_score_west",
+                            "invalid_edge_support_lt_3pct_count",
+                            "invalid_halo_support_lt_5pct_count",
+                            "missing_halo_count",
+                            "missing_target_count",
+                            "semantic_invalid_count",
+                            "individual_loss_skipped_invalid_count",
+                            "competition_skipped_invalid_count",
+                            "q_regret_invalid_pair_count",
+                            "valid_mean_in_region_advantage",
+                            "valid_min_in_region_advantage",
+                            "invalid_excluded_advantage_count",
+                            "seam_validity_terrain_threshold",
+                            "hard_routed_regional_diff_loss_raw",
+                            "hard_routed_regional_diff_loss_safe",
+                            "regional_use_fixed_q_route_for_ownership",
+                            "regional_freeze_gate_routing_head",
+                            "regional_detach_routing_from_regional_loss",
+                        ):
+                            regional_diag_values[_field_name] = _tensor_scalar(_diag.get(_field_name), regional_diag_values.get(_field_name, 0.0))
+                        regional_diag_values["regional_routing_protected_warmup_active"] = 1.0 if protected_warmup_active else 0.0
+                        regional_diag_values["regional_freeze_gate_routing_head_during_warmup"] = 1.0 if bool(regional_loss_config.get("regional_freeze_gate_routing_head_during_warmup", False)) else 0.0
+                        regional_diag_values["regional_detach_routing_from_regional_loss_during_warmup"] = 1.0 if bool(regional_loss_config.get("regional_detach_routing_from_regional_loss_during_warmup", False)) else 0.0
+                        for _field_name in (
+                            "competitive_gate_enabled",
+                            "competitive_gate_effective_weight",
+                            "competitive_gate_neutralized_for_equivalence",
+                            "base_weight_floor",
+                            "competitive_surplus_weight",
+                            "catchup_weight",
+                        ):
+                            regional_diag_values[_field_name] = _tensor_scalar(_diag.get(_field_name), regional_diag_values.get(_field_name, 0.0))
+                        regional_diag_values["regional_diff_loss"] = regional_loss_value
+                        regional_diag_values["regional_diff_loss_weighted"] = regional_diff_weighted_value
+                        regional_diag_values["regional_diff_loss_raw"] = regional_loss_raw_value
+                        regional_diag_values["regional_diff_loss_safe"] = _tensor_scalar(_diag.get("regional_diff_loss_safe"), regional_loss_value)
+                        regional_diag_values["regional_diff_loss_q_confident"] = _tensor_scalar(_diag.get("regional_diff_loss_q_confident"), regional_loss_value)
+                        regional_diag_values["regional_diff_loss_weighted_raw"] = regional_diff_weighted_raw_value
+                        regional_diag_values["regional_loss_raw_safe_ratio"] = _tensor_scalar(_diag.get("regional_loss_raw_safe_ratio"), 0.0)
+                        regional_diag_values["regional_diff_loss_unmasked"] = float(_diag["regional_diff_loss_unmasked"].detach().item())
+                        recent_window = int(regional_loss_config.get("regional_loss_spike_median_window", 200))
+                        recent_raw_values = _recent_float_values(loss_trace, "regional_diff_loss_weighted_raw", recent_window)
+                        if not recent_raw_values:
+                            recent_raw_values = _recent_float_values(loss_trace, "regional_diff_loss_weighted", recent_window)
+                        rolling_median = _safe_list_median(recent_raw_values) if recent_raw_values else max(1e-12, regional_diff_weighted_raw_value)
+                        spike_threshold = float(regional_loss_config.get("regional_loss_spike_threshold_ratio", 10.0)) * max(rolling_median, 1e-12)
+                        spike_recent = _recent_float_values(loss_trace, "regional_loss_spike", 100)
+                        recent_100_raw = _recent_float_values(loss_trace, "regional_diff_loss_weighted_raw", 100)
+                        if not recent_100_raw:
+                            recent_100_raw = _recent_float_values(loss_trace, "regional_diff_loss_weighted", 100)
+                        recent_20_raw = _recent_float_values(loss_trace, "regional_diff_loss_weighted_raw", 20)
+                        if not recent_20_raw:
+                            recent_20_raw = _recent_float_values(loss_trace, "regional_diff_loss_weighted", 20)
+                        regional_diag_values["regional_loss_rolling_median_200"] = rolling_median
+                        regional_diag_values["regional_loss_rolling_median_20"] = _safe_list_median(recent_20_raw) if recent_20_raw else regional_diff_weighted_raw_value
+                        regional_diag_values["regional_loss_spike_threshold"] = spike_threshold
+                        regional_diag_values["max_raw_regional_loss_100"] = max(recent_100_raw + [regional_diff_weighted_raw_value]) if recent_100_raw else regional_diff_weighted_raw_value
+                        regional_diag_values["log10_max_raw_regional_loss_100"] = math.log10(max(1e-12, regional_diag_values["max_raw_regional_loss_100"]))
+                        regional_diag_values["regional_loss_spike"] = 1.0 if regional_diff_weighted_raw_value > spike_threshold else 0.0
+                        regional_diag_values["regional_loss_ratio_to_rolling"] = regional_diff_weighted_raw_value / max(regional_diag_values["regional_loss_rolling_median_20"], 1e-12)
+                        regional_diag_values["spike_count_100"] = float(sum(1 for value in spike_recent if value > 0.0) + (1 if regional_diag_values["regional_loss_spike"] > 0.0 else 0))
+                        regional_diag_values["regional_loss_denominator"] = _tensor_scalar(_diag.get("regional_loss_denominator"), 0.0)
+                        regional_diag_values["regional_loss_min_denominator"] = _tensor_scalar(_diag.get("regional_loss_min_denominator"), 0.0)
+                        regional_diag_values["regional_loss_per_sample_raw_max"] = _tensor_max_scalar(_diag.get("regional_loss_per_sample_raw"), 0.0)
+                        regional_diag_values["regional_loss_per_sample_safe_max"] = _tensor_max_scalar(_diag.get("regional_loss_per_sample_safe"), 0.0)
+                        regional_diag_values["max_pixel_loss_per_sample_max"] = _tensor_max_scalar(_diag.get("max_pixel_loss_per_sample"), 0.0)
+                        regional_diag_values["mean_pixel_loss_per_sample_max"] = _tensor_max_scalar(_diag.get("mean_pixel_loss_per_sample"), 0.0)
+                        regional_diag_values["max_candidate_loss_per_sample_max"] = _tensor_max_scalar(_diag.get("max_candidate_loss_per_sample"), 0.0)
+                        regional_diag_values["candidate_with_max_loss_max"] = _tensor_max_scalar(_diag.get("candidate_with_max_loss"), 0.0)
+                        regional_diag_values["pixel_max_candidate_max"] = _tensor_max_scalar(_diag.get("pixel_max_candidate"), 0.0)
+                        regional_diag_values["pixel_max_y_max"] = _tensor_max_scalar(_diag.get("pixel_max_y"), 0.0)
+                        regional_diag_values["pixel_max_x_max"] = _tensor_max_scalar(_diag.get("pixel_max_x"), 0.0)
+                        regional_diag_values["target_eps_sigma_min_raw"] = _tensor_min_scalar(_diag.get("target_eps_sigma_min_raw"), 0.0)
+                        regional_diag_values["target_eps_sigma_min_safe"] = _tensor_min_scalar(_diag.get("target_eps_sigma_min_safe"), 0.0)
+                        alpha_diag = sqrt_alpha_t.detach().float().reshape(-1).pow(2)
+                        sigma2_diag = sqrt_one_minus_alpha_t.detach().float().reshape(-1).pow(2).clamp_min(1e-12)
+                        snr_diag = alpha_diag / sigma2_diag
+                        regional_diag_values["timestep_min"] = float(timesteps.detach().float().amin().item())
+                        regional_diag_values["timestep_max"] = float(timesteps.detach().float().amax().item())
+                        regional_diag_values["sigma"] = _tensor_scalar(_diag.get("sigma"), 0.0)
+                        regional_diag_values["sigma_min"] = _tensor_scalar(_diag.get("sigma_min"), regional_diag_values["sigma"])
+                        regional_diag_values["sigma_max"] = _tensor_scalar(_diag.get("sigma_max"), regional_diag_values["sigma"])
+                        regional_diag_values["snr"] = _tensor_scalar(_diag.get("snr"), 0.0)
+                        regional_diag_values["snr_min"] = float(snr_diag.amin().item())
+                        regional_diag_values["snr_max"] = float(snr_diag.amax().item())
+                        regional_diag_values["diffusion_loss_weight_t_raw_max"] = _tensor_max_scalar(_diag.get("diffusion_loss_weight_t_raw"), 0.0)
+                        regional_diag_values["diffusion_loss_weight_t_safe_max"] = _tensor_max_scalar(_diag.get("diffusion_loss_weight_t_safe"), 0.0)
+                        regional_diag_values["diffusion_loss_weight_t_max"] = _tensor_max_scalar(_diag.get("diffusion_loss_weight_t_max"), 0.0)
+                        regional_diag_values["regional_loss_sigma_weight_mean"] = _tensor_scalar(_diag.get("regional_loss_sigma_weight_mean"), 1.0)
+                        regional_diag_values["regional_loss_sigma_weight_min"] = _tensor_scalar(_diag.get("regional_loss_sigma_weight_min"), 1.0)
+                        regional_diag_values["regional_loss_sigma_weight_max"] = _tensor_scalar(_diag.get("regional_loss_sigma_weight_max"), 1.0)
+                        regional_diag_values["regional_low_sigma_weight"] = _tensor_scalar(_diag.get("regional_low_sigma_weight"), regional_diag_values["regional_loss_sigma_weight_mean"])
+                        regional_diag_values["regional_competition_skipped_low_sigma"] = _tensor_scalar(_diag.get("regional_competition_skipped_low_sigma"), 0.0)
+                        regional_diag_values["regional_competition_skipped_low_sigma_count"] = _tensor_scalar(_diag.get("regional_competition_skipped_low_sigma_count"), 0.0)
+                        regional_diag_values["candidate_competition_weight_mean"] = _tensor_scalar(_diag.get("candidate_competition_weight_mean"), 1.0)
+                        regional_diag_values["candidate_competition_weight_min"] = _tensor_scalar(_diag.get("candidate_competition_weight_min"), 1.0)
+                        regional_diag_values["candidate_competition_weight_max"] = _tensor_scalar(_diag.get("candidate_competition_weight_max"), 1.0)
+                        regional_diag_values["regional_nonfinite_detected"] = _tensor_scalar(_diag.get("regional_nonfinite_detected"), 0.0)
+                        for _finite_key in ("isfinite_pred_x0", "isfinite_target_i", "isfinite_R_i", "isfinite_L_train_i", "isfinite_L_train_i_safe", "isfinite_routing"):
+                            regional_diag_values[_finite_key] = _tensor_scalar(_diag.get(_finite_key), 1.0)
+                        for _range_key in ("max_abs_pred_x0", "max_abs_target_i", "max_abs_pred_target_delta", "max_abs_R_i", "max_abs_L_train_i", "max_abs_L_train_i_safe"):
+                            regional_diag_values[_range_key] = _tensor_scalar(_diag.get(_range_key), 0.0)
+                        debug_ratio_to_rolling_threshold = float(regional_loss_config.get("regional_loss_debug_ratio_to_rolling", 3.0))
+                        if accelerator.is_main_process and bool(regional_loss_config.get("save_regional_spike_debug", False)) and (
+                            regional_diag_values["regional_loss_spike"] > 0.0
+                            or regional_diag_values["regional_nonfinite_detected"] > 0.0
+                            or regional_diag_values["regional_loss_ratio_to_rolling"] > debug_ratio_to_rolling_threshold
+                        ):
+                            debug_path = _write_regional_spike_debug(
+                                args.output_dir,
+                                step_for_logging,
+                                _diag,
+                                regional_diag_values,
+                                timesteps,
+                                sqrt_alpha_t,
+                                sqrt_one_minus_alpha_t,
+                            )
+                            if debug_path:
+                                regional_diag_values["regional_loss_spike_debug_saved"] = 1.0
+                                logger.warning(
+                                    "[regional/spike] step=%d raw=%.6f safe=%.6f median=%.6f threshold=%.6f debug=%s",
+                                    step_for_logging,
+                                    regional_diff_weighted_raw_value,
+                                    regional_diff_weighted_value,
+                                    rolling_median,
+                                    spike_threshold,
+                                    debug_path,
+                                )
+                        regional_diag_values["active_content_mask_mean"] = float(_diag["active_content_mask_mean"].detach().item())
+                        regional_diag_values["active_content_mask_sum"] = float(_diag["active_content_mask_sum"].detach().item())
+                        regional_diag_values["active_content_mask_sum_latent"] = _tensor_scalar(_diag.get("active_content_mask_sum_latent"), regional_diag_values["active_content_mask_sum"])
+                        regional_diag_values["active_content_mask_sum_pooled"] = _tensor_scalar(_diag.get("active_content_mask_sum_pooled"), 0.0)
+                        regional_diag_values["active_content_latent_mask_sum"] = _tensor_scalar(_diag.get("active_content_latent_mask_sum"), regional_diag_values["active_content_mask_sum"])
+                        regional_diag_values["active_content_pooled_mask_sum"] = _tensor_scalar(_diag.get("active_content_pooled_mask_sum"), 0.0)
+                        regional_diag_values["terrain_soft_mean"] = float(_diag["terrain_soft_mean"].detach().item())
+                        regional_diag_values["terrain_soft_sum"] = _tensor_scalar(_diag.get("terrain_soft_sum"), 0.0)
+                        regional_diag_values["terrain_soft_min"] = _tensor_scalar(_diag.get("terrain_soft_min"), 0.0)
+                        regional_diag_values["terrain_soft_max"] = _tensor_scalar(_diag.get("terrain_soft_max"), 0.0)
+                        regional_diag_values["terrain_empty_count"] = _tensor_scalar(_diag.get("terrain_empty_count"), _tensor_scalar(_diag.get("terrain_empty_sample_count"), 0.0))
+                        regional_diag_values["terrain_empty_sample_count"] = _tensor_scalar(_diag.get("terrain_empty_sample_count"), 0.0)
+                        regional_diag_values["seam_boundary_content_mask_sum"] = _tensor_scalar(_diag.get("seam_boundary_content_mask_sum"), 0.0)
+                        regional_diag_values["active_content_fraction"] = float(_diag["active_content_fraction"].detach().item())
+                        regional_diag_values["fraction_of_active_diffusion_pixels_kept"] = _tensor_scalar(
+                            _diag.get("fraction_of_active_diffusion_pixels_kept"),
+                            regional_diag_values["active_content_fraction"],
+                        )
+                        regional_diag_values["active_content_fraction_min"] = _tensor_min_scalar(_diag.get("active_content_fraction_per_sample"), 0.0)
+                        regional_diag_values["active_content_fraction_max"] = _tensor_max_scalar(_diag.get("active_content_fraction_per_sample"), 0.0)
+                        regional_diag_values["active_content_fraction_raw_min"] = _tensor_min_scalar(_diag.get("active_content_fraction_per_sample_raw"), 0.0)
+                        regional_diag_values["active_content_fraction_raw_max"] = _tensor_max_scalar(_diag.get("active_content_fraction_per_sample_raw"), 0.0)
+                        regional_diag_values["active_content_mask_fallback"] = float(_diag["active_content_mask_fallback"].detach().item())
+                        regional_diag_values["active_content_fallback_count"] = _tensor_scalar(_diag.get("active_content_fallback_count"), 0.0)
+                        regional_diag_values["active_diffusion_mask_sum_min"] = _tensor_min_scalar(_diag.get("active_diffusion_mask_sum_per_sample"), 0.0)
+                        regional_diag_values["active_content_mask_sum_min"] = _tensor_min_scalar(_diag.get("active_content_mask_sum_per_sample"), 0.0)
+                        for _ri_scalar_key in (
+                            "ri_active_candidate_std_mean",
+                            "ri_active_candidate_std_max",
+                            "ri_active_pairwise_absdiff_mean",
+                            "ri_active_pairwise_absdiff_max",
+                            "ri_active_q_neg_r_corr_mean",
+                            "ri_active_q_neg_r_corr_min",
+                            "ri_unmasked_candidate_std_mean",
+                            "ri_unmasked_candidate_std_max",
+                            "ri_unmasked_pairwise_absdiff_mean",
+                            "ri_unmasked_pairwise_absdiff_max",
+                            "ri_unmasked_q_neg_r_corr_mean",
+                            "ri_unmasked_q_neg_r_corr_min",
+                            "ri_qboot_min_in_region_advantage",
+                            "ri_qboot_mean_in_region_advantage",
+                        ):
+                            regional_diag_values[_ri_scalar_key] = _tensor_scalar(_diag.get(_ri_scalar_key), 0.0)
+                        if (
+                            accelerator.is_main_process
+                            and regional_diag_values["active_content_mask_fallback"] > 0.0
+                            and (regional_relative_step <= 1 or regional_relative_step % 50 == 0)
+                        ):
+                            logger.warning(
+                                "[regional/content_mask] fallback_to_active_diffusion_mask step=%d active_fraction=%.6f min_fraction=%.6f",
+                                step_for_logging,
+                                float(regional_diag_values["active_content_fraction"]),
+                                float(regional_loss_config.get("min_active_content_fraction", 0.05)),
+                            )
+                        regional_diag_values["q_regret_loss"] = float(_diag["q_regret_loss"].detach().item())
+                        regional_diag_values["q_regret_loss_weighted"] = regional_base_ownership_weight * lambda_q_regret_current * regional_diag_values["q_regret_loss"]
+                        regional_diag_values["q_regret_active_pair_fraction"] = float(_diag["q_regret_active_pair_fraction"].detach().item())
+                        regional_diag_values["q_regret_violation_mean"] = float(_diag["q_regret_violation_mean"].detach().item())
+                        regional_diag_values["q_regret_violation_max"] = float(_diag["q_regret_violation_max"].detach().item())
+                        regional_diag_values["phase"] = float(regional_control["phase"])
+                        regional_diag_values["rho_q_route"] = float(_diag["rho_q_route"].detach().item())
+                        regional_diag_values["q_route_u"] = float(_diag["q_route_u"].detach().item())
+                        regional_diag_values["gamma_boot"] = float(_diag["gamma_boot"].detach().item())
+                        regional_diag_values["gamma_route"] = _tensor_scalar(_diag.get("gamma_route"), regional_diag_values["gamma_boot"])
+                        regional_diag_values["q_confidence_mean"] = _tensor_scalar(_diag.get("q_confidence_mean"), 0.0)
+                        regional_diag_values["q_confidence_max"] = _tensor_scalar(_diag.get("q_confidence_max"), 0.0)
+                        regional_diag_values["q_confidence_threshold"] = _tensor_scalar(_diag.get("q_confidence_threshold"), 0.0)
+                        regional_diag_values["q_confidence_mask_fraction"] = _tensor_scalar(_diag.get("q_confidence_mask_fraction"), 0.0)
+                        regional_diag_values["aux_ramp"] = float(_diag["aux_ramp"].detach().item())
+                        regional_diag_values["aux_strength"] = float(regional_control["aux_strength"])
+                        regional_diag_values["lambda_q_regret_current"] = lambda_q_regret_current
+                        regional_diag_values["lambda_bind_current"] = regional_diag_values["effective_bind_weight"]
+                        regional_diag_values["q_regret_weight_current"] = lambda_q_regret_current
+                        regional_diag_values["bind_weight_current"] = regional_diag_values["effective_bind_weight"]
+                        regional_diag_values["lambda_q_mix"] = float(_diag["lambda_q_mix"].detach().item())
+                        regional_diag_values["q_mix_schedule_step"] = float(_diag["q_mix_schedule_step"].detach().item())
+                        regional_diag_values["q_mix_weight"] = float(_diag["q_mix_weight"].detach().item())
+                        regional_diag_values["q_mix_added_mass"] = float(_diag["q_mix_added_mass"].detach().item())
+                        regional_diag_values["q_entropy_mean"] = float(_diag["q_entropy_mean"].detach().item())
+                        regional_diag_values["q_entropy_normalized"] = float(_diag["q_entropy_normalized"].detach().item())
+                        regional_diag_values["q_raw_entropy_mean"] = _tensor_scalar(_diag.get("q_raw_entropy_mean"), regional_diag_values["q_entropy_mean"])
+                        regional_diag_values["q_raw_entropy_normalized"] = _tensor_scalar(_diag.get("q_raw_entropy_normalized"), regional_diag_values["q_entropy_normalized"])
+                        regional_diag_values["q_route_entropy_mean"] = _tensor_scalar(_diag.get("q_route_entropy_mean"), regional_diag_values["q_entropy_mean"])
+                        regional_diag_values["q_route_entropy_normalized"] = _tensor_scalar(_diag.get("q_route_entropy_normalized"), regional_diag_values["q_entropy_normalized"])
+                        regional_diag_values["q_boot_entropy_mean"] = float(_diag["q_boot_entropy_mean"].detach().item())
+                        regional_diag_values["q_boot_entropy_normalized"] = float(_diag["q_boot_entropy_normalized"].detach().item())
+                        regional_diag_values["q_boot_usage"] = _tensor_scalar(_diag.get("q_boot_usage"), 0.0)
+                        regional_diag_values["routing_entropy_mean"] = float(_diag["routing_entropy_mean"].detach().item())
+                        regional_diag_values["routing_entropy_normalized"] = float(_diag["routing_entropy_normalized"].detach().item())
+                        regional_diag_values["entropy_sharpening"] = regional_diag_values["q_route_entropy_mean"] - regional_diag_values["routing_entropy_mean"]
+                        regional_diag_values["routing_gate_l1_mean"] = float(_diag["routing_gate_l1_mean"].detach().item())
+                        regional_diag_values["routing_q_l1_mean"] = float(_diag["routing_q_l1_mean"].detach().item())
+                        regional_diag_values["routing_mass_mean"] = float(_diag["routing_mass_mean"].detach().item())
+                        regional_diag_values["routing_mass_abs_error"] = float(_diag["routing_mass_abs_error"].detach().item())
+                        regional_diag_values["rgb_aux_loss"] = rgb_aux_loss_value
+                        regional_diag_values["rgb_aux_loss_weighted"] = rgb_aux_weight_current * rgb_aux_loss_value
+                        regional_diag_values["rgb_aux_mask_sum"] = rgb_aux_mask_sum_value
+                        regional_diag_values["hard_band_gradient_loss"] = hard_band_gradient_loss_value
+                        regional_diag_values["hard_band_gradient_loss_weighted"] = hard_band_gradient_loss_weighted_value
+                        regional_diag_values["hard_band_valid_mask_sum"] = max(hard_band_valid_mask_sum_value, float(_diag["hard_band_valid_mask_sum"].detach().item()))
+                        regional_diag_values["hard_band_current_scale"] = 0.0 if hard_band_gradient_weight_base <= 0.0 else (hard_band_weight_current / hard_band_gradient_weight_base)
+                        regional_diag_values["hard_band_weight_current"] = hard_band_weight_current
+                        regional_diag_values["gate_entropy_mean"] = float(_diag["gate_entropy_mean"].detach().item())
+                        regional_diag_values["gate_entropy_normalized"] = float(_diag["gate_entropy_normalized"].detach().item())
+                        regional_diag_values["gate_score_gap_mean"] = float(_diag["gate_score_gap_mean"].detach().item())
+                        regional_diag_values["gate_smoothness"] = float(_diag["gate_smoothness"].detach().item())
+                        regional_diag_values["q_winner_alignment"] = float(_diag["q_winner_alignment"].detach().item())
+                        regional_diag_values["q_winner_alignment_all"] = _tensor_scalar(_diag.get("q_winner_alignment_all"), regional_diag_values["q_winner_alignment"])
+                        regional_diag_values["q_valid_sum_deviation_from_1"] = _tensor_scalar(_diag.get("q_valid_sum_deviation_from_1"), 0.0)
+                        for _ti, _name in enumerate(("interior", "north", "south", "east", "west")):
+                            _key = f"winner_share_slot{_ti}"
+                            if _key in _diag:
+                                regional_diag_values[f"winner_share_{_name}"] = float(_diag[_key].detach().item())
+                            for _prefix, _source_prefix in (
+                                ("q_mass", "q_mass_slot"),
+                                ("q_valid_mass", "q_valid_mass_slot"),
+                                ("q_raw_mass", "q_raw_mass_slot"),
+                                ("invalid_q_mass", "invalid_q_mass_slot"),
+                                ("invalid_raw_q_mass", "invalid_raw_q_mass_slot"),
+                                ("gate_share", "gate_share_slot"),
+                                ("routing_share", "routing_share_slot"),
+                                ("invalid_routing_mass", "invalid_routing_mass_slot"),
+                                ("invalid_gate_mass", "invalid_gate_mass_slot"),
+                                ("invalid_winner_share", "invalid_winner_share_slot"),
+                                ("q_route_terrain_support", "q_route_terrain_support_slot"),
+                                ("regional_loss_contribution", "regional_loss_contribution_slot"),
+                                ("gate_q_ratio", "gate_q_ratio_slot"),
+                                ("q_band_gate", "q_band_gate_slot"),
+                                ("q_gate_corr", "q_gate_corr_slot"),
+                                ("q_routing_corr", "q_routing_corr_slot"),
+                                ("r_mean", "r_mean_slot"),
+                                ("r_high_q", "r_high_q_slot"),
+                                ("r_low_q", "r_low_q_slot"),
+                                ("specialization_advantage", "specialization_advantage_slot"),
+                                ("region_weight_sum", "region_weight_sum_slot"),
+                                ("R_self", "R_self_slot"),
+                                ("R_comp", "R_comp_slot"),
+                                ("R_comp_mean", "R_comp_mean_slot"),
+                                ("R_comp_best", "R_comp_best_slot"),
+                                ("in_region_advantage", "in_region_advantage_slot"),
+                                ("in_region_advantage_ema", "in_region_advantage_ema_slot"),
+                                ("competitive_gate", "competitive_gate_slot"),
+                                ("competitive_gate_raw", "competitive_gate_raw_slot"),
+                                ("competitive_gate_delta", "competitive_gate_delta_slot"),
+                                ("base_region_loss", "base_region_loss_slot"),
+                                ("competitive_region_loss", "competitive_region_loss_slot"),
+                                ("final_region_loss", "final_region_loss_slot"),
+                                ("catchup_loss", "catchup_loss_slot"),
+                                ("catchup_active", "catchup_active_slot"),
+                                ("would_hard_gate_suppress", "would_hard_gate_suppress_slot"),
+                                ("ri_qboot_R_self", "ri_qboot_R_self_slot"),
+                                ("ri_qboot_R_comp", "ri_qboot_R_comp_slot"),
+                                ("ri_qboot_in_region_advantage", "ri_qboot_in_region_advantage_slot"),
+                                ("ri_active_lowest_frac", "ri_active_lowest_frac_slot"),
+                                ("ri_active_q_neg_r_corr", "ri_active_q_neg_r_corr_slot"),
+                            ):
+                                _diag_key = f"{_source_prefix}{_ti}"
+                                if _diag_key in _diag:
+                                    regional_diag_values[f"{_prefix}_{_name}"] = float(_diag[_diag_key].detach().item())
+                        regional_diag_values["q_route_mass_sum"] = _tensor_scalar(_diag.get("q_route_mass_sum"), 0.0)
+                        regional_diag_values["q_raw_mass_sum"] = _tensor_scalar(_diag.get("q_raw_mass_sum"), 0.0)
+                        regional_diag_values["competitive_catchup_loss"] = _tensor_scalar(_diag.get("competitive_catchup_loss"), 0.0)
+                        regional_diag_values["min_in_region_advantage"] = float(_diag["min_in_region_advantage"].detach().item())
+                        regional_diag_values["mean_in_region_advantage"] = float(_diag["mean_in_region_advantage"].detach().item())
+                        regional_diag_values["worst_region_index"] = _tensor_scalar(_diag.get("worst_region_index"), 0.0)
+                        regional_diag_values["worst_region_slot"] = _tensor_scalar(_diag.get("worst_region_slot"), regional_diag_values["worst_region_index"])
+                        regional_diag_values["worst_region_is_active"] = _tensor_scalar(_diag.get("worst_region_is_active"), 0.0)
+                        regional_diag_values["worst_region_advantage"] = _tensor_scalar(_diag.get("worst_region_advantage"), regional_diag_values["min_in_region_advantage"])
+                        regional_diag_values["worst_region_R_self"] = _tensor_scalar(_diag.get("worst_region_R_self"), 0.0)
+                        regional_diag_values["worst_region_R_comp"] = _tensor_scalar(_diag.get("worst_region_R_comp"), 0.0)
+                        regional_diag_values["worst_region_q_route_mass"] = _tensor_scalar(_diag.get("worst_region_q_route_mass"), 0.0)
+                        regional_diag_values["worst_region_q_raw_mass"] = _tensor_scalar(_diag.get("worst_region_q_raw_mass"), 0.0)
+                        regional_diag_values["worst_region_gate_share"] = _tensor_scalar(_diag.get("worst_region_gate_share"), 0.0)
+                        regional_diag_values["worst_region_routing_share"] = _tensor_scalar(_diag.get("worst_region_routing_share"), 0.0)
+                        regional_diag_values["worst_region_winner_share"] = _tensor_scalar(_diag.get("worst_region_winner_share"), 0.0)
+                        _worst_region_slot_index = int(round(regional_diag_values["worst_region_slot"]))
+                        if 0 <= _worst_region_slot_index < len(REGIONAL_SLOT_NAMES):
+                            regional_diag_values["worst_region_name"] = REGIONAL_SLOT_NAMES[_worst_region_slot_index]
+                        _winner_lat = regional_outputs["winner_idx_latent"]
+                        _q_lat = cand_q_lat.detach()
+                        _interior_mask = (_q_lat[:, 0] >= 0.5).float()
+                        _interior_den = _interior_mask.sum().clamp_min(1.0)
+                        _interior_win = ((_winner_lat == 0).float() * _interior_mask).sum() / _interior_den
+                        regional_diag_values["winner_hard_region_share_interior"] = float(_interior_win.detach().item())
+                        _hard_band_lat = None
+                        if hard_band is not None:
+                            _hard_band_lat = F.interpolate(hard_band.float(), size=_winner_lat.shape[-2:], mode="area")
+                        for _edge_slot, _edge_name in enumerate(("north", "south", "east", "west"), start=1):
+                            if _hard_band_lat is not None:
+                                _hard_mask = (_hard_band_lat[:, _edge_slot - 1 : _edge_slot] >= 0.5).float()
+                            else:
+                                _hard_mask = (_q_lat[:, _edge_slot] >= 0.5).float()
+                            if regional_candidate_valid is not None:
+                                _hard_mask = _hard_mask * regional_candidate_valid[:, _edge_slot].view(-1, 1, 1, 1).to(dtype=_hard_mask.dtype)
+                            _hard_den = _hard_mask.sum().clamp_min(1.0)
+                            _hard_win = ((_winner_lat == _edge_slot).float() * _hard_mask).sum() / _hard_den
+                            regional_diag_values[f"winner_hard_band_share_{_edge_name}"] = float(_hard_win.detach().item())
+                        regional_aux_weighted = regional_diag_values["q_regret_loss_weighted"] + regional_diag_values["bind_loss_weighted"]
+                        regional_diff_weighted = max(1e-12, regional_diag_values["regional_diff_loss_weighted"])
+                        regional_diag_values["combined_aux_regional_ratio"] = regional_aux_weighted / regional_diff_weighted
+                        regional_diag_values["q_regret_ratio"] = _loss_ratio(regional_diag_values["q_regret_loss_weighted"], regional_diff_weighted)
+                        regional_diag_values["bind_ratio"] = _loss_ratio(regional_diag_values["bind_loss_weighted"], regional_diff_weighted)
+                        regional_diag_values["hard_band_ratio"] = _loss_ratio(regional_diag_values["hard_band_gradient_loss_weighted"], regional_diff_weighted)
+                        regional_diag_values["rgb_aux_ratio"] = _loss_ratio(regional_diag_values["rgb_aux_loss_weighted"], regional_diff_weighted)
+                        if dynamic_qroute_enabled:
+                            active_for_phase_metrics = regional_candidate_valid if regional_candidate_valid is not None else cand_active
+                            active_slot_names = [
+                                slot_name
+                                for slot_index, slot_name in enumerate(REGIONAL_SLOT_NAMES)
+                                if float(active_for_phase_metrics[:, slot_index].amax().detach().item()) > 0.0
+                            ]
+                            controller_summary = _update_dynamic_qrouting_controller(
+                                regional_qroute_controller,
+                                regional_loss_config,
+                                regional_relative_step,
+                                {
+                                    "active_slot_names": active_slot_names,
+                                    "q_routing_corr": [regional_diag_values.get(f"q_routing_corr_{slot_name}", 0.0) for slot_name in active_slot_names],
+                                    "q_gate_corr": [regional_diag_values.get(f"q_gate_corr_{slot_name}", 0.0) for slot_name in active_slot_names],
+                                    "in_region_advantage": [regional_diag_values.get(f"in_region_advantage_{slot_name}", 0.0) for slot_name in active_slot_names],
+                                    "r_mean": [regional_diag_values.get(f"r_mean_{slot_name}", 0.0) for slot_name in active_slot_names],
+                                    "winner_share": [regional_diag_values.get(f"winner_share_{slot_name}", 0.0) for slot_name in active_slot_names],
+                                    "q_winner_alignment": regional_diag_values["q_winner_alignment"],
+                                    "gate_entropy_normalized": regional_diag_values["gate_entropy_normalized"],
+                                    "q_entropy_mean": regional_diag_values["q_entropy_mean"],
+                                    "q_route_entropy_mean": regional_diag_values["q_route_entropy_mean"],
+                                    "routing_entropy_mean": regional_diag_values["routing_entropy_mean"],
+                                    "q_regret_violation_mean": regional_diag_values["q_regret_violation_mean"],
+                                    "regional_diff_loss_weighted": regional_diag_values["regional_diff_loss_weighted"],
+                                    "regional_diff_loss_weighted_safe": regional_diag_values["regional_diff_loss_weighted"],
+                                    "regional_diff_loss_weighted_raw": regional_diag_values["regional_diff_loss_weighted_raw"],
+                                    "regional_loss_spike": regional_diag_values["regional_loss_spike"],
+                                },
+                            )
+                            regional_diag_values["regional_loss_slope"] = controller_summary["regional_loss_slope"]
+                            regional_diag_values["regional_loss_slope_raw_ema"] = controller_summary["regional_loss_slope_raw_ema"]
+                            regional_diag_values["regional_loss_log_slope_raw"] = controller_summary["regional_loss_log_slope_raw"]
+                            regional_diag_values["regional_loss_log_slope_clipped"] = controller_summary["regional_loss_log_slope_clipped"]
+                            regional_diag_values["regional_loss_ema_raw"] = controller_summary["regional_loss_ema_raw"]
+                            regional_diag_values["regional_diff_loss_100step_ema"] = controller_summary["regional_diff_loss_100step_ema"]
+                            regional_diag_values["guardrail_triggered"] = controller_summary["guardrail_triggered"]
+                            regional_diag_values["guardrail_reason"] = controller_summary["guardrail_reason"]
+                            regional_diag_values["phase15_ready_streak"] = controller_summary["phase15_ready_streak"]
+                            regional_diag_values["phase15_exit_ready"] = controller_summary["phase15_exit_ready"]
+                            regional_diag_values["phase15_exit_block_reason"] = controller_summary["phase15_exit_block_reason"]
+                            regional_diag_values["regional_guard_ma20"] = controller_summary["regional_guard_ma20"]
+                            regional_diag_values["regional_guard_threshold"] = controller_summary["regional_guard_threshold"]
+                            regional_diag_values["regional_guard_bad_streak"] = controller_summary["regional_guard_bad_streak"]
+                            regional_diag_values["regional_guard_stop"] = controller_summary["regional_guard_stop"]
+                            regional_diag_values["regional_guard_baseline"] = controller_summary["regional_guard_baseline"]
+                            regional_diag_values["entropy_sharpening"] = controller_summary.get("entropy_sharpening", regional_diag_values["entropy_sharpening"])
+                            regional_diag_values["phase1_exit_ready"] = controller_summary["phase1_exit_ready"]
+                            regional_diag_values["phase1_exit_block_reason"] = controller_summary["phase1_exit_block_reason"]
+                            regional_diag_values.update(_compute_canary_baseline_fields(loss_trace, regional_diag_values))
+                            improving_spike = (
+                                regional_diag_values["regional_loss_ratio_to_initial"] > float(regional_loss_config.get("phase15_spike_warn_ratio", 2.0))
+                                and regional_diag_values["regional_loss_slope"] < 0.0
+                                and regional_diag_values["mean_in_region_advantage"] >= float(regional_loss_config.get("phase15_success_mean_adv_min", 0.006))
+                                and regional_diag_values["min_in_region_advantage"] >= float(regional_loss_config.get("phase15_success_min_adv_min", -0.05))
+                                and controller_summary.get("mean_q_routing_corr_ema", 0.0) >= float(regional_loss_config.get("phase15_success_q_routing_corr_mean_min", 0.80))
+                                and controller_summary.get("min_q_routing_corr_ema", 0.0) >= float(regional_loss_config.get("phase15_success_q_routing_corr_min", 0.70))
+                            )
+                            regional_diag_values["regional_loss_spike_but_slope_improving"] = 1.0 if improving_spike else 0.0
+                            if regional_diag_values["regional_guard_stop"] > 0.0:
+                                mean_adv_delta = regional_diag_values["mean_in_region_advantage"] - float(controller_summary.get("phase15_resume_mean_advantage", 0.0))
+                                min_adv_delta = regional_diag_values["min_in_region_advantage"] - float(controller_summary.get("phase15_resume_min_advantage", 0.0))
+                                raise RuntimeError(
+                                    "resume regional-loss guard triggered: "
+                                    f"ma20={regional_diag_values['regional_guard_ma20']:.6f} "
+                                    f"threshold={regional_diag_values['regional_guard_threshold']:.6f} "
+                                    f"baseline={regional_diag_values['regional_guard_baseline']:.6f} "
+                                    f"slope={regional_diag_values['regional_loss_slope']:.6f} "
+                                    f"mean_adv_delta={mean_adv_delta:.6f} min_adv_delta={min_adv_delta:.6f}"
+                                )
+                        regional_diag_values["tau_current"] = float(_diag["tau_current"].detach().item())
+                        regional_diag_values["gamma_current"] = float(_diag["gamma_current"].detach().item())
 
                     seam_decay_maps = None
                     edge_band_masks = None
@@ -7399,6 +11460,9 @@ def train(args: argparse.Namespace) -> None:
                         ).to(device=accelerator.device, dtype=weight_dtype)
                         if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0 and expanded_valid_source_mask is not None:
                             style_support_valid_mask = style_support_valid_mask * expanded_valid_source_mask
+                        regional_q_valid_support_mask = None
+                        if regional_loss_config.get("enabled", False):
+                            regional_q_valid_support_mask = regional_loss_valid_mask_full.float()
                         seam_supervision_mask_pre = _build_seam_supervision_mask(
                             trusted_mask=trusted_mask.float(),
                             edge_band_masks=edge_band_masks,
@@ -7420,6 +11484,7 @@ def train(args: argparse.Namespace) -> None:
                             valid_expanded_source_mask=expanded_valid_source_mask,
                             continuation_valid_mask=continuation_valid_mask,
                             style_support_valid_mask=style_support_valid_mask,
+                            q_valid_support_mask=regional_q_valid_support_mask,
                             style_ratio_config=style_ratio_config,
                         )
                         seam_edge_qualification = summarize_seam_edge_qualification(
@@ -7473,6 +11538,7 @@ def train(args: argparse.Namespace) -> None:
                             valid_expanded_source_mask=expanded_valid_source_mask,
                             continuation_valid_mask=continuation_valid_mask,
                             style_support_valid_mask=style_support_valid_mask,
+                            q_valid_support_mask=regional_q_valid_support_mask,
                             style_ratio_config=style_ratio_config,
                         )
                         seam_maps_raw = _build_seam_region_maps(
@@ -7488,6 +11554,7 @@ def train(args: argparse.Namespace) -> None:
                             valid_expanded_source_mask=expanded_valid_source_mask,
                             continuation_valid_mask=continuation_valid_mask,
                             style_support_valid_mask=style_support_valid_mask,
+                            q_valid_support_mask=regional_q_valid_support_mask,
                             style_ratio_config=style_ratio_config,
                         )
                         seam_margin_inner_coverage_px = float(seam_maps_supervised["margin_inner"].sum().detach().item())
@@ -7564,6 +11631,7 @@ def train(args: argparse.Namespace) -> None:
                         pred_x0_latents = (noisy_latents - (sqrt_one_minus_alpha_t * noise_pred)) / sqrt_alpha_t
                         pred_x0_latents_for_decode = (pred_x0_latents / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)
                         pred_x0_latents_for_decode_grad = None
+                        pred_x0_latents_for_decode_style_ratio_grad = None
 
                         region_weights = {
                             "halo_inner": float(seam_config.get("halo_inner_rgb_weight", 2.0)),
@@ -7571,6 +11639,7 @@ def train(args: argparse.Namespace) -> None:
                             "interior_continuation": float(seam_config.get("continuation_peak_rgb_weight", 2.5)),
                             "interior_core": float(seam_config.get("interior_core_rgb_weight", 0.10)),
                         }
+                        @_disable_compile_capture
                         def _decode_seam_rgb(latents: torch.Tensor) -> torch.Tensor:
                             return vae.decode(latents).sample
 
@@ -7592,22 +11661,14 @@ def train(args: argparse.Namespace) -> None:
                         halo_inner_16px_area = noisy_latents.new_tensor(0.0)
                         seam_halo_gradient_raw_sum = noisy_latents.new_tensor(0.0)
                         seam_halo_gradient_active_px = noisy_latents.new_tensor(0.0)
-                        save_seam_visual_debug_enabled = bool(verification_config.get("save_seam_visual_debug", False))
-                        pred_rgb = None
-                        target_rgb = None
-                        seam_supervision_mask_rgb = None
-                        seam_maps_rgb = None
-                        seam_maps_debug_full = None
-                        if save_seam_visual_debug_enabled:
-                            seam_maps_debug_full = {
-                                key: (value.detach().cpu() if isinstance(value, torch.Tensor) else value)
-                                for key, value in seam_maps_supervised.items()
-                            }
-                        target_rgb_full = batch_images.detach().cpu() if save_seam_visual_debug_enabled else None
-                        seam_debug_crop_box = None
+                        seam_halo_target_raw_sum = noisy_latents.new_tensor(0.0)
+                        seam_halo_target_area = noisy_latents.new_tensor(0.0)
+                        save_seam_visual_debug_enabled = False
+                        seam_first_edge_recorded = False
                         style_ratio_total_loss_tensor = noisy_latents.new_tensor(0.0)
                         style_ratio_edge_count = 0
                         rgb_recon_loss_weight = float(seam_config.get("rgb_recon_loss_weight", 0.0))
+                        seam_rgb_grad_scale = 1.0
                         seam_rgb_edge_plans: List[Dict[str, object]] = []
                         seam_rgb_region_area_totals = {
                             "halo_inner": noisy_latents.new_tensor(0.0),
@@ -7666,6 +11727,14 @@ def train(args: argparse.Namespace) -> None:
                             edge_name = str(edge_plan["edge_name"])
                             edge_seam_maps = edge_plan["seam_maps"]
                             seam_loss_support_mask = edge_plan["loss_support_mask"]
+                            edge_target_rgb_source = cand_rgb[:, 1 + edge_index].to(device=batch_images.device, dtype=batch_images.dtype)
+                            if edge_target_rgb_source.shape[-2:] != batch_images.shape[-2:]:
+                                edge_target_rgb_source = F.interpolate(
+                                    edge_target_rgb_source,
+                                    size=batch_images.shape[-2:],
+                                    mode="bilinear",
+                                    align_corners=False,
+                                )
 
                             decode_crop = _compute_seam_decode_crop(
                                 seam_loss_support_mask,
@@ -7687,7 +11756,7 @@ def train(args: argparse.Namespace) -> None:
                                 y1=latent_y1,
                             )
                             edge_target_rgb = _crop_spatial_tensor(
-                                batch_images,
+                                edge_target_rgb_source,
                                 x0=decode_crop["pixel_x0"],
                                 x1=decode_crop["pixel_x1"],
                                 y0=decode_crop["pixel_y0"],
@@ -7715,22 +11784,20 @@ def train(args: argparse.Namespace) -> None:
                             assert edge_pred_rgb.shape == edge_target_rgb.shape == expanded_rgb_mask.shape, (
                                 f"seam RGB geometry mismatch edge={edge_name} pred={tuple(edge_pred_rgb.shape)} target={tuple(edge_target_rgb.shape)} mask={tuple(expanded_rgb_mask.shape)}"
                             )
-                            if pred_rgb is None:
-                                if save_seam_visual_debug_enabled:
-                                    pred_rgb = edge_pred_rgb.detach().cpu()
-                                    target_rgb = edge_target_rgb.detach().cpu()
-                                    seam_supervision_mask_rgb = edge_seam_supervision_mask.detach().cpu()
-                                    seam_maps_rgb = {
-                                        key: (value.detach().cpu() if isinstance(value, torch.Tensor) else value)
-                                        for key, value in edge_seam_maps.items()
-                                    }
-                                    seam_debug_crop_box = dict(decode_crop)
+                            if not seam_first_edge_recorded:
+                                seam_first_edge_recorded = True
                                 train_prediction_h = float(edge_pred_rgb.shape[-2])
                                 train_prediction_w = float(edge_pred_rgb.shape[-1])
                                 train_alpha_target_h = float(edge_target_rgb.shape[-2])
                                 train_alpha_target_w = float(edge_target_rgb.shape[-1])
                                 train_supervision_mask_h = float(expanded_rgb_mask.shape[-2])
                                 train_supervision_mask_w = float(expanded_rgb_mask.shape[-1])
+
+                            edge_halo_mask = (edge_seam_maps["margin_inner"] + edge_seam_maps["margin_outer"]).clamp(0.0, 1.0).float()
+                            seam_halo_target_raw_sum = seam_halo_target_raw_sum + (
+                                edge_target_rgb.detach().float().abs().mean(dim=1, keepdim=True) * edge_halo_mask
+                            ).sum().detach()
+                            seam_halo_target_area = seam_halo_target_area + edge_halo_mask.sum().detach()
 
                             edge_style_ratio_total_loss = None
                             if style_ratio_config["enabled"]:
@@ -7833,10 +11900,29 @@ def train(args: argparse.Namespace) -> None:
                                 continuation_weighted_mask=edge_seam_maps["continuation_distance_weighted"],
                                 seam_config=seam_config,
                             )
-                            edge_backward_loss = noisy_latents.new_tensor(0.0)
+                            edge_seam_rgb_backward_loss = noisy_latents.new_tensor(0.0)
+                            edge_style_ratio_backward_loss = noisy_latents.new_tensor(0.0)
                             if edge_summary["region_losses"]:
                                 seam_rgb_edge_summaries.append(_detach_tensor_tree(edge_summary))
                                 edge_rgb_l1_map_detached = edge_rgb_l1_map.detach()
+                                if regional_halo_debug_maps is not None:
+                                    crop_x0 = int(decode_crop["pixel_x0"])
+                                    crop_x1 = int(decode_crop["pixel_x1"])
+                                    crop_y0 = int(decode_crop["pixel_y0"])
+                                    crop_y1 = int(decode_crop["pixel_y1"])
+                                    edge_diff_cpu = edge_rgb_l1_map_detached[0:1].float().cpu()
+                                    edge_inner_mask_cpu = edge_seam_maps["margin_inner"][0:1].detach().float().cpu().clamp(0.0, 1.0)
+                                    edge_outer_mask_cpu = edge_seam_maps["margin_outer"][0:1].detach().float().cpu().clamp(0.0, 1.0)
+                                    for map_name, edge_value in (
+                                        ("halo_inner_mask", edge_inner_mask_cpu),
+                                        ("halo_outer_mask", edge_outer_mask_cpu),
+                                        ("halo_inner_diff", edge_diff_cpu * edge_inner_mask_cpu),
+                                        ("halo_outer_diff", edge_diff_cpu * edge_outer_mask_cpu),
+                                    ):
+                                        regional_halo_debug_maps[map_name][:, :, crop_y0:crop_y1, crop_x0:crop_x1] = torch.maximum(
+                                            regional_halo_debug_maps[map_name][:, :, crop_y0:crop_y1, crop_x0:crop_x1],
+                                            edge_value,
+                                        )
                                 edge_halo_metrics = _compute_edge_halo_copy_metrics(
                                     edge_rgb_l1_map_detached,
                                     edge_name=edge_name,
@@ -7881,35 +11967,35 @@ def train(args: argparse.Namespace) -> None:
 
                                 if rgb_recon_loss_weight > 0.0:
                                     if region_weights["halo_inner"] > 0.0 and float(seam_rgb_region_area_totals["halo_inner"].item()) > 0.0:
-                                        edge_backward_loss = edge_backward_loss + (
+                                        edge_seam_rgb_backward_loss = edge_seam_rgb_backward_loss + (
                                             rgb_recon_loss_weight
                                             * float(region_weights["halo_inner"])
                                             * edge_summary["region_raw_sums"]["halo_inner"]
                                             / seam_rgb_region_area_totals["halo_inner"].clamp_min(1e-6)
                                         )
                                     if region_weights["halo_outer"] > 0.0 and float(seam_rgb_region_area_totals["halo_outer"].item()) > 0.0:
-                                        edge_backward_loss = edge_backward_loss + (
+                                        edge_seam_rgb_backward_loss = edge_seam_rgb_backward_loss + (
                                             rgb_recon_loss_weight
                                             * float(region_weights["halo_outer"])
                                             * edge_summary["region_raw_sums"]["halo_outer"]
                                             / seam_rgb_region_area_totals["halo_outer"].clamp_min(1e-6)
                                         )
                                     if region_weights["interior_continuation"] > 0.0 and float(seam_continuation_weight_sum_total.item()) > 0.0:
-                                        edge_backward_loss = edge_backward_loss + (
+                                        edge_seam_rgb_backward_loss = edge_seam_rgb_backward_loss + (
                                             rgb_recon_loss_weight
                                             * float(region_weights["interior_continuation"])
                                             * edge_summary["continuation_weighted_raw_sum"]
                                             / seam_continuation_weight_sum_total.clamp_min(1e-6)
                                         )
                                     if region_weights["interior_core"] > 0.0 and float(seam_rgb_region_area_totals["interior_core"].item()) > 0.0:
-                                        edge_backward_loss = edge_backward_loss + (
+                                        edge_seam_rgb_backward_loss = edge_seam_rgb_backward_loss + (
                                             rgb_recon_loss_weight
                                             * float(region_weights["interior_core"])
                                             * edge_summary["region_raw_sums"]["interior_core"]
                                             / seam_rgb_region_area_totals["interior_core"].clamp_min(1e-6)
                                         )
                                     if seam_continuation_gradient_loss_weight_value > 0.0 and float(seam_gradient_weight_sum_total.item()) > 0.0:
-                                        edge_backward_loss = edge_backward_loss + (
+                                        edge_seam_rgb_backward_loss = edge_seam_rgb_backward_loss + (
                                             rgb_recon_loss_weight
                                             * seam_continuation_gradient_loss_weight_value
                                             * edge_gradient_summary["weighted_raw_sum"]
@@ -7917,15 +12003,15 @@ def train(args: argparse.Namespace) -> None:
                                         )
 
                             if isinstance(edge_style_ratio_total_loss, torch.Tensor) and style_ratio_edge_count_total > 0:
-                                edge_backward_loss = edge_backward_loss + (
+                                edge_style_ratio_backward_loss = edge_style_ratio_backward_loss + (
                                     edge_style_ratio_total_loss / float(style_ratio_edge_count_total)
                                 )
 
-                            if edge_backward_loss.requires_grad:
+                            if edge_seam_rgb_backward_loss.requires_grad:
                                 edge_latent_grad = torch.autograd.grad(
-                                    edge_backward_loss,
+                                    edge_seam_rgb_backward_loss,
                                     edge_pred_x0_latents_for_decode,
-                                    retain_graph=False,
+                                    retain_graph=bool(edge_style_ratio_backward_loss.requires_grad),
                                     create_graph=False,
                                     allow_unused=False,
                                 )[0]
@@ -7935,6 +12021,21 @@ def train(args: argparse.Namespace) -> None:
                                     pred_x0_latents_for_decode_grad[:, :, latent_y0:latent_y1, latent_x0:latent_x1] = (
                                         pred_x0_latents_for_decode_grad[:, :, latent_y0:latent_y1, latent_x0:latent_x1]
                                         + edge_latent_grad
+                                    )
+                            if edge_style_ratio_backward_loss.requires_grad:
+                                edge_style_ratio_latent_grad = torch.autograd.grad(
+                                    edge_style_ratio_backward_loss,
+                                    edge_pred_x0_latents_for_decode,
+                                    retain_graph=False,
+                                    create_graph=False,
+                                    allow_unused=False,
+                                )[0]
+                                if edge_style_ratio_latent_grad is not None:
+                                    if pred_x0_latents_for_decode_style_ratio_grad is None:
+                                        pred_x0_latents_for_decode_style_ratio_grad = torch.zeros_like(pred_x0_latents_for_decode)
+                                    pred_x0_latents_for_decode_style_ratio_grad[:, :, latent_y0:latent_y1, latent_x0:latent_x1] = (
+                                        pred_x0_latents_for_decode_style_ratio_grad[:, :, latent_y0:latent_y1, latent_x0:latent_x1]
+                                        + edge_style_ratio_latent_grad
                                     )
 
                         halo_mask = (seam_maps_supervised["margin_inner"] + seam_maps_supervised["margin_outer"]).clamp(0.0, 1.0)
@@ -7959,14 +12060,29 @@ def train(args: argparse.Namespace) -> None:
                         }
                         seam_continuation_gradient_loss_value = float(seam_gradient_summary["weighted_loss"].detach().item())
                         seam_continuation_gradient_loss_raw_value = float(seam_gradient_summary["raw_loss"].detach().item())
+                        seam_rgb_weight_current = 0.0
 
                         if seam_rgb_region_losses:
                             seam_rgb_total_loss = seam_rgb_summary["total_loss"] + (
                                 seam_continuation_gradient_loss_weight_value
                                 * seam_gradient_summary["weighted_loss"]
                             )
-                            loss = loss + (rgb_recon_loss_weight * seam_rgb_total_loss.detach())
                             seam_rgb_total_loss_value = float(seam_rgb_total_loss.detach().item())
+                            seam_rgb_weight_current = rgb_recon_loss_weight
+                            if dynamic_qroute_enabled:
+                                seam_rgb_weight_current = _cap_weight_by_ratio(
+                                    seam_rgb_weight_current,
+                                    seam_rgb_total_loss_value,
+                                    regional_diff_weighted_value,
+                                    ratio_caps["seam_rgb"][1],
+                                )
+                            seam_rgb_grad_scale = seam_rgb_weight_current / max(rgb_recon_loss_weight, 1e-12)
+                            seam_rgb_total_loss_weighted_value = seam_rgb_weight_current * seam_rgb_total_loss_value
+                            seam_rgb_total_ratio_value = _loss_ratio(
+                                seam_rgb_total_loss_weighted_value,
+                                regional_diff_weighted_value,
+                            )
+                            loss = loss + (seam_rgb_weight_current * seam_rgb_total_loss.detach())
                             seam_rgb_halo_loss_raw_value = float(seam_rgb_summary["halo_loss_raw"].detach().item())
                             seam_rgb_interior_loss_raw_value = float(seam_rgb_summary["interior_loss_raw"].detach().item())
                             seam_rgb_halo_loss_weighted_value = float(seam_rgb_summary["halo_loss_weighted"].detach().item())
@@ -8021,9 +12137,9 @@ def train(args: argparse.Namespace) -> None:
                                 (seam_halo_gradient_raw_sum / seam_halo_gradient_active_px.clamp_min(1e-6)).detach().item()
                             ) if float(seam_halo_gradient_active_px.detach().item()) > 0.0 else 0.0
                             seam_halo_to_interior_px_ratio_value = seam_halo_supervised_px_value / max(seam_interior_supervised_px_value, 1e-6)
-                            halo_area = halo_mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
-                            halo_target_energy = ((batch_images.float().abs().mean(dim=1, keepdim=True) * halo_mask).sum(dim=(1, 2, 3)) / halo_area).mean()
-                            seam_halo_target_energy_value = float(halo_target_energy.detach().item())
+                            seam_halo_target_energy_value = float(
+                                (seam_halo_target_raw_sum / seam_halo_target_area.clamp_min(1e-6)).detach().item()
+                            ) if float(seam_halo_target_area.detach().item()) > 0.0 else 0.0
                             if verification_config.get("enable_seam_diagnostic_guards", False):
                                 min_halo_energy = float(verification_config.get("seam_halo_target_energy_min", 1e-3))
                                 if seam_halo_supervised_px_value > 0.0 and seam_halo_target_energy_value <= min_halo_energy:
@@ -8066,37 +12182,6 @@ def train(args: argparse.Namespace) -> None:
                                     style_ratio_entropy_loss_value,
                                     int(style_ratio_edge_count),
                                 )
-
-                        if (
-                            save_seam_visual_debug_enabled
-                            and (step_for_logging - int(resumed_step)) <= int(verification_config.get("seam_visual_debug_max_steps", 2))
-                        ):
-                            _save_seam_visual_debug(
-                                output_dir=args.output_dir,
-                                step=step_for_logging,
-                                pred_rgb=pred_rgb,
-                                target_rgb=target_rgb,
-                                supervision_mask=seam_supervision_mask_rgb,
-                                seam_maps=seam_maps_rgb,
-                                full_target_rgb=target_rgb_full,
-                                full_seam_maps=seam_maps_debug_full,
-                                crop_box=seam_debug_crop_box,
-                                reference_target_rgb=source_batch_images,
-                                source_sizes_hw=(
-                                    int(batch["original_sizes_hw"][0][0].item()),
-                                    int(batch["original_sizes_hw"][0][1].item()),
-                                ),
-                                expanded_source_box=(
-                                    tuple(float(v) for v in batch["expanded_crop_box"][0].detach().cpu().tolist())
-                                    if training_expanded_supervision_enabled and batch.get("expanded_crop_box") is not None
-                                    else None
-                                ),
-                                output_size_hw=(
-                                    int(source_batch_images.shape[-2]),
-                                    int(source_batch_images.shape[-1]),
-                                ),
-                                style_ratio_debug=style_ratio_visual_debug,
-                            )
 
                         seam_rgb_margin_inner_loss_value = float(
                             seam_rgb_region_losses.get("margin_inner", torch.tensor(0.0, device=accelerator.device)).detach().item()
@@ -8205,6 +12290,15 @@ def train(args: argparse.Namespace) -> None:
                             assigned_crop_class=batch.get("assigned_crop_class", None),
                             special_structure_tags=batch.get("special_structure_tags", None),
                         )
+                        corrupted_model_conditioning = build_corrupted_model_visible_conditioning(
+                            batch,
+                            dataset,
+                            seam_config,
+                            corrupted_conditioning,
+                            accelerator.device,
+                            weight_dtype,
+                            int(training_expanded_halo_px) if training_expanded_supervision_enabled else 0,
+                        )
 
                         if bind_negative_mode_requested == "local_spatial_misalignment" and bind_negative_mode_realized == "local_spatial_misalignment":
                             realized_c_count = 1.0
@@ -8233,7 +12327,7 @@ def train(args: argparse.Namespace) -> None:
                             timesteps,
                             text_embedding,
                             vector_embedding,
-                            corrupted_conditioning,
+                            corrupted_model_conditioning,
                         )
                         noise_pred_neg = unet(
                             noisy_latents,
@@ -8271,6 +12365,7 @@ def train(args: argparse.Namespace) -> None:
                             raise RuntimeError("alpha mode enabled but alpha outputs were not produced")
                         if alpha_target is None:
                             raise RuntimeError("alpha mode enabled but alpha targets are missing from the batch")
+                        alpha_target = alpha_target.clamp(0.0, 1.0)
 
                         alpha_prior_weight = _linear_schedule(
                             alpha_config["prior_start_weight"],
@@ -8296,13 +12391,15 @@ def train(args: argparse.Namespace) -> None:
                         terrain_mask_prior = _terrain_mask_to_occupancy(
                             terrain_mask_prior_raw,
                             bool(alpha_config["terrain_mask_black_is_terrain"]),
-                        )
+                        ).clamp(0.0, 1.0)
                         blended_alpha_target = (
                             (1.0 - alpha_prior_weight) * binary_alpha_target
                             + alpha_prior_weight * terrain_mask_prior
-                        )
+                        ).clamp(0.0, 1.0)
 
-                        # Alpha loss is scored only over the interior crop region (no expanded seam halo).
+                        # Base alpha supervision covers the full supervised frame.
+                        # When expanded supervision is enabled, only the outer expanded halo is excluded;
+                        # terrain-specific auxiliaries still use the narrower terrain/edge mask below.
                         supervision_mask = torch.ones_like(alpha_target, dtype=weight_dtype)
                         if training_expanded_supervision_enabled and int(training_expanded_halo_px) > 0:
                             _halo = int(training_expanded_halo_px)
@@ -8330,12 +12427,21 @@ def train(args: argparse.Namespace) -> None:
                             blended_alpha_target.float(),
                             reduction="none",
                         )
-                        alpha_bce = (alpha_bce_map * supervision_mask.float()).sum() / supervision_mask.float().sum().clamp_min(1e-6)
-
                         edge_band = _build_edge_band(binary_alpha_target.float(), alpha_config["edge_dilate_px"])
+                        # Base alpha supervision should cover the full supervised image region.
+                        # Keep terrain-specific auxiliaries on the narrower terrain/edge mask.
+                        alpha_loss_mask = supervision_mask.float().clamp(0.0, 1.0)
+                        alpha_terrain_mask = (
+                            supervision_mask.float()
+                            * torch.maximum(terrain_mask_prior.float(), edge_band.float()).detach().clamp(0.0, 1.0)
+                        ).clamp(0.0, 1.0)
+                        alpha_bce = (alpha_bce_map * alpha_loss_mask).sum() / alpha_loss_mask.sum().clamp_min(1e-6)
+                        alpha_bce = _require_nonnegative_loss("alpha_bce", alpha_bce)
+
                         edge_weight_map = 1.0 + (alpha_config["edge_band_weight"] * edge_band)
-                        weighted_supervision = supervision_mask.float() * edge_weight_map
+                        weighted_supervision = (alpha_loss_mask * edge_weight_map).clamp_min(0.0)
                         alpha_edge = (alpha_bce_map * weighted_supervision).sum() / weighted_supervision.sum().clamp_min(1e-6)
+                        alpha_edge = _require_nonnegative_loss("alpha_edge", alpha_edge)
 
                         pred_alpha_prob = torch.sigmoid(scaled_alpha_logits.float())
                         terrain_mask_target = terrain_mask_prior.float()
@@ -8344,7 +12450,7 @@ def train(args: argparse.Namespace) -> None:
                             terrain_mask_target,
                             reduction="none",
                         )
-                        terrain_bce_per_sample = _masked_mean_per_sample(terrain_bce_map, supervision_mask.float())
+                        terrain_bce_per_sample = _masked_mean_per_sample(terrain_bce_map, alpha_terrain_mask)
                         terrain_presence = terrain_mask_target.mean(dim=(1, 2, 3))
                         terrain_presence_gate = (
                             (terrain_presence - float(alpha_config["terrain_presence_floor"]))
@@ -8352,16 +12458,19 @@ def train(args: argparse.Namespace) -> None:
                         ).clamp(0.0, 1.0)
                         terrain_sample_weight = 1.0 + (float(alpha_config["terrain_presence_boost"]) * terrain_presence_gate)
                         terrain_bce = (terrain_bce_per_sample * terrain_sample_weight).sum() / terrain_sample_weight.sum().clamp_min(1e-6)
+                        terrain_bce = _require_nonnegative_loss("alpha_terrain_bce", terrain_bce)
 
                         terrain_intersection = _masked_mean_per_sample(
                             pred_alpha_prob * terrain_mask_target,
-                            supervision_mask.float(),
+                            alpha_terrain_mask,
                         )
                         terrain_union = _masked_mean_per_sample(
                             pred_alpha_prob + terrain_mask_target - (pred_alpha_prob * terrain_mask_target),
-                            supervision_mask.float(),
+                            alpha_terrain_mask,
                         ).clamp_min(1e-6)
-                        terrain_iou_loss = (1.0 - (terrain_intersection / terrain_union)).mean()
+                        terrain_iou = (terrain_intersection / terrain_union).clamp(0.0, 1.0)
+                        terrain_iou_loss = (1.0 - terrain_iou).mean()
+                        terrain_iou_loss = _require_nonnegative_loss("alpha_terrain_iou", terrain_iou_loss)
 
                         terrain_curriculum_factor = _linear_schedule(
                             float(alpha_config["terrain_curriculum_start"]),
@@ -8373,10 +12482,12 @@ def train(args: argparse.Namespace) -> None:
                             float(alpha_config["terrain_coupling_weight"]) * terrain_bce
                             + float(alpha_config["terrain_iou_weight"]) * terrain_iou_loss
                         )
+                        terrain_coupling_loss = _require_nonnegative_loss("alpha_terrain_coupling", terrain_coupling_loss)
 
                         alpha_total = alpha_config["loss_weight"] * (
                             alpha_bce + (alpha_config["edge_loss_scale"] * alpha_edge)
                         )
+                        alpha_total = _require_nonnegative_loss("alpha_total_base", alpha_total)
 
                         seam_alpha_local_loss = None
                         if (
@@ -8432,9 +12543,22 @@ def train(args: argparse.Namespace) -> None:
                             )
 
                         if seam_alpha_local_loss is not None:
+                            seam_alpha_local_loss = _require_nonnegative_loss("seam_alpha_local_loss", seam_alpha_local_loss)
                             alpha_total = alpha_total + float(seam_config["alpha_local_loss_weight"]) * seam_alpha_local_loss
 
                         alpha_total = alpha_total + terrain_coupling_loss
+                        alpha_total = _require_nonnegative_loss("alpha_total_raw", alpha_total)
+                        alpha_loss_raw_value = float(alpha_total.detach().item())
+                        alpha_weight_current = 1.0
+                        if regional_outputs is not None and dynamic_qroute_enabled:
+                            alpha_weight_current = _cap_weight_by_ratio(
+                                1.0,
+                                float(alpha_total.detach().item()),
+                                regional_diag_values["regional_diff_loss_weighted"],
+                                ratio_caps["alpha"][1],
+                            )
+                        alpha_total = alpha_weight_current * alpha_total
+                        alpha_total = _require_nonnegative_loss("alpha_total_weighted", alpha_total)
                         loss = loss + alpha_total
 
                         diffusion_loss_value = float(diffusion_loss.detach().item())
@@ -8446,12 +12570,20 @@ def train(args: argparse.Namespace) -> None:
                             0.0 if seam_alpha_local_loss is None else float(seam_alpha_local_loss.detach().item())
                         )
                         alpha_total_value = float(alpha_total.detach().item())
+                        alpha_loss_mask_sum_value = float(alpha_loss_mask.detach().sum().item())
+                        active_terrain_alpha_support_sum_value = float(alpha_terrain_mask.detach().sum().item())
+                        if regional_outputs is not None:
+                            regional_diag_values["alpha_ratio"] = _loss_ratio(
+                                alpha_total_value,
+                                regional_diag_values["regional_diff_loss_weighted"],
+                            )
+                            regional_diag_values["alpha_loss_mask_sum"] = float(alpha_loss_mask.detach().sum().item())
                     else:
                         diffusion_loss_value = float(diffusion_loss.detach().item())
 
                     rgb_region_contrib = seam_rgb_summary.get("region_weighted_contributions", {}) if isinstance(seam_rgb_summary, dict) else {}
                     alpha_region_contrib = seam_alpha_summary.get("region_weighted_contributions", {}) if isinstance(seam_alpha_summary, dict) else {}
-                    rgb_scale = float(seam_config.get("rgb_recon_loss_weight", 0.0))
+                    rgb_scale = float(seam_rgb_weight_current)
                     alpha_scale = float(seam_config.get("alpha_local_loss_weight", 0.0))
 
                     def _region_term_value(source: Dict[str, torch.Tensor], key: str) -> float:
@@ -8480,6 +12612,10 @@ def train(args: argparse.Namespace) -> None:
                         * seam_continuation_gradient_loss_weight_value
                         * seam_continuation_gradient_loss_value
                     )
+                    if seam_rgb_summary:
+                        seam_rgb_continuation_weighted_loss_value = (
+                            rgb_scale * _region_term_value(rgb_region_contrib, "continuation_distance_weighted")
+                        )
 
                     seam_total_contribution = (
                         halo_inner_weighted_contribution
@@ -8489,6 +12625,9 @@ def train(args: argparse.Namespace) -> None:
                         + continuation_gradient_weighted_contribution
                     )
                     seam_loss_contribution_ratio_value = seam_total_contribution / max(float(loss.detach().item()), 1e-6)
+                    regional_diff_weighted_for_halo = float(regional_diag_values.get("regional_diff_loss_weighted", 0.0) or 0.0)
+                    halo_inner_rgb_ratio_value = _loss_ratio(halo_inner_weighted_contribution, regional_diff_weighted_for_halo)
+                    halo_outer_rgb_ratio_value = _loss_ratio(halo_outer_weighted_contribution, regional_diff_weighted_for_halo)
                     if verification_config.get("enable_seam_diagnostic_guards", False) and step_for_logging == 1:
                         min_ratio = float(verification_config.get("seam_loss_contribution_ratio_min", 0.05))
                         if seam_loss_contribution_ratio_value <= min_ratio:
@@ -8535,6 +12674,14 @@ def train(args: argparse.Namespace) -> None:
                     if verification_log_now and accelerator.sync_gradients:
                         pre_step_param_stats = _collect_trainable_module_stats(control_net)
 
+                if pred_x0_latents_for_decode_grad is not None and abs(seam_rgb_grad_scale - 1.0) > 1e-12:
+                    pred_x0_latents_for_decode_grad = pred_x0_latents_for_decode_grad * seam_rgb_grad_scale
+                if pred_x0_latents_for_decode_style_ratio_grad is not None:
+                    if pred_x0_latents_for_decode_grad is None:
+                        pred_x0_latents_for_decode_grad = pred_x0_latents_for_decode_style_ratio_grad
+                    else:
+                        pred_x0_latents_for_decode_grad = pred_x0_latents_for_decode_grad + pred_x0_latents_for_decode_style_ratio_grad
+
                 if pred_x0_latents_for_decode_grad is not None:
                     accelerator.backward(loss, retain_graph=True)
                     torch.autograd.backward((pred_x0_latents_for_decode,), (pred_x0_latents_for_decode_grad,))
@@ -8544,6 +12691,18 @@ def train(args: argparse.Namespace) -> None:
                 seam_adapter_pre_step_snapshot = None
                 if verification_log_now and accelerator.sync_gradients:
                     grad_stats = _collect_trainable_grad_stats(control_net)
+                    if not bool(regional_loss_config.get("enabled", False)):
+                        grad_total_value = math.sqrt(
+                            max(
+                                0.0,
+                                float(grad_stats.get("semantic_pre_stem", {}).get("l2", 0.0)) ** 2
+                                + float(grad_stats.get("control_residual_blocks", {}).get("l2", 0.0)) ** 2
+                                + float(grad_stats.get("control_mid_block", {}).get("l2", 0.0)) ** 2
+                                + float(grad_stats.get("alpha_heads", {}).get("l2", 0.0)) ** 2,
+                            )
+                        )
+                        if not math.isfinite(grad_total_value):
+                            raise RuntimeError("baseline ablation gradient norm became non-finite")
                 if controlnet_diagnostics is not None and accelerator.sync_gradients:
                     controlnet_diagnostics = dict(controlnet_diagnostics)
                     controlnet_diagnostics.update(
@@ -8555,6 +12714,14 @@ def train(args: argparse.Namespace) -> None:
                     )
                     seam_adapter_pre_step_snapshot = _collect_seam_adapter_parameter_snapshot(control_net)
                 if accelerator.sync_gradients:
+                    lr_warmup_scale = _apply_optimizer_lr_warmup(
+                        optimizer,
+                        (global_step - resumed_step) + 1,
+                        int(getattr(args, "lr_warmup_steps", 0) or 0),
+                        float(getattr(args, "lr_warmup_start_factor", 0.10)),
+                    )
+                    if accelerator.is_main_process and int(getattr(args, "lr_warmup_steps", 0) or 0) > 0 and ((global_step - resumed_step) + 1) <= int(args.lr_warmup_steps) and (((global_step - resumed_step) + 1) in {1, int(args.lr_warmup_steps)} or ((global_step - resumed_step) + 1) % 25 == 0):
+                        logger.info("[optimizer/lr_warmup] relative_step=%d scale=%.6f", (global_step - resumed_step) + 1, float(lr_warmup_scale))
                     if args.max_grad_norm > 0.0:
                         accelerator.clip_grad_norm_(control_net.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -8616,6 +12783,75 @@ def train(args: argparse.Namespace) -> None:
                     param_delta_control_mid = float(_deltas_for_trace.get("control_mid_block", 0.0))
 
                 if global_step == 1 or global_step % max(1, args.loss_trace_every) == 0 or global_step == args.max_train_steps:
+                    recent_total_losses.append(loss_value)
+                    ema_alpha = 2.0 / 21.0
+                    if loss_ema20_value is None:
+                        loss_ema20_value = loss_value
+                    else:
+                        loss_ema20_value = (ema_alpha * loss_value) + ((1.0 - ema_alpha) * loss_ema20_value)
+                    if len(recent_total_losses) >= 2:
+                        x = np.arange(len(recent_total_losses), dtype=np.float32)
+                        y = np.array(list(recent_total_losses), dtype=np.float32)
+                        loss_slope_20_value = float(np.polyfit(x, y, 1)[0])
+                    else:
+                        loss_slope_20_value = 0.0
+                    alpha_cumprod_diag = noise_scheduler.alphas_cumprod[timesteps].detach().float().reshape(-1)
+                    sigma_diag = (1.0 - alpha_cumprod_diag).clamp_min(1e-12).sqrt()
+                    snr_diag = alpha_cumprod_diag / sigma_diag.pow(2).clamp_min(1e-12)
+                    prediction_norm_value = float(noise_pred.detach().float().reshape(noise_pred.shape[0], -1).norm(dim=1).mean().item())
+                    target_norm_value = float(noise.detach().float().reshape(noise.shape[0], -1).norm(dim=1).mean().item())
+                    pred_minus_target_norm_value = float((noise_pred.detach().float() - noise.detach().float()).reshape(noise.shape[0], -1).norm(dim=1).mean().item())
+                    gradient_norm_total_value = 0.0
+                    gradient_norm_base_diffusion_value = 0.0
+                    gradient_norm_alpha_value = 0.0
+                    if grad_stats is not None:
+                        gradient_norm_alpha_value = float(grad_stats.get("alpha_heads", {}).get("l2", 0.0))
+                        gradient_norm_base_diffusion_value = math.sqrt(
+                            max(
+                                0.0,
+                                float(grad_stats.get("semantic_pre_stem", {}).get("l2", 0.0)) ** 2
+                                + float(grad_stats.get("control_residual_blocks", {}).get("l2", 0.0)) ** 2
+                                + float(grad_stats.get("control_mid_block", {}).get("l2", 0.0)) ** 2,
+                            )
+                        )
+                        gradient_norm_total_value = math.sqrt(
+                            max(0.0, (gradient_norm_base_diffusion_value ** 2) + (gradient_norm_alpha_value ** 2))
+                        )
+                    visible_metrics = {
+                        "visible_terrain_rgb_mean": 0.0,
+                        "visible_terrain_rgb_std": 0.0,
+                        "visible_terrain_gradient_energy": 0.0,
+                        "visible_terrain_laplacian_energy": 0.0,
+                        "active_terrain_alpha_support_sum": active_terrain_alpha_support_sum_value,
+                    }
+                    if not bool(regional_loss_config.get("enabled", False)):
+                        try:
+                            alpha_t_for_decode = noise_scheduler.alphas_cumprod[timesteps[:1]].to(device=noisy_latents.device, dtype=noisy_latents.dtype).view(1, 1, 1, 1)
+                            sqrt_alpha_t_for_decode = alpha_t_for_decode.sqrt().clamp_min(1e-6)
+                            sqrt_sigma_t_for_decode = (1.0 - alpha_t_for_decode).clamp_min(0.0).sqrt()
+                            pred_x0_trace = (noisy_latents[:1] - (sqrt_sigma_t_for_decode * noise_pred[:1])) / sqrt_alpha_t_for_decode
+                            pred_rgb_trace = vae.decode((pred_x0_trace / sdxl_model_util.VAE_SCALE_FACTOR).to(dtype=vae_dtype)).sample
+                            if alpha_config["enabled"]:
+                                support_mask = torch.maximum(pred_alpha_prob[:1].detach(), terrain_mask_target[:1].detach()).clamp(0.0, 1.0)
+                            else:
+                                support_mask = trusted_mask[:1].detach().float()
+                            visible_metrics = _compute_visible_terrain_trace_metrics(pred_rgb_trace, support_mask)
+                        except Exception as visible_exc:
+                            logger.warning("[baseline/visible_metrics] failed: %s", visible_exc)
+                    nonfinite_or_nan_detected_value = 1.0 if any(
+                        not math.isfinite(value)
+                        for value in (
+                            loss_value,
+                            standard_base_diffusion_loss_raw_value,
+                            alpha_loss_raw_value,
+                            prediction_norm_value,
+                            target_norm_value,
+                            pred_minus_target_norm_value,
+                            gradient_norm_total_value,
+                            visible_metrics["visible_terrain_gradient_energy"],
+                            visible_metrics["visible_terrain_laplacian_energy"],
+                        )
+                    ) else 0.0
                     if alpha_config["enabled"]:
                         _log_alpha_loss_breakdown(
                             global_step,
@@ -8628,10 +12864,63 @@ def train(args: argparse.Namespace) -> None:
                             terrain_curriculum_factor,
                             alpha_config["dominance_warn_ratio"],
                         )
+                    texture_collapse_metrics = {
+                        "texture_collapse_cosine_similarity": float("nan"),
+                        "texture_collapse_fft_energy_similarity": float("nan"),
+                        "texture_collapse_cross_region_lpips": float("nan"),
+                        "texture_collapse_pair_count": 0.0,
+                    }
+                    if regional_pred_rgb is not None and regional_cand_q_lat is not None and regional_pred_x0_for_region is not None:
+                        try:
+                            pred_latents_for_texture = regional_pred_x0_for_region.float()
+                            if pred_latents_for_texture.shape[-2:] != regional_pred_rgb.shape[-2:]:
+                                pred_latents_for_texture = F.interpolate(
+                                    pred_latents_for_texture,
+                                    size=regional_cand_q_lat.shape[-2:],
+                                    mode="bilinear",
+                                    align_corners=False,
+                                )
+                            texture_collapse_metrics = _compute_texture_collapse_metrics(
+                                pred_latents=pred_latents_for_texture.detach(),
+                                pred_rgb=regional_pred_rgb.detach(),
+                                candidate_q_latent=regional_cand_q_lat.detach(),
+                                candidate_active_mask=cand_active.detach(),
+                            )
+                        except Exception as texture_exc:
+                            logger.warning("[regional/texture_collapse] failed: %s", texture_exc)
                     loss_trace_row = {
                             "step": float(global_step),
                             "loss": loss_value,
+                            "total_loss": loss_value,
+                            "standard_base_diffusion_loss_raw": standard_base_diffusion_loss_raw_value,
+                            "standard_base_diffusion_loss_weighted": standard_base_diffusion_loss_weighted_value,
+                            "alpha_loss_raw": alpha_loss_raw_value,
+                            "alpha_loss_weighted": alpha_total_value,
+                            "loss_ema_20": float(loss_ema20_value),
+                            "loss_slope_20": loss_slope_20_value,
+                            "prediction_norm": prediction_norm_value,
+                            "target_norm": target_norm_value,
+                            "pred_minus_target_norm": pred_minus_target_norm_value,
+                            "gradient_norm_total": gradient_norm_total_value,
+                            "gradient_norm_base_diffusion": gradient_norm_base_diffusion_value,
+                            "gradient_norm_alpha": gradient_norm_alpha_value,
+                            "visible_terrain_rgb_mean": visible_metrics["visible_terrain_rgb_mean"],
+                            "visible_terrain_rgb_std": visible_metrics["visible_terrain_rgb_std"],
+                            "visible_terrain_gradient_energy": visible_metrics["visible_terrain_gradient_energy"],
+                            "visible_terrain_laplacian_energy": visible_metrics["visible_terrain_laplacian_energy"],
+                            "active_terrain_alpha_support_sum": visible_metrics["active_terrain_alpha_support_sum"],
+                            "nonfinite_or_nan_detected": nonfinite_or_nan_detected_value,
+                            "regional_multitarget_enabled": 1.0 if regional_loss_config.get("enabled", False) else 0.0,
+                            "regional_wrapper_called": 1.0 if regional_outputs is not None else 0.0,
+                            "standard_base_diffusion_only_mode": 1.0 if not regional_loss_config.get("enabled", False) else 0.0,
+                            "learned_routing_gate_enabled": 1.0 if regional_loss_config.get("enabled", False) and regional_loss_config.get("q_route_dynamic_enabled", True) else 0.0,
                             "diffusion_loss": diffusion_loss_value,
+                            "sigma": float(sigma_diag.mean().item()),
+                            "sigma_min": float(sigma_diag.min().item()),
+                            "sigma_max": float(sigma_diag.max().item()),
+                            "snr": float(snr_diag.mean().item()),
+                            "snr_min": float(snr_diag.min().item()),
+                            "snr_max": float(snr_diag.max().item()),
                             "alpha_bce_loss": alpha_bce_value,
                             "alpha_edge_loss": alpha_edge_value,
                             "alpha_terrain_bce_loss": alpha_terrain_bce_value,
@@ -8684,6 +12973,8 @@ def train(args: argparse.Namespace) -> None:
                             "seam_continuation_rgb_loss_bin_40_48": seam_continuation_rgb_loss_bin_40_48_value,
                             "seam_continuation_distance_band_px_count": seam_continuation_distance_band_px_count_value,
                             "seam_rgb_total_loss": seam_rgb_total_loss_value,
+                            "seam_rgb_total_loss_weighted": seam_rgb_total_loss_weighted_value,
+                            "seam_rgb_total_ratio": seam_rgb_total_ratio_value,
                             "seam_edge_recon_score": seam_edge_recon_score,
                             "seam_margin_inner_coverage_ratio": seam_margin_inner_coverage_ratio,
                             "seam_margin_inner_coverage_px": seam_margin_inner_coverage_px,
@@ -8692,6 +12983,7 @@ def train(args: argparse.Namespace) -> None:
                             "prompt_conflict_score": prompt_conflict_score,
                             "prompt_conflict_score_norm": prompt_conflict_score_norm,
                             "alpha_total_loss": alpha_total_value,
+                            "alpha_loss_mask_sum": alpha_loss_mask_sum_value,
                             "seam_defined_ratio": seam_diag.get("seam_defined_ratio", 0.0),
                             "seam_pre_gate_l2": seam_diag.get("seam_pre_gate_l2", 0.0),
                             "seam_post_gate_l2": seam_diag.get("seam_post_gate_l2", 0.0),
@@ -8713,9 +13005,15 @@ def train(args: argparse.Namespace) -> None:
                             "seam_loss_contribution_ratio": seam_loss_contribution_ratio_value,
                             "halo_inner_weighted_contribution": halo_inner_weighted_contribution,
                             "halo_outer_weighted_contribution": halo_outer_weighted_contribution,
+                            "halo_inner_rgb_ratio": halo_inner_rgb_ratio_value,
+                            "halo_outer_rgb_ratio": halo_outer_rgb_ratio_value,
                             "interior_continuation_weighted_contribution": interior_continuation_weighted_contribution,
                             "interior_core_weighted_contribution": interior_core_weighted_contribution,
                             "continuation_gradient_weighted_contribution": continuation_gradient_weighted_contribution,
+                            "texture_collapse_cosine_similarity": texture_collapse_metrics["texture_collapse_cosine_similarity"],
+                            "texture_collapse_fft_energy_similarity": texture_collapse_metrics["texture_collapse_fft_energy_similarity"],
+                            "texture_collapse_cross_region_lpips": texture_collapse_metrics["texture_collapse_cross_region_lpips"],
+                            "texture_collapse_pair_count": texture_collapse_metrics["texture_collapse_pair_count"],
                             "train_prediction_h": train_prediction_h,
                             "train_prediction_w": train_prediction_w,
                             "train_alpha_target_h": train_alpha_target_h,
@@ -8857,7 +13155,11 @@ def train(args: argparse.Namespace) -> None:
                             "train_prompt_mode": train_prompt_mode,
                             "train_prompt": train_prompt,
                             "train_prompt2": train_prompt2,
+                            # --- regional multi-target diffusion loss diagnostics ---
+                            **regional_diag_values,
                         }
+                    if regional_loss_config.get("enabled", False):
+                        loss_trace_row.update(_compute_canary_baseline_fields(loss_trace, loss_trace_row, baseline_window=10))
                     formatted_loss_trace_row = _format_loss_trace_row(loss_trace_row, loss_trace_mode)
                     loss_trace.append(formatted_loss_trace_row)
                     if loss_trace:
@@ -8952,7 +13254,7 @@ def train(args: argparse.Namespace) -> None:
                             _ckpt_trace_path = os.path.join(args.output_dir, "sanity", "loss_trace.csv")
                             try:
                                 os.makedirs(os.path.join(args.output_dir, "sanity"), exist_ok=True)
-                                _fieldnames = list(loss_trace[0].keys())
+                                _fieldnames = _loss_trace_fieldnames(loss_trace)
                                 with open(_ckpt_trace_path, "w", newline="", encoding="utf-8") as _fh:
                                     _w = csv.DictWriter(_fh, fieldnames=_fieldnames, extrasaction="ignore")
                                     _w.writeheader()
@@ -9101,7 +13403,7 @@ def train(args: argparse.Namespace) -> None:
             os.makedirs(sanity_dir, exist_ok=True)
             loss_trace_path = os.path.join(sanity_dir, "loss_trace.csv")
             with open(loss_trace_path, "w", newline="", encoding="utf-8") as handle:
-                fieldnames = list(loss_trace[0].keys())
+                fieldnames = _loss_trace_fieldnames(loss_trace)
                 writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(loss_trace)

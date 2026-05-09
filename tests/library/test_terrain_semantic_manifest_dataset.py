@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,8 @@ def test_style_ratio_support_excludes_valid_expanded_halo() -> None:
     seam_strip_width_px = torch.tensor([2.0], dtype=torch.float32)
     supervision_mask = torch.ones((1, 1, 10, 10), dtype=torch.float32)
     valid_expanded_source_mask = torch.ones((1, 1, 10, 10), dtype=torch.float32)
+    q_valid_support_mask = torch.zeros((1, 1, 10, 10), dtype=torch.float32)
+    q_valid_support_mask[:, :, 2:8, 2:8] = 1.0
 
     seam_maps = build_seam_region_maps(
         edge_band_masks=edge_band_masks,
@@ -81,6 +84,7 @@ def test_style_ratio_support_excludes_valid_expanded_halo() -> None:
         valid_expanded_source_mask=valid_expanded_source_mask,
         continuation_valid_mask=None,
         style_support_valid_mask=None,
+        q_valid_support_mask=q_valid_support_mask,
         style_ratio_config={
             "hard_band_end_px": 1.0,
             "near_band_end_px": 2.0,
@@ -103,13 +107,303 @@ def test_style_ratio_support_excludes_valid_expanded_halo() -> None:
         "soft_field_mask",
         "valid_style_support_mask",
         "style_spatial_support_mask",
-        "soft_field_q_sum",
     ):
         field = seam_maps[field_name]
         assert float((field * valid_halo_mask).sum().item()) == 0.0, field_name
 
+    assert torch.allclose(
+        seam_maps["soft_field_q_sum"] * valid_halo_mask,
+        torch.zeros_like(valid_halo_mask),
+        atol=1e-5,
+    )
     assert float((seam_maps["soft_field_q_sum"] * source_interior_mask).sum().item()) > 0.0
     assert float((seam_maps["soft_field_mask"] * source_interior_mask).sum().item()) > 0.0
+
+
+def test_q_fields_follow_loss_support_not_style_support() -> None:
+    height = 16
+    width = 32
+    edge_band_masks = torch.zeros((1, 4, height, width), dtype=torch.float32)
+    seam_decay_maps = torch.zeros_like(edge_band_masks)
+    edge_defined_flags = torch.tensor([[1.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+    seam_strip_width_px = torch.tensor([2.0], dtype=torch.float32)
+    regional_loss_valid_mask = torch.ones((1, 1, height, width), dtype=torch.float32)
+    regional_loss_valid_mask[:, :, 6:10, 12:20] = 0.0
+    style_support_valid_mask = torch.zeros((1, 1, height, width), dtype=torch.float32)
+    style_support_valid_mask[:, :, 0:3, 14:18] = 1.0
+
+    seam_maps = build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=edge_defined_flags,
+        seam_strip_width_px=seam_strip_width_px,
+        supervision_mask=torch.ones_like(regional_loss_valid_mask),
+        seam_config={},
+        source_sizes_hw=torch.tensor([[float(height), float(width)]], dtype=torch.float32),
+        style_support_valid_mask=style_support_valid_mask,
+        q_valid_support_mask=regional_loss_valid_mask,
+        style_ratio_config={
+            "edge_plateau_px": 2.0,
+            "edge_radius_fraction": 1.0,
+            "edge_sigma_fraction": 0.35,
+            "q_normalize": True,
+            "soft_field_end_px": 30.0,
+        },
+    )
+
+    q_sum = seam_maps["soft_field_q_per_edge"].sum(dim=1, keepdim=True) + seam_maps["soft_field_q_interior"]
+    assert torch.allclose(q_sum * regional_loss_valid_mask, regional_loss_valid_mask, atol=1e-5)
+    assert float((q_sum * (1.0 - regional_loss_valid_mask)).sum().item()) == 0.0
+    assert float(q_sum[0, 0, 4, 4].item()) > 0.99
+    assert float(style_support_valid_mask[0, 0, 4, 4].item()) == 0.0
+
+
+def test_q_fields_keep_interior_competing_on_edge_plateaus() -> None:
+    height = 24
+    width = 48
+    edge_band_masks = torch.zeros((1, 4, height, width), dtype=torch.float32)
+    seam_decay_maps = torch.zeros_like(edge_band_masks)
+    edge_defined_flags = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    seam_strip_width_px = torch.tensor([2.0], dtype=torch.float32)
+    supervision_mask = torch.ones((1, 1, height, width), dtype=torch.float32)
+
+    seam_maps = build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=edge_defined_flags,
+        seam_strip_width_px=seam_strip_width_px,
+        supervision_mask=supervision_mask,
+        seam_config={},
+        source_sizes_hw=torch.tensor([[float(height), float(width)]], dtype=torch.float32),
+        style_ratio_config={
+            "edge_plateau_px": 4.0,
+            "edge_radius_fraction": 1.0,
+            "edge_sigma_fraction": 0.35,
+            "q_normalize": True,
+            "soft_field_end_px": 20.0,
+        },
+    )
+
+    q_edges = seam_maps["soft_field_q_per_edge"]
+    q_interior = seam_maps["soft_field_q_interior"]
+    q_sum = q_edges.sum(dim=1, keepdim=True) + q_interior
+
+    assert torch.allclose(q_sum, torch.ones_like(q_sum), atol=1e-5)
+    assert float(q_edges[0, 0, 0, width // 2].item()) >= 0.999
+    assert float(q_interior[0, 0, 0, width // 2].item()) <= 1e-6
+
+
+def test_smooth_q_fields_decay_and_overlap_at_corners() -> None:
+    height = 24
+    width = 64
+    edge_band_masks = torch.zeros((1, 4, height, width), dtype=torch.float32)
+    seam_decay_maps = torch.zeros_like(edge_band_masks)
+    edge_defined_flags = torch.tensor([[1.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+    seam_strip_width_px = torch.tensor([2.0], dtype=torch.float32)
+    supervision_mask = torch.ones((1, 1, height, width), dtype=torch.float32)
+
+    seam_maps = build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=edge_defined_flags,
+        seam_strip_width_px=seam_strip_width_px,
+        supervision_mask=supervision_mask,
+        seam_config={},
+        source_sizes_hw=torch.tensor([[float(height), float(width)]], dtype=torch.float32),
+        style_ratio_config={
+            "edge_plateau_px": 2.0,
+            "q_edge_sigma_px": 180.0,
+            "q_normalize": True,
+            "soft_field_end_px": 20.0,
+        },
+    )
+
+    q_edges = seam_maps["soft_field_q_per_edge"]
+    q_interior = seam_maps["soft_field_q_interior"]
+    q_pre_mask = seam_maps["q_edge_pre_mask_per_edge"]
+    q_distance = seam_maps["q_distance_px_per_edge"]
+    max_edge_q = seam_maps["q_max_edge"]
+    q_sum = q_edges.sum(dim=1, keepdim=True) + q_interior
+
+    assert torch.allclose(q_sum, torch.ones_like(q_sum), atol=1e-5)
+    assert float(q_distance[0, 0, 1, width // 2].item()) > float(q_distance[0, 0, 0, width // 2].item())
+    assert float(q_distance[0, 3, height // 2, 1].item()) > float(q_distance[0, 3, height // 2, 0].item())
+    assert float(q_pre_mask[0, 0, 0, width // 2].item()) >= 0.95
+    assert float(q_interior[0, 0, 0, width // 2].item()) <= 0.05
+    assert float(q_edges[0, 0, 3, width // 2].item()) < float(q_edges[0, 0, 0, width // 2].item())
+    assert float(q_edges[0, 3, height // 2, 3].item()) < float(q_edges[0, 3, height // 2, 0].item())
+    assert float(q_edges[0, 1].max().item()) == 0.0
+    assert float(q_edges[0, 2].max().item()) == 0.0
+    assert float(q_edges[0, 0, 8, 8].item()) > 0.0
+    assert float(q_edges[0, 3, 8, 8].item()) > 0.0
+    assert abs(float(q_edges[0, 0, 0, 0].item()) - 0.5) <= 1e-5
+    assert abs(float(q_edges[0, 3, 0, 0].item()) - 0.5) <= 1e-5
+    assert float(q_interior[0, 0, 0, 0].item()) <= 0.05
+    assert float(max_edge_q[0, 0, 0, 0].item()) >= 0.95
+    assert float(q_interior[0, 0, height // 2, width // 2].item()) > float(q_interior[0, 0, 0, 0].item())
+    assert float(q_edges[0, 0, -1, width // 2].item()) < float(q_edges[0, 0, 0, width // 2].item())
+
+
+def test_q_fields_use_source_space_seam_edge_priors() -> None:
+    height = 32
+    width = 64
+    edge_band_masks = torch.zeros((1, 4, height, width), dtype=torch.float32)
+    seam_decay_maps = torch.zeros_like(edge_band_masks)
+    edge_defined_flags = torch.tensor([[1.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+    seam_strip_width_px = torch.tensor([2.0], dtype=torch.float32)
+    supervision_mask = torch.ones((1, 1, height, width), dtype=torch.float32)
+    valid_generated_mask = torch.zeros((1, 1, height, width), dtype=torch.float32)
+    valid_generated_mask[:, :, 0:4, 20:45] = 1.0
+    valid_generated_mask[:, :, 10:21, 0:4] = 1.0
+
+    seam_maps = build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=edge_defined_flags,
+        seam_strip_width_px=seam_strip_width_px,
+        supervision_mask=supervision_mask,
+        seam_config={},
+        source_sizes_hw=torch.tensor([[float(height), float(width)]], dtype=torch.float32),
+        style_support_valid_mask=valid_generated_mask,
+        style_ratio_config={
+            "hard_band_end_px": 4.0,
+            "near_band_end_px": 8.0,
+            "overlap_band_end_px": 12.0,
+            "soft_field_end_px": 30.0,
+            "edge_plateau_px": 2.0,
+            "q_edge_sigma_px": 180.0,
+            "q_normalize": True,
+        },
+    )
+
+    q_edges = seam_maps["soft_field_q_per_edge"]
+    q_decay = seam_maps["q_inward_decay_per_edge"]
+    q_distance = seam_maps["q_distance_px_per_edge"]
+    q_interior = seam_maps["q_interior"]
+
+    assert float(q_decay[0, 0, 0, 32].item()) >= 0.95
+    assert float(q_edges[0, 0, 0, 32].item()) > 0.5
+    assert float(q_edges[0, 0, 0, 2].item()) > 0.45
+    assert float(q_edges[0, 3, 12, 0].item()) > 0.45
+    assert abs(float(q_edges[0, 0, 1, 0].item()) - 0.5) <= 1e-5
+    assert abs(float(q_edges[0, 3, 1, 0].item()) - 0.5) <= 1e-5
+    assert float(q_edges[0, 0, 8, 8].item()) > 0.0
+    assert float(q_edges[0, 3, 8, 8].item()) > 0.0
+    assert float(q_distance[0, 0, 3, 32].item()) > float(q_distance[0, 0, 0, 32].item())
+    assert float(q_distance[0, 3, 12, 3].item()) > float(q_distance[0, 3, 12, 0].item())
+    assert float(q_decay[0, 0, 6, 32].item()) < float(q_decay[0, 0, 0, 32].item())
+    assert float(q_decay[0, 3, 12, 6].item()) < float(q_decay[0, 3, 12, 0].item())
+    assert float(q_interior[0, 0, 0, 32].item()) <= 0.05
+    assert float(q_interior[0, 0, 12, 0].item()) <= 0.05
+
+
+def test_q_edge_decay_saturates_then_balances_bottom_edge_and_interior() -> None:
+    height = 640
+    width = 128
+    edge_band_masks = torch.zeros((1, 4, height, width), dtype=torch.float32)
+    seam_decay_maps = torch.zeros_like(edge_band_masks)
+    edge_defined_flags = torch.tensor([[0.0, 1.0, 0.0, 0.0]], dtype=torch.float32)
+    seam_strip_width_px = torch.tensor([2.0], dtype=torch.float32)
+    supervision_mask = torch.ones((1, 1, height, width), dtype=torch.float32)
+
+    seam_maps = build_seam_region_maps(
+        edge_band_masks=edge_band_masks,
+        seam_decay_maps=seam_decay_maps,
+        edge_defined_flags=edge_defined_flags,
+        seam_strip_width_px=seam_strip_width_px,
+        supervision_mask=supervision_mask,
+        seam_config={},
+        source_sizes_hw=torch.tensor([[float(height), float(width)]], dtype=torch.float32),
+        style_ratio_config={
+            "edge_plateau_px": 16.0,
+            "q_edge_sigma_px": 180.0,
+            "q_interior_sigma_px": 180.0,
+            "q_floor": 0.0,
+            "q_normalize": True,
+        },
+    )
+
+    q_edges = seam_maps["soft_field_q_per_edge"]
+    q_interior = seam_maps["soft_field_q_interior"]
+    q_decay = seam_maps["q_inward_decay_per_edge"]
+    q_distance = seam_maps["q_distance_px_per_edge"]
+    center_x = width // 2
+
+    assert 0.0 <= float(q_distance[0, 1, height - 1, center_x].item()) <= 0.5
+    assert float(q_decay[0, 1, height - 1, center_x].item()) == 1.0
+    assert float(q_decay[0, 1, height - 1 - 16, center_x].item()) >= 0.998
+    assert 0.03 <= float(q_decay[0, 1, height - 1 - 600, center_x].item()) <= 0.05
+
+    bottom_edge_sum = float(q_edges[:, 1:2].sum().item())
+    interior_sum = float(q_interior.sum().item())
+    balance_ratio = bottom_edge_sum / max(interior_sum, 1e-6)
+    assert 0.65 <= balance_ratio <= 1.15
+
+
+def _build_regional_candidate_dataset_stub(paths: list[str]) -> TerrainSemanticManifestDataset:
+    dataset = TerrainSemanticManifestDataset.__new__(TerrainSemanticManifestDataset)
+    dataset.regional_loss_enabled = True
+    dataset._records = [{"image_name": "family_a", "crop_box": (0, 0, 4, 4)}]
+    dataset.train_size = (4, 4)
+    dataset.expanded_target_halo_px = 0
+    dataset._regional_rng = random.Random(1234)
+    dataset._regional_audit_logged = 0
+    dataset._regional_audit_max = 0
+    family = {
+        "variants": [
+            {"path": paths[0], "prompt": "prompt 0", "negative_prompt": "", "name": "variant_0"},
+            {"path": paths[1], "prompt": "prompt 1", "negative_prompt": "", "name": "variant_1"},
+        ],
+        "full_image_set": list(paths),
+    }
+    dataset._resolve_family_for_image_name = lambda _image_name: family
+    dataset._load_candidate_train_rgba = lambda image_path, _crop_box: torch.full(
+        (4, 4, 4),
+        float(paths.index(image_path) + 1) / 10.0,
+        dtype=torch.float32,
+    )
+    return dataset
+
+
+def test_regional_candidates_never_reuse_active_target_image(tmp_path: Path) -> None:
+    paths = [str(tmp_path / f"candidate_{idx}.png") for idx in range(5)]
+    dataset = _build_regional_candidate_dataset_stub(paths)
+
+    candidates = dataset._compose_regional_candidates(
+        index=0,
+        edge_defined_flags=torch.ones((4,), dtype=torch.float32),
+    )
+
+    assert candidates is not None
+    active_mask = candidates["candidate_active_mask"]
+    active_names = [
+        name
+        for is_active, name in zip(active_mask.tolist(), candidates["candidate_image_names"])
+        if is_active > 0.5
+    ]
+    assert len(active_names) == 5
+    assert len(active_names) == len(set(active_names))
+
+
+def test_regional_candidates_disable_slots_instead_of_reusing_images(tmp_path: Path) -> None:
+    unique_paths = [str(tmp_path / f"candidate_{idx}.png") for idx in range(3)]
+    duplicated_paths = unique_paths + [unique_paths[1], unique_paths[2], unique_paths[2]]
+    dataset = _build_regional_candidate_dataset_stub(duplicated_paths)
+
+    candidates = dataset._compose_regional_candidates(
+        index=0,
+        edge_defined_flags=torch.ones((4,), dtype=torch.float32),
+    )
+
+    assert candidates is not None
+    active_mask = candidates["candidate_active_mask"]
+    active_names = [
+        name
+        for is_active, name in zip(active_mask.tolist(), candidates["candidate_image_names"])
+        if is_active > 0.5
+    ]
+    assert len(active_names) == len(set(active_names))
+    assert int(active_mask.sum().item()) == len(set(duplicated_paths))
 
 
 def test_regenerated_seam_sources_select_distinct_family_variant(tmp_path: Path) -> None:

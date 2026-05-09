@@ -84,6 +84,21 @@ def _float_to_grayscale_image(mask: torch.Tensor) -> Image.Image:
     return Image.fromarray((norm * 255.0).round().astype(np.uint8), mode="L")
 
 
+def _composite_rgba_on_neutral(rgba: Image.Image, background: Tuple[int, int, int] = (192, 192, 192)) -> Image.Image:
+    base = Image.new("RGBA", rgba.size, background + (255,))
+    return Image.alpha_composite(base, rgba.convert("RGBA")).convert("RGB")
+
+
+def _detail_heatmap(image: Image.Image) -> Image.Image:
+    edge = image.convert("L").filter(ImageFilter.FIND_EDGES)
+    arr = np.asarray(edge, dtype=np.float32)
+    peak = float(arr.max())
+    if peak > 0.0:
+        arr = arr / peak
+    heat = np.stack([arr * 255.0, np.sqrt(arr) * 192.0, arr * 64.0], axis=2).clip(0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(heat, mode="RGB")
+
+
 def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
     x1 = x.flatten().float()
     y1 = y.flatten().float()
@@ -1179,6 +1194,8 @@ def _render_one(
     conditioning_spec: Optional[ModelVisibleConditioningSpec] = None,
     override_conditioning: Optional[torch.Tensor] = None,
     override_full_conditioning: Optional[torch.Tensor] = None,
+    negative_cached_text: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    guidance_scale: float = 1.0,
 ) -> Dict[str, object]:
     if override_full_conditioning is not None:
         cond = override_full_conditioning.unsqueeze(0).to(device=device, dtype=control_dtype)
@@ -1224,6 +1241,12 @@ def _render_one(
 
     te1, te2, pool2 = cached_text
     text_embedding = torch.cat([te1, te2], dim=2)
+    negative_text_embedding = None
+    negative_vector_pool = None
+    if negative_cached_text is not None and float(guidance_scale) != 1.0:
+        neg_te1, neg_te2, neg_pool2 = negative_cached_text
+        negative_text_embedding = torch.cat([neg_te1, neg_te2], dim=2)
+        negative_vector_pool = neg_pool2
 
     size_batch = {
         "original_sizes_hw": torch.tensor([[target_h, target_w]], device=device, dtype=torch.long),
@@ -1237,6 +1260,9 @@ def _render_one(
         device,
     ).to(weight_dtype)
     vector_embedding = torch.cat([pool2, size_embeddings], dim=1)
+    negative_vector_embedding = None
+    if negative_vector_pool is not None:
+        negative_vector_embedding = torch.cat([negative_vector_pool, size_embeddings], dim=1)
 
     latent_h = int(target_h) // 8
     latent_w = int(target_w) // 8
@@ -1273,23 +1299,64 @@ def _render_one(
     with torch.no_grad():
         for step_index, timestep in enumerate(scheduler.timesteps):
             t = timestep.expand(1).to(device=device, dtype=torch.long)
-            input_resi_add, mid_add, alpha_outputs = control_net(
-                noisy.to(dtype=control_dtype),
-                t,
-                text_embedding.to(dtype=control_dtype),
-                vector_embedding.to(dtype=control_dtype),
-                cond,
-                return_alpha=True,
-                alpha_target_size=(target_h, target_w),
-            )
-            eps = unet(
-                noisy.to(dtype=weight_dtype),
-                t,
-                text_embedding.to(dtype=weight_dtype),
-                vector_embedding.to(dtype=weight_dtype),
-                [x.to(dtype=weight_dtype) for x in input_resi_add],
-                mid_add.to(dtype=weight_dtype),
-            )
+            if negative_text_embedding is not None and negative_vector_embedding is not None:
+                neg_input_resi_add, neg_mid_add = control_net(
+                    noisy.to(dtype=control_dtype),
+                    t,
+                    negative_text_embedding.to(dtype=control_dtype),
+                    negative_vector_embedding.to(dtype=control_dtype),
+                    cond,
+                    return_alpha=False,
+                    alpha_target_size=(target_h, target_w),
+                )
+                eps_uncond = unet(
+                    noisy.to(dtype=weight_dtype),
+                    t,
+                    negative_text_embedding.to(dtype=weight_dtype),
+                    negative_vector_embedding.to(dtype=weight_dtype),
+                    [x.to(dtype=weight_dtype) for x in neg_input_resi_add],
+                    neg_mid_add.to(dtype=weight_dtype),
+                )
+                input_resi_add, mid_add, alpha_outputs = control_net(
+                    noisy.to(dtype=control_dtype),
+                    t,
+                    text_embedding.to(dtype=control_dtype),
+                    vector_embedding.to(dtype=control_dtype),
+                    cond,
+                    return_alpha=True,
+                    alpha_target_size=(target_h, target_w),
+                )
+                eps_text = unet(
+                    noisy.to(dtype=weight_dtype),
+                    t,
+                    text_embedding.to(dtype=weight_dtype),
+                    vector_embedding.to(dtype=weight_dtype),
+                    [x.to(dtype=weight_dtype) for x in input_resi_add],
+                    mid_add.to(dtype=weight_dtype),
+                )
+                eps = eps_uncond + (float(guidance_scale) * (eps_text - eps_uncond))
+                del neg_input_resi_add
+                del neg_mid_add
+                del eps_uncond
+                del eps_text
+            else:
+                input_resi_add, mid_add, alpha_outputs = control_net(
+                    noisy.to(dtype=control_dtype),
+                    t,
+                    text_embedding.to(dtype=control_dtype),
+                    vector_embedding.to(dtype=control_dtype),
+                    cond,
+                    return_alpha=True,
+                    alpha_target_size=(target_h, target_w),
+                )
+                eps = unet(
+                    noisy.to(dtype=weight_dtype),
+                    t,
+                    text_embedding.to(dtype=weight_dtype),
+                    vector_embedding.to(dtype=weight_dtype),
+                    [x.to(dtype=weight_dtype) for x in input_resi_add],
+                    mid_add.to(dtype=weight_dtype),
+                )
             step_out = scheduler.step(eps, timestep, noisy)
             pred_x0 = step_out.pred_original_sample.to(dtype=torch.float32)
             if clamp_enabled and (
@@ -1618,6 +1685,7 @@ def run_eval_step(
     _write_json(os.path.join(step_dir, "eval_run_config.json"), run_config)
 
     rows_for_board: List[Tuple[str, List[Image.Image]]] = []
+    baseline_rows_for_board: List[Tuple[str, List[Image.Image]]] = []
     metrics_rows: List[Dict[str, object]] = []
     resolved_rows: List[Dict[str, object]] = []
     collapse_images: List[np.ndarray] = []
@@ -1646,6 +1714,8 @@ def run_eval_step(
         terrain_prior = _terrain_mask_to_occupancy(terrain_prior_raw, terrain_black_is_terrain)
         if target_alpha is None:
             target_alpha = terrain_prior.clone()
+        target_rgb = _tensor_to_image(sample["images"]).convert("RGB")
+        semantic_preview = _float_to_grayscale_image(sample["conditioning_images"][terrain_mask_index]).convert("RGB")
 
         primary_render = None
         seed_rgb_list: List[Image.Image] = []
@@ -1687,9 +1757,17 @@ def run_eval_step(
             if seed == primary_seed:
                 primary_render = render
                 collapse_images.append(np.asarray(render["rgb"].convert("RGB"), dtype=np.uint8))
+                semantic_preview.save(os.path.join(step_dir, f"{sample_info.eval_id}_source_input.png"))
+                target_rgb.save(os.path.join(step_dir, f"{sample_info.eval_id}_target_rgb.png"))
                 _mask_to_image(target_alpha).save(os.path.join(step_dir, f"{sample_info.eval_id}_target_alpha.png"))
                 _mask_to_image(terrain_prior).save(os.path.join(step_dir, f"{sample_info.eval_id}_terrain_prior.png"))
                 _mask_to_image(terrain_prior_raw).save(os.path.join(step_dir, f"{sample_info.eval_id}_terrain_prior_raw.png"))
+                _composite_rgba_on_neutral(render["rgba"]).save(
+                    os.path.join(step_dir, f"{sample_info.eval_id}_seed{seed:06d}_visible_terrain_neutral.png")
+                )
+                _detail_heatmap(render["rgb"]).save(
+                    os.path.join(step_dir, f"{sample_info.eval_id}_seed{seed:06d}_detail_heatmap.png")
+                )
                 if "pred_x0_latent" in render:
                     debug_dir = os.path.join(step_dir, "debug")
                     os.makedirs(debug_dir, exist_ok=True)
@@ -2054,8 +2132,6 @@ def run_eval_step(
                 "semantic_tensor_sha256": sem_hash,
             }
         )
-
-        semantic_preview = _float_to_grayscale_image(sample["conditioning_images"][terrain_mask_index]).convert("RGB")
         rows_for_board.append(
             (
                 f"{sample_info.eval_id} | {sample_info.category}",
@@ -2066,6 +2142,20 @@ def run_eval_step(
                     primary_render["pred_alpha_img"].convert("RGB"),
                     primary_render["rgb"].convert("RGB"),
                     primary_render["rgba"].convert("RGB"),
+                ],
+            )
+        )
+        baseline_rows_for_board.append(
+            (
+                f"{sample_info.eval_id} | {sample_info.category}",
+                [
+                    semantic_preview,
+                    target_rgb,
+                    primary_render["rgb"].convert("RGB"),
+                    _mask_to_image(target_alpha).convert("RGB"),
+                    primary_render["pred_alpha_img"].convert("RGB"),
+                    _composite_rgba_on_neutral(primary_render["rgba"]),
+                    _detail_heatmap(primary_render["rgb"]),
                 ],
             )
         )
@@ -2165,6 +2255,22 @@ def run_eval_step(
     headers = ["semantic", "target_alpha", "terrain_prior", "pred_alpha", "generated_rgb", "rgba"]
     board_a_path = os.path.join(step_dir, "board_a_alpha_alignment.png")
     _build_contact_sheet(rows_for_board, headers, board_a_path, tile_min_size=int(eval_config.get("board_tile_min_size", 256)))
+    baseline_headers = [
+        "source_input",
+        "target_rgb",
+        "generated_rgb",
+        "target_alpha",
+        "pred_alpha",
+        "visible_terrain_neutral",
+        "detail_heatmap",
+    ]
+    board_b_path = os.path.join(step_dir, "board_b_base_diffusion_ablation.png")
+    _build_contact_sheet(
+        baseline_rows_for_board,
+        baseline_headers,
+        board_b_path,
+        tile_min_size=int(eval_config.get("board_tile_min_size", 256)),
+    )
 
     full_scene_dir = os.path.join(output_dir, "full_scene")
     os.makedirs(full_scene_dir, exist_ok=True)
